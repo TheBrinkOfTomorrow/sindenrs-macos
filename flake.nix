@@ -264,6 +264,87 @@
           };
         });
 
+
+      # NixOS module: udev rules so the gun, its camera and its internal hub are usable
+      # without root, ModemManager kept away from the gun's serial port, and an optional
+      # system service. Import as `sindenrs.nixosModules.default` and set
+      # `services.sindenrs.enable = true;`.
+      nixosModules.default = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.sindenrs;
+          udevRules = pkgs.writeTextFile {
+            name = "sinden-lightgun-udev-rules";
+            destination = "/lib/udev/rules.d/70-sinden-lightgun.rules";
+            # Numbered below 73-seat-late.rules so TAG+="uaccess" takes effect (the logged-in
+            # seat user gets an ACL on each node); the GROUP fallbacks cover headless use.
+            text = ''
+              # Sinden Lightgun: ATmega32U4 with CDC-ACM serial + HID. All firmware variants.
+              SUBSYSTEM=="tty", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="0f01|0f02|0f38|0f39", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+              SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="0f01|0f02|0f38|0f39", ENV{ID_MM_DEVICE_IGNORE}="1"
+              # The gun's Caterina bootloader (Arduino Leonardo), used for resets and firmware updates.
+              SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0036", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+              SUBSYSTEM=="usb", ATTR{idVendor}=="2341", ATTR{idProduct}=="0036", ENV{ID_MM_DEVICE_IGNORE}="1"
+              # Sinden camera boards (video capture + metadata nodes).
+              SUBSYSTEM=="video4linux", ATTRS{idVendor}=="05a3|32e4|16d0", ATTRS{idProduct}=="9210|0109", MODE="0660", GROUP="video", TAG+="uaccess"
+              # The hub inside the gun (Microchip USB2512, manufacturer string "KSB"). Access to its
+              # ports' sysfs `disable` attribute (Linux >= 6.0) lets the driver power-cycle a gun
+              # whose firmware has stopped answering; the usbfs node is the fallback for old kernels.
+              SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="2512", ATTR{manufacturer}=="KSB", ATTR{bDeviceClass}=="09", MODE="0660", GROUP="dialout", TAG+="uaccess"
+              SUBSYSTEM=="usb", DRIVER=="hub", ATTRS{idVendor}=="0424", ATTRS{idProduct}=="2512", ATTRS{manufacturer}=="KSB", RUN+="${pkgs.runtimeShell} -c '${pkgs.coreutils}/bin/chgrp -f dialout $sys$devpath/*-port*/disable; ${pkgs.coreutils}/bin/chmod -f 660 $sys$devpath/*-port*/disable'"
+            '';
+          };
+        in
+        {
+          options.services.sindenrs = {
+            enable = lib.mkEnableOption "Sinden Lightgun support (udev rules, device access)";
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "sindenrs.packages.\${system}.default";
+              description = "The sindenrs package to install.";
+            };
+            users = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "alice" ];
+              description = ''
+                Users added to the dialout and video groups. Seat users already get the
+                device nodes via uaccess, but power-cycling a wedged gun goes through a sysfs
+                attribute that only the dialout group can write, so list your desktop user
+                here too if you want `sindenrs` to recover the gun without root.
+              '';
+            };
+            daemon = {
+              enable = lib.mkEnableOption "the sindenrs system service (not yet functional; the tracker is in progress)";
+              extraArgs = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Extra command-line arguments for the service.";
+              };
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            environment.systemPackages = [ cfg.package ];
+            services.udev.packages = [ udevRules ];
+            users.users = lib.genAttrs cfg.users (_: { extraGroups = [ "dialout" "video" ]; });
+
+            systemd.services.sindenrs = lib.mkIf cfg.daemon.enable {
+              description = "Sinden Lightgun driver";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "systemd-udev-settle.service" ];
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/sindenrs run ${lib.escapeShellArgs cfg.daemon.extraArgs}";
+                Restart = "on-failure";
+                RestartSec = 2;
+                DynamicUser = true;
+                SupplementaryGroups = [ "dialout" "video" ];
+                DeviceAllow = [ "char-ttyACM rw" "char-video4linux rw" "char-usb_device rw" ];
+              };
+            };
+          };
+        };
+
       # Expose nix-direnv for .envrc to use
       lib = {
         inherit nix-direnv;

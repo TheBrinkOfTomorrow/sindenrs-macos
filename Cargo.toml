@@ -3,46 +3,51 @@ name = "sindenrs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Rust application built with Nix flakes"
+description = "Clean-room Linux/Windows driver for the Sinden Lightgun"
 readme = "README.md"
-keywords = ["nix", "flake"]
-categories = ["command-line-utilities"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+keywords = ["lightgun", "sinden", "v4l2"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
-# Production dependencies go here
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.11"
+# default-features = false drops the libudev dependency; we discover devices via sysfs ourselves.
+serialport = { version = "4", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zune-jpeg = "0.5"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
-# Dev-only dependencies (tests, benchmarks) - these don't leak to production builds
 
 [lints.rust]
-# Rust compiler lints
 unsafe_code = "warn"
-missing_docs = "allow"  # Enable when API stabilizes
+missing_docs = "allow"
 
 [lints.clippy]
-# Clippy lint groups (lower priority so individual lints can override)
 all = { level = "warn", priority = -1 }
-pedantic = { level = "allow", priority = -1 }  # Enable selectively as needed
-nursery = { level = "allow", priority = -1 }   # Enable selectively as needed
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
 
-# Individual clippy lints worth enabling
 enum_glob_use = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 cast_possible_wrap = "warn"
 ptr_as_ptr = "warn"
 redundant_closure_for_method_calls = "warn"
-unwrap_used = "warn"  # Warn in production code; allow per-module in tests/examples
+unwrap_used = "warn"
 
 [profile.dev]
-# Fast compile times for development
 opt-level = 0
 debug = true
 
 [profile.release]
-# Optimize for binary size and performance
 opt-level = 3
 lto = "thin"
 codegen-units = 1
@@ -50,6 +55,5 @@ strip = true
 panic = "abort"
 
 [profile.test]
-# Keep some debug info for test failures
 opt-level = 0
 debug = true

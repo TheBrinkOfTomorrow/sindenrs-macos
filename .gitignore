@@ -38,3 +38,9 @@ htmlcov/
 # Local environment overrides (if any)
 .env.local
 .envrc.local
+
+# Recorded camera frames (large; kept locally)
+corpus/
+
+# Vendor firmware images (not ours to redistribute; supply locally)
+firmware/

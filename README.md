@@ -1,76 +1,254 @@
 # sindenrs
 
-A Rust application with a reproducible [Nix]-based development environment.
+A clean-room driver for the [Sinden Lightgun](https://sindenlightgun.com), written in Rust
+from the reverse-engineering notes in `~/re-shell/artifacts/sinden-lightgun/`. It replaces the
+vendor's abandoned Mono binary on Linux and is structured so Windows can follow.
+
+Status (2026-09-21): **transport and measurement stages are done and validated on hardware**;
+the border tracker is next. See [Roadmap](#roadmap).
+
+## What works today
+
+| Piece | State |
+|---|---|
+| Device discovery (sysfs, no `lsusb`/`udevadm` shell-outs) | done |
+| Serial protocol: framing, mutual SHA-256 handshake, queries, position writes, events | done, validated against firmware 1.5 |
+| V4L2 capture with newest-frame drain and kernel timestamps | done, 60 fps MJPEG / 30 fps YUYV measured |
+| Camera control enumeration and exposure sweeps | done |
+| Resetting a wedged gun (bootloader touch; hub port power-cycle as fallback) | done, validated |
+| Homography (border quad to screen) | done, unit tested |
+| Border acquisition (threshold, blobs, hull, quad, corner refine) + live `track` | done, first light on the OLED |
+| Sub-pixel edge tracker, lens/curvature correction | not started |
+| Calibration overlay (Wayland / X11 / Windows) | not started |
+| Windows capture and discovery backends | stubs |
+
+## Hardware access on Linux
+
+The gun is a composite USB device: CDC-ACM serial (`/dev/ttyACM*`), HID mouse and keyboard,
+and a separate UVC camera behind the gun's internal hub. Three things must be true:
+
+1. Your user can open the gun's tty. It is `root:dialout` by default.
+2. Your user can open the camera's `/dev/video*` node (usually `root:video`).
+3. ModemManager must not probe the tty.
+4. (Optional) your user is in `dialout`, so `sindenrs gun power-cycle` can write the gun's
+   hub port `disable` attribute in sysfs. The normal recovery path (`gun reset`) needs only
+   the tty.
+
+### NixOS
+
+The flake exports a module that installs the udev rules for all of the above:
+
+```nix
+{
+  inputs.sindenrs.url = "github:schlarpc/sindenrs";
+  # ...
+  imports = [ inputs.sindenrs.nixosModules.default ];
+  services.sindenrs.enable = true;
+  # Headless / non-seat users who need the devices:
+  services.sindenrs.users = [ "arcade" ];
+}
+```
+
+The rules use `TAG+="uaccess"`, so whoever is logged in on the seat gets an ACL on the gun,
+the camera and the hub automatically, and `ENV{ID_MM_DEVICE_IGNORE}="1"` keeps ModemManager
+away. The rules file is numbered `70-` so it runs before `73-seat-late.rules`; putting the
+same rules in `services.udev.extraRules` (which becomes `99-local.rules`) would be too late
+for `uaccess` to take effect.
+
+### Other distributions
+
+Install `70-sinden-lightgun.rules` from `flake.nix` into `/etc/udev/rules.d/` and run
+`udevadm control --reload && udevadm trigger`, or add yourself to `dialout` and `video` and
+re-login. For a quick one-off: `sudo setfacl -m u:$USER:rw /dev/ttyACM0`.
+
+## Firmware
+
+The gun is an ATmega32U4 with the Arduino Leonardo (Caterina) bootloader, reached by the same
+1200-baud touch used for resets; it then enumerates as `2341:0036` and speaks AVR109. The
+vendor's Windows app flashes it with the .NET ArduinoSketchUploader; `sindenrs` does the same
+natively, on any platform with a serial port:
+
+```
+sindenrs gun firmware info firmware/LightgunFirmwareBlue.hex   # range, embedded USB id, sections
+sindenrs gun firmware backup                                   # dump all 32 KiB to corpus/firmware/
+sindenrs gun firmware flash firmware/LightgunFirmwareBlue.hex  # dry run: backup + compare only
+sindenrs gun firmware flash firmware/LightgunFirmwareBlue.hex --yes
+```
+
+Only the application section (below 0x7000) is ever written; the bootloader section in the
+image is compared to the gun's and left alone. Every flash first saves a full backup. The
+images in `firmware/` are the vendor's, from the V2.08b Windows bundle; despite the release
+notes calling them "1.9" the gun reports **v2.1** after flashing. The variants differ in a
+single byte (the USB product id), so the tool refuses an image whose id does not match the
+gun unless told otherwise. This gun was flashed from 1.5 to 2.1 on 2026-09-21; the 1.5 image
+is kept at `corpus/firmware/backup-fw1.5-blue.hex`.
+
+**Joystick mode (firmware 1.9+).** The newer firmware can expose a standard HID joystick
+(32 buttons, two hats, six 16-bit axes; the Arduino Joystick library layout). It is off by
+default: `sindenrs gun joystick-device enable` sets the persistent flag (command 184) and
+resets the gun so it re-enumerates with the extra HID collection, after which the gun shows
+up as a third input device (`js1`). Command 182, `--joystick` on `sweep` and `track`, then
+switches position output from the mouse to the joystick axes. It is not XInput and has no force-feedback
+output reports; rumble for games will come from a virtual gamepad the driver creates itself
+(uinput on Linux), which also lets it drive the recoil solenoid from game rumble.
+
+## Configuration
+
+`sindenrs config init` writes a commented TOML file to `~/.config/sindenrs/config.toml`
+(`%APPDATA%\sindenrs\config.toml` on Windows; `$SINDENRS_CONFIG` or `--config` override it;
+`config show` prints the effective result, `config path` says where it is looking). It
+talks to every attached gun and writes one `[[gun]]` entry per gun, keyed by the gun's
+**unique id** (a per-unit number the firmware reports; `probe` prints it), so entries
+survive port renumbering and two guns of the same colour. Every key has a default, so the
+file is optional. Firmware backups go to `~/.local/share/sindenrs/` (`%LOCALAPPDATA%` on
+Windows, `$SINDENRS_DATA` overrides).
+
+```toml
+[global]                 # log filter, auto-recover on a wedged handshake
+[display]                # threshold, min_size, exposure, contrast, flip, gunsight_y, offset/ratio trims,
+                         # orientation, fps — the tuning that varies per display
+[profiles.crt]           # any subset of [display] keys; select with --profile crt
+exposure = 120
+[[gun]]                  # one per gun; matched by [gun.match] id (preferred), variant, usb_path or port
+name = "player1"
+[gun.match]
+id = "2146665221"
+joystick = false         # positions to the joystick HID device (needs `gun joystick-device enable`)
+[gun.buttons.trigger]    # ten inputs, each with onscreen/offscreen actions and modifiers
+onscreen = "mouse_left"
+[gun.recoil]             # the vendor's whole recoil model: enable, strength, single/repeat,
+enabled = false          # which events fire it, automatic-mode timing
+```
+
+Button actions are strings: `mouse_left|middle|right`, `key:<char>`, `key:f1`..`key:f12`,
+`key:up|down|left|right|return|escape|tab|space`, `joy:<1-20>`, `turbo`, `turbo_reload`,
+`pause`, `border_toggle`, `none`. Bad values are rejected when the file is parsed.
+
+`gun setup` sends the whole startup configuration to the gun (modes, 41 button-map frames,
+the nine-frame recoil burst); `track --send` does the same before streaming. The vendor
+driver pauses 100 ms between recoil frames. Measured: only three of the nine frames answer
+(167 strength, 171 timing, 172 extended strength, each within 2 ms, 11 bytes in total), and
+those bytes were what the sleeps kept out of the way of the next query. The driver drains
+after each frame and pauses 5 ms (`global.recoil_gap_ms`, `--recoil-gap-ms`), so the whole
+startup takes about 60 ms instead of 900. A query after the burst is used as the alignment
+check: with no gap at all the version read back as "v10.1". Recoil on the
+gun is trigger-driven by the firmware once configured; `gun recoil test` fires pulses on
+demand through command 168, which is the hook for game-driven rumble later.
+
+## Command-line tool
+
+```
+sindenrs probe                          # list guns and cameras, and whether you can open them
+sindenrs config init|show|path          # TOML config (see Configuration)
+sindenrs gun setup                      # apply the config's modes, button map and recoil to the gun
+sindenrs gun recoil test|auto|off       # on-demand recoil pulses (168), automatic recoil (169), or off
+sindenrs track [--send] [--threshold N] [--contrast N] [--record DIR]   # camera -> border -> aim -> gun
+sindenrs track --send --threshold 48 --contrast 50                     # what worked on the OLED
+sindenrs camera info                    # formats, frame rates, every control with its range
+sindenrs camera capture [--format mjpeg|yuyv] [--exposure N|auto] [--frames N] [--out DIR]
+sindenrs camera sweep-exposure          # frame rate and frame age across exposure values
+sindenrs gun info                       # handshake, firmware, stored camera name, calibration, identity
+sindenrs gun monitor --seconds 10       # stream, hold a position, print every event byte
+sindenrs gun sweep --pattern circle     # move the pointer through a pattern (validates the position path)
+sindenrs gun sweep --joystick           # same, as joystick axes (firmware 1.9+)
+sindenrs gun joystick-device enable|disable|status   # persistent joystick HID device flag (resets the gun)
+sindenrs gun reset                      # reset a wedged gun via the bootloader (1200-baud touch)
+sindenrs gun power-cycle                # switch the gun's hub port off/on (fallback; re-enumerates only)
+sindenrs gun write-calibration --x -4.4 --y 4.2   # persist bore offsets to the gun's EEPROM
+```
+
+`--log debug` (or `RUST_LOG=sindenrs=trace`) shows every byte on the serial port.
+
+## Measurements from the first hardware session
+
+Blue gun, firmware **1.5**, `SindenCameraL` (`32e4:9210`), Ryzen 7 5800X, Linux 7.2.
+
+**Camera.** MJPEG runs 640x480 at **60 fps**; YUYV only reaches **30 fps**. The redesign's
+"prefer YUYV to skip the decode" trade-off therefore costs a whole frame period, so MJPEG is
+the right default and the 0.4 ms grayscale decode is cheap by comparison. Kernel timestamps
+are monotonic; frame age at dequeue is one frame period (16 ms at 60 fps, 32 ms at 30 fps),
+which means uvcvideo stamps the start of the frame and the data lands one period later.
+Exposure is advertised as 19..5000 in 100 µs units (nothing clamps a 60 Hz CRT value of
+167), but the frame rate did not fall at any exposure up to 100 ms and the scene was fully
+dark during this session, so whether the sensor honours long exposures is still unconfirmed.
+Gain, gamma, sharpness, zoom and power-line-frequency controls exist and are unused by the
+vendor driver.
+
+**Gun.** Full handshake takes about 650 ms, almost all of it the gun computing SHA-256
+(337 ms for leg 1, 298 ms for the leg 2 challenge). Every other query answers in about
+1 ms, so the vendor driver's fixed 50-200 ms sleeps are pure waste. Commands 111/113/115
+(unique id, factory colour, manufacture date) work on firmware 1.5 even though only the
+Windows driver uses them; the joystick probe (184) does not answer on 1.5. Position reports
+at 60 Hz produce two absolute-axis events each on the gun's own HID mouse, confirmed with
+evdev.
+
+**Firmware hazard and recovery.** If an auth command (109 or 110) reaches the gun without
+its 32-byte payload in the same USB packet, the firmware sits waiting for those 32 bytes and
+services nothing else; once its two 64-byte receive banks fill it stops accepting packets at
+all (writes time out on the host). This driver therefore writes command and payload in one
+write. Recovery is layered and automatic in every `gun` command:
+
+1. Feed the pending read 32 bytes in one packet; the firmware answers and carries on. No
+   re-enumeration, a few hundred milliseconds. Only works while the gun still accepts packets.
+2. **Bootloader touch:** open the port at 1200 baud with DTR low (the Leonardo reset). The
+   Arduino USB core handles it in the USB interrupt, so it works with the main loop stuck.
+   The gun spends about four seconds as the Caterina bootloader (`2341:0036`) and comes back
+   as itself; `sindenrs gun reset` does just this, and it is plain serial so it works on
+   Windows too.
+3. Switch the gun's internal hub port off and on (`sindenrs gun power-cycle`, through the
+   kernel's sysfs `disable` attribute so the hub driver does not immediately re-power it).
+   Measured: this re-enumerates the gun but does **not** reset the microcontroller, so it is
+   only a fallback for when the serial port has vanished.
+
+A plain USB bus reset does nothing useful either.
+
+**First light (OLED, `tools/border.html` fullscreen, 3vh white border).** At the vendor's
+exposure of 7.8 ms the border peaks around luma 100 on this display, so the stock-style 128
+threshold misses it; threshold 48 with contrast 50 detects it in 100% of frames with all four
+corners visible, and 86% while swinging the gun around with the border partly out of frame.
+Processing is 11 ms per frame in a debug build. The border edges bow visibly in the camera
+image on this flat panel, about 10 px over the top edge: that is the lens's barrel distortion,
+and a straight-edge homography will carry roughly 2% of screen error at edge midpoints until
+the tracker fits curves. The camera is mounted **upside down** (the cursor moved opposite to the gun on both axes
+until the frame was rotated 180°; `track --flip both` is the default), which is what the
+vendor driver's "camera is upside down" sign encodes. Recorded frames from the session are kept under `corpus/` (not in
+git) for regression replay.
+
+## Architecture
+
+```
+src/protocol/   wire format, auth hashes, event parser      (pure, tested, platform-neutral)
+src/gun.rs      one serial session: handshake, queries, position writes, event drain
+src/discovery/  find guns and cameras (sysfs on Linux; Windows stub)
+src/camera/     capture types; v4l2/ is the Linux backend (hand-written ABI, size-tested)
+src/usb.rs      hub port power cycling via usbfs
+src/vision/     homography (verified), luma helpers
+src/main.rs     CLI
+```
+
+The pointer is reported by the gun's own HID mouse, so the core driver never touches the
+display server. Wayland, X11 and Windows only matter for the calibration/border overlay,
+which will be one module behind `winit` + `softbuffer`. Serial uses the `serialport` crate
+(cross-platform); capture and discovery have `cfg(target_os)` backends with Windows stubs.
+The Windows target type-checks today (`cargo check --target x86_64-pc-windows-msvc`).
+
+## Roadmap
+
+1. Border acquisition (downsample, threshold, connected components, convex quad) against a
+   white-border page on the OLED.
+2. Sub-pixel gradient tracker with RANSAC edge fits; recorded-frame regression corpus.
+3. Predictive filter and end-to-end latency measurement.
+4. Overlay for calibration (winit/softbuffer), config file, `sindenrs run` daemon.
+5. Windows backends (Media Foundation capture, SetupAPI discovery).
+6. CRT: curvature-aware calibration field, exposure vs refresh validation.
 
 ## Development
 
-This project uses [rust-flake] as its foundation, providing a pinned Rust toolchain and
-reproducible builds via [Nix] and [Crane].
-
-### Setting up the development environment
-
-The project uses [direnv] to automatically load the development environment. When you enter
-the project directory, direnv activates a shell with the pinned toolchain and dev tools
-available, refreshing automatically when you change the flake or `Cargo.toml`.
+Nix flake with a pinned toolchain; see `CLAUDE.md` for the command list.
 
 ```shell
-$ direnv allow
+direnv allow            # or: nix develop
+cargo build && cargo nextest run && cargo clippy --all-targets
+nix build               # Linux package
+nix build .#windows     # cross-compile
 ```
-
-Without direnv, enter the shell manually:
-
-```shell
-$ nix develop
-```
-
-### Building and running
-
-```shell
-$ cargo run                                      # debug build + run
-$ cargo build --release                          # optimized build
-$ nix run                                        # build and run via Nix
-$ ./result/bin/sindenrs   # the nix-built binary
-```
-
-### Testing, linting, and formatting
-
-```shell
-$ cargo nextest run          # fast parallel test runner
-$ cargo llvm-cov nextest     # tests with coverage
-$ cargo clippy --all-targets # lint
-$ cargo fmt                  # format
-```
-
-### Working with Nix
-
-```shell
-$ nix build          # build the package
-$ nix build .#windows # cross-compile for Windows (x86_64-pc-windows-msvc)
-$ nix flake check    # run all checks (build, clippy, fmt, test, coverage)
-$ nix flake update   # update flake inputs
-```
-
-Windows cross-compilation also works from the dev shell without Nix sandboxing:
-
-```shell
-$ cargo xwin build --release --target x86_64-pc-windows-msvc
-```
-
-The Rust toolchain is pinned in `rust-toolchain.toml` (single source of truth); Nix reads it
-via `rust-bin.fromRustupToolchainFile`, so builds stay reproducible. To upgrade Rust, bump
-`channel` there.
-
-## Keeping in sync with the base template
-
-This project was generated from [rust-flake] and can receive updates from the upstream
-template using [cruft]:
-
-```shell
-$ cruft update --checkout template
-```
-
-[Crane]: https://crane.dev/
-[cruft]: https://cruft.github.io/cruft/
-[direnv]: https://direnv.net/
-[Nix]: https://nixos.org/
-[rust-flake]: https://github.com/schlarpc/rust-flake
