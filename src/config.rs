@@ -62,6 +62,20 @@ pub fn default_data_dir() -> PathBuf {
     base.unwrap_or_else(|| PathBuf::from(".")).join("sindenrs")
 }
 
+/// Where throwaway diagnostic captures go.
+pub fn default_cache_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("SINDENRS_CACHE") {
+        return PathBuf::from(p);
+    }
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    base.unwrap_or_else(|| PathBuf::from(".")).join("sindenrs")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -224,11 +238,16 @@ impl Display {
         }
     }
 
-    /// Apply trims and the gunsight offset to a raw solve, and clamp to the screen.
+    /// Apply trims and the gunsight offset to a raw solve.
+    ///
+    /// Deliberately **not** clamped to the screen: a reading of 104% is information, and
+    /// clamping it to 100% silently understates the error during calibration. The wire
+    /// encoding clamps when the position is actually sent to the gun.
     pub fn finish_aim(&self, x: f64, y: f64) -> (f64, f64) {
-        let x = x * self.ratio_x + self.offset_x;
-        let y = y * self.ratio_y + self.offset_y - self.gunsight_y;
-        (x.clamp(0.0, 100.0), y.clamp(0.0, 100.0))
+        (
+            x * self.ratio_x + self.offset_x,
+            y * self.ratio_y + self.offset_y - self.gunsight_y,
+        )
     }
 }
 
@@ -263,6 +282,15 @@ pub struct GunConfig {
     pub calibration_mode: bool,
     /// Whether D-pad up toggles recoil on the gun.
     pub recoil_toggle: bool,
+    /// Ask the gun to report button presses to the host (command 50).
+    ///
+    /// The vendor calls this "secondary serial output" and only enables it when a PS2/PSX
+    /// adapter is configured, but measured on firmware 2.1 it is also what gates the gun's
+    /// button reports over USB: with it off the gun sends nothing at all, with it on it sends
+    /// `FE <state1> <state2> 96` on every press and release. The driver needs those for the
+    /// trigger and for offscreen reload, so it defaults to on; the mirrored position simply
+    /// goes to a UART nothing is listening to.
+    pub buttons_over_serial: bool,
     pub buttons: Buttons,
     pub recoil: Recoil,
 }
@@ -278,6 +306,7 @@ impl Default for GunConfig {
             offscreen_reload: false,
             calibration_mode: true,
             recoil_toggle: true,
+            buttons_over_serial: true,
             buttons: Buttons::default(),
             recoil: Recoil::default(),
         }
@@ -495,7 +524,8 @@ pub enum RecoilMode {
 pub struct Recoil {
     /// Master enable. Off means the gun never fires the solenoid on its own.
     pub enabled: bool,
-    /// 0-100.
+    /// Solenoid strength as a percentage, 0-100, sent to the gun as 0-250 (see
+    /// [`Recoil::wire_level`]). Command 172 is what actually controls the kick.
     pub strength: u8,
     pub mode: RecoilMode,
     pub on_trigger: bool,
@@ -534,22 +564,33 @@ impl Default for Recoil {
 }
 
 impl Recoil {
+    /// The solenoid drive level on the wire, 0..=250.
+    ///
+    /// Both strength commands take this scale. The Windows app's slider is 0..=25 and it
+    /// sends `value * 10` to **both** 167 and 172 (its default 10 gives 100). The Linux
+    /// driver instead sends a raw 0..=100 to 167, always near the bottom of the range, and
+    /// only `* 2.5` to 172 — which is why 167 appears to do nothing there. Measured on
+    /// firmware 2.1 with a microphone: 0 gives no kick, 60 a weak one, 125 and 250 full ones,
+    /// and 172 latches (zero it and nothing else revives recoil until it is set again).
+    pub fn wire_level(&self) -> u8 {
+        // `strength` is a percentage; 100% -> 250.
+        u8::try_from(u16::from(self.strength.min(100)) * 5 / 2).unwrap_or(250)
+    }
+
     /// The vendor's configuration burst, in its order. Send with a pause between frames.
     pub fn frames(&self) -> Vec<Frame> {
         let b = |v: bool| u8::from(v);
-        let strength = self.strength.min(100);
         let auto = (
             self.auto_strength.min(200),
             self.auto_start_delay.min(200),
             self.auto_pulse_delay.min(200),
         );
-        // Vendor: RecoilStrength * 2.5, clamped to a byte.
-        let ext = (u16::from(strength) * 5 / 2).min(255);
-        let [_, ext] = ext.to_be_bytes();
+        let level = self.wire_level();
+        let ext = level;
         vec![
             Frame::new(cmd::RECOIL_AUTO_PARAMS, [auto.0, auto.1, auto.0, auto.2]),
             Frame::flag(cmd::RECOIL_ENABLE, true),
-            Frame::new(cmd::RECOIL_STRENGTH, [strength, 0, 0, 0]),
+            Frame::new(cmd::RECOIL_STRENGTH, [level, 0, 0, 0]),
             Frame::flag(
                 cmd::RECOIL_TRIGGER_MODE,
                 matches!(self.mode, RecoilMode::Repeat),
@@ -731,8 +772,33 @@ mod tests {
         let f = r.frames();
         let cmds: Vec<u8> = f.iter().map(Frame::command).collect();
         assert_eq!(cmds, vec![162, 161, 167, 163, 164, 165, 171, 161, 172]);
-        assert_eq!(f[2].as_bytes()[2], 80);
-        assert_eq!(f[8].as_bytes()[2], 200); // 80 * 2.5
+        // Both strength commands carry the same 0..=250 level, as the Windows app does.
+        assert_eq!(f[2].as_bytes()[2], 200);
+        assert_eq!(f[8].as_bytes()[2], 200);
+        assert_eq!(
+            Recoil {
+                strength: 100,
+                ..Default::default()
+            }
+            .wire_level(),
+            250
+        );
+        assert_eq!(
+            Recoil {
+                strength: 0,
+                ..Default::default()
+            }
+            .wire_level(),
+            0
+        );
+        assert_eq!(
+            Recoil {
+                strength: 40,
+                ..Default::default()
+            }
+            .wire_level(),
+            100
+        );
         assert_eq!(f[7].as_bytes()[2], 1);
         let off = Recoil::default().frames();
         assert_eq!(off[7].as_bytes()[2], 0);

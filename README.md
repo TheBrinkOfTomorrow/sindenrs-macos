@@ -18,6 +18,11 @@ the border tracker is next. See [Roadmap](#roadmap).
 | Resetting a wedged gun (bootloader touch; hub port power-cycle as fallback) | done, validated |
 | Homography (border quad to screen) | done, unit tested |
 | Border acquisition (threshold, blobs, hull, quad, corner refine) + live `track` | done, first light on the OLED |
+| Multi-gun runtime (`run`: one thread per gun, camera paired by hub, Ctrl-C) | done, two guns |
+| Fullscreen overlay: draws the border, calibration UI (Wayland + X11) | done |
+| Aim accuracy harness (`aim-test`) | done, not yet measured |
+| TOML config (display profiles, per-gun buttons/recoil by unique id) | done |
+| Firmware backup/flash, bootloader reset, joystick device switch | done, both guns on 2.1 |
 | Sub-pixel edge tracker, lens/curvature correction | not started |
 | Calibration overlay (Wayland / X11 / Windows) | not started |
 | Windows capture and discovery backends | stubs |
@@ -124,6 +129,24 @@ Button actions are strings: `mouse_left|middle|right`, `key:<char>`, `key:f1`..`
 `key:up|down|left|right|return|escape|tab|space`, `joy:<1-20>`, `turbo`, `turbo_reload`,
 `pause`, `border_toggle`, `none`. Bad values are rejected when the file is parsed.
 
+**Recoil strength, measured.** The kick is controlled by command **172**, not 167, and both
+take a **0-250** scale. The Windows app sends `slider * 10` to both (its slider is 0-25); the
+Linux driver sends a raw 0-100 to 167 and only `* 2.5` to 172, which is why 167 looks inert
+there. `strength` in the config is a percentage and is sent as 0-250 to both, matching the
+Windows app. Measured acoustically on firmware 2.1 by recording the solenoid:
+
+| wire level (167 and 172) | kick |
+|---|---|
+| 0 | none |
+| 50 | weak, ~10 ms |
+| 100 | full, ~20 ms |
+| 150, 200 | same as 100 (saturated) |
+
+So the useful range is roughly the bottom 40% of the config's `strength`; above that it
+saturates. 172 also **latches**: zero it and no other frame revives recoil until it is set
+again. There is **no duty-cycle cutoff**: 40 consecutive full-strength pulses over 20 seconds
+all fired, with only a mild shortening of the ring-down (about 20 ms early, 10 ms late).
+
 `gun setup` sends the whole startup configuration to the gun (modes, 41 button-map frames,
 the nine-frame recoil burst); `track --send` does the same before streaming. The vendor
 driver pauses 100 ms between recoil frames. Measured: only three of the nine frames answer
@@ -138,6 +161,9 @@ demand through command 168, which is the hook for game-driven rumble later.
 ## Command-line tool
 
 ```
+sindenrs run                            # every attached gun, one thread each, until Ctrl-C (the service entry point)
+sindenrs border                         # draw the tracking border fullscreen (Escape quits)
+sindenrs aim-test --grid 3 [--out f.csv]  # measure aim error, with an on-screen calibration overlay
 sindenrs probe                          # list guns and cameras, and whether you can open them
 sindenrs config init|show|path          # TOML config (see Configuration)
 sindenrs gun setup                      # apply the config's modes, button map and recoil to the gun
@@ -214,6 +240,62 @@ until the frame was rotated 180°; `track --flip both` is the default), which is
 vendor driver's "camera is upside down" sign encodes. Recorded frames from the session are kept under `corpus/` (not in
 git) for regression replay.
 
+**Button reports need command 50.** The gun sends nothing over serial until asked, and the
+command that asks is the one the vendor labels "secondary serial output". With it off there
+are no trigger or button events at all; with it on the gun sends `FE <state1> <state2> 96` on
+every press and release. The driver enables it by default
+(`[[gun]] buttons_over_serial = true`), since the trigger and offscreen reload both depend on
+it. The mirrored position goes to a UART that nothing is listening to, so there is no cost.
+
+## The overlay
+
+The gun tracks a bright border drawn around the screen edge, so the driver draws one itself:
+`sindenrs border`. It is a fullscreen window rendered with `winit` (windowing and input) and
+`softbuffer` (a plain CPU pixel buffer), which works on Wayland and X11 today and compiles
+for Windows. There is no GPU dependency and no font files; the few numbers on screen are
+drawn as seven-segment glyphs.
+
+Both libraries load their system libraries with `dlopen`, so they never appear as `NEEDED`
+entries and rpath patching cannot find them. The flake puts them on `LD_LIBRARY_PATH` in the
+dev shell and wraps the installed binary the same way.
+
+## Measuring aim accuracy
+
+`sindenrs aim-test` is the calibration overlay: it draws the border, a grid of crosshairs,
+and a ring around the one you should be shooting. Aim at the ring, pull the trigger, and it
+records; the ring moves to the next target. Everything you need is on the screen you are
+already looking at, which matters because the terminal is invisible behind a fullscreen
+window:
+
+- a **cyan dot** where the driver thinks you are pointing,
+- a **square in the bottom-left** that is green only while the whole border is in the
+  camera's view, amber when it is clipped at the frame edge, red when it is lost,
+- each measured target turning **green with a line** to where it actually read, so the shape
+  of the error is visible at a glance,
+- the current target **flashing red** if a shot could not be measured.
+
+At the end the terminal prints the error at every point, the mean and worst error, the
+systematic bias (which `display.offset_x` / `offset_y` can cancel) and the spread left after
+removing that bias, which is what a curvature correction would have to fix.
+
+A capture needs the whole border in view, because a border clipped at the edge of the camera
+frame gives a partial quad and a badly wrong solve. A pull that cannot be measured says so
+and waits for you to pull again, so the target numbering can never drift out of step with
+where you are actually aiming.
+
+Either gesture works: pull the trigger, or hold steady on the target (`--capture trigger`,
+`dwell` or `either`). The trigger is the better measurement because it is the gesture used
+when playing, and the pull cannot disturb the reading since the recorded point is the median
+of the 0.6 s window around the event rather than the instant of it.
+
+If recoil is enabled the gun kicks on every pull, which may disturb your aim, so set
+`[gun.recoil] enabled = false` for a clean measurement.
+
+Every shot saves the camera frame behind it under `~/.cache/sindenrs/aim/<stamp>/`, named by
+target, shot number and outcome (`pull-ok`, `pull-clipped`, `pull-lost`, `measured`,
+`unmeasurable`, `unsteady`), so a suspicious reading can be looked at rather than guessed
+about. Pass `--debug-dir ""` to turn it off.
+
 ## Architecture
 
 ```
@@ -238,7 +320,7 @@ The Windows target type-checks today (`cargo check --target x86_64-pc-windows-ms
    white-border page on the OLED.
 2. Sub-pixel gradient tracker with RANSAC edge fits; recorded-frame regression corpus.
 3. Predictive filter and end-to-end latency measurement.
-4. Overlay for calibration (winit/softbuffer), config file, `sindenrs run` daemon.
+4. Correction field fitted from the aim test; virtual gamepad with rumble-to-recoil; hotplug in `run`.
 5. Windows backends (Media Foundation capture, SetupAPI discovery).
 6. CRT: curvature-aware calibration field, exposure vs refresh validation.
 

@@ -9,8 +9,12 @@ pub enum Event {
     CalibrationSet,
     /// Byte 202: left calibration mode without setting.
     ExitedCalibration,
-    /// Byte 254 followed by three bytes: button state 1, button state 2, and one byte the
-    /// stock driver discards (kept here as `extra`).
+    /// Byte 254 followed by three bytes: button state 1, button state 2, and a trailer the
+    /// stock driver discards (kept here as `extra`; observed to be a constant 0x96).
+    ///
+    /// Only sent when the gun has been asked to report buttons (command 50). Each bit is one
+    /// physical input: state1 carries at least bits 0-5 and state2 at least bits 0-3, ten in
+    /// total, matching the gun's ten controls. Bit 0 of state1 is the trigger.
     Buttons { state1: u8, state2: u8, extra: u8 },
     /// Byte 120: the stock driver treats this as "trigger enabled" in low-resource mode.
     TriggerEnabled,

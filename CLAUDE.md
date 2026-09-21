@@ -47,6 +47,8 @@ hardware findings and the roadmap.
 - **src/protocol/** — wire protocol, auth, events (pure, unit tested)
 - **src/config.rs** — TOML config (global / display+profiles / per-gun buttons+recoil); `~/.config/sindenrs/config.toml`
 - **src/gun.rs** — serial session with one gun; `apply_config` sends the vendor startup burst
+- **src/runtime.rs** — the per-gun tracking loop shared by `track`, `run` and `aim-test`
+- **src/overlay.rs** — fullscreen window (winit + softbuffer): draws the tracking border and the calibration UI. The event loop owns the main thread, so tracking runs on a worker.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle
 - **src/vision/** — homography (verified), luma helpers, `acquire.rs` border finder

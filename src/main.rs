@@ -51,6 +51,16 @@ enum Cmd {
     },
     /// Live border tracking: camera -> corners -> aim point, optionally driving the gun.
     Track(Box<TrackArgs>),
+    /// Run every attached gun (one thread each) until Ctrl-C. What the service runs.
+    Run,
+    /// Draw the tracking border fullscreen and nothing else. Escape quits.
+    Border {
+        /// Border thickness as a percentage of the shorter screen dimension.
+        #[arg(long, default_value_t = 3.0)]
+        thickness: f64,
+    },
+    /// Measure aim accuracy: aim at each target the overlay lights up and pull the trigger.
+    AimTest(Box<AimTestArgs>),
     /// Camera capture and measurement.
     Camera {
         #[command(subcommand)]
@@ -172,6 +182,56 @@ enum CameraCmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CaptureMode {
+    /// Hold the aim steady on the target.
+    Dwell,
+    /// Pull the trigger.
+    Trigger,
+    /// Whichever happens first.
+    Either,
+}
+
+#[derive(Args)]
+struct AimTestArgs {
+    #[command(flatten)]
+    settings: CameraSettings,
+    #[arg(short, long)]
+    port: Option<String>,
+    /// Grid size: 3, 4 or 5 targets per side.
+    #[arg(long, default_value_t = 3)]
+    grid: u32,
+    /// Border thickness as a percentage of the shorter screen dimension.
+    #[arg(long, default_value_t = 3.0)]
+    thickness: f64,
+    /// Aim points to average per target.
+    #[arg(long, default_value_t = 24)]
+    samples: u32,
+    /// How to capture a target: pull the trigger (the real gesture), hold steady on it, or
+    /// whichever comes first.
+    #[arg(long, value_enum, default_value = "trigger")]
+    capture: CaptureMode,
+    /// Hold-steady tolerance in percent of screen; smaller demands a steadier hand.
+    #[arg(long, default_value_t = 1.2)]
+    dwell_radius: f64,
+    /// How far the aim must move off a captured point before the next can be captured.
+    #[arg(long, default_value_t = 4.0)]
+    rearm_distance: f64,
+    /// Write the measurements here as CSV.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Save the camera frame behind every shot for inspection. Defaults to a timestamped
+    /// directory under the cache dir; pass `--debug-dir ""` to turn it off.
+    #[arg(long)]
+    debug_dir: Option<PathBuf>,
+    /// Reject a capture whose samples disagree by more than this, in percent of screen.
+    #[arg(long, default_value_t = 4.0)]
+    steady_tolerance: f64,
+    /// Write the computed bore calibration into the config file for this gun.
+    #[arg(long)]
+    apply: bool,
+}
+
 #[derive(Args)]
 struct TrackArgs {
     #[command(flatten)]
@@ -237,7 +297,7 @@ enum FirmwareCmd {
     Backup {
         #[arg(short, long)]
         port: Option<String>,
-        /// Output path; default corpus/firmware/backup-<date>.hex
+        /// Output path; default <data dir>/firmware/backup-<stamp>.hex
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -272,17 +332,6 @@ impl From<FlipArg> for sindenrs::vision::acquire::Flip {
             FlipArg::Vertical => Flip::Vertical,
             FlipArg::Both => Flip::Both,
         }
-    }
-}
-
-fn flip_from_config(f: sindenrs::config::Flip) -> sindenrs::vision::acquire::Flip {
-    use sindenrs::config::Flip as C;
-    use sindenrs::vision::acquire::Flip as V;
-    match f {
-        C::None => V::None,
-        C::Horizontal => V::Horizontal,
-        C::Vertical => V::Vertical,
-        C::Both => V::Both,
     }
 }
 
@@ -337,6 +386,16 @@ enum GunCmd {
         #[arg(short, long)]
         port: Option<String>,
     },
+    /// Find out what the gun reports over serial when you use its buttons. Streams positions
+    /// and dumps every byte received, cycling through gun modes so one run shows which (if
+    /// any) makes the gun send button reports.
+    Events {
+        #[arg(short, long)]
+        port: Option<String>,
+        /// Seconds per phase.
+        #[arg(long, default_value_t = 8)]
+        seconds: u64,
+    },
     /// Authenticate, start streaming, hold a fixed position, and log every event byte.
     Monitor {
         #[arg(short, long)]
@@ -385,6 +444,16 @@ enum GunCmd {
         #[arg(long, default_value_t = 300)]
         window_ms: u64,
     },
+    /// Send several raw frames in one session: each argument is `cmd[:p1[:p2[:p3[:p4]]]]`,
+    /// decimal or 0x-hex; `sleep:<ms>` pauses. Replies are dumped as they arrive.
+    RawSeq {
+        #[arg(short, long)]
+        port: Option<String>,
+        frames: Vec<String>,
+        /// Pause after each frame, in ms.
+        #[arg(long, default_value_t = 20)]
+        gap_ms: u64,
+    },
     /// Send the full startup configuration (modes, button map, recoil) from the config file.
     Setup {
         #[arg(short, long)]
@@ -411,6 +480,10 @@ enum GunCmd {
         /// Override the configured strength (0-100) for this run.
         #[arg(long)]
         strength: Option<u8>,
+        /// A/B: fire `count` pulses at each of these strengths in turn, one session, with a
+        /// pause between groups (e.g. 30,100).
+        #[arg(long, value_delimiter = ',')]
+        strengths: Vec<u8>,
     },
     /// Enable, disable or query the gun's joystick HID device (firmware 1.9+, persistent;
     /// the gun is reset afterwards so the change takes effect).
@@ -473,6 +546,16 @@ fn main() -> Result<()> {
         Cmd::Probe { quick } => probe(&ctx, quick),
         Cmd::Config { cmd } => config_cmd(&ctx, cmd),
         Cmd::Track(args) => track(&ctx, *args),
+        Cmd::Run => run_all(&ctx),
+        Cmd::Border { thickness } => {
+            use std::sync::atomic::AtomicBool;
+            use std::sync::{Arc, Mutex};
+            let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(
+                thickness / 100.0,
+            )));
+            sindenrs::overlay::run(scene, Arc::new(AtomicBool::new(false)))
+        }
+        Cmd::AimTest(a) => aim_test(&ctx, *a),
         Cmd::Camera { cmd } => camera(cmd),
         Cmd::Gun { cmd } => gun(&ctx, cmd),
     }
@@ -555,7 +638,11 @@ fn config_cmd(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
 
 /// The config entry for an attached gun, or the built-in default. `id` is the gun's unique
 /// id when the caller has already talked to it.
-fn gun_config_for(ctx: &Ctx, port: &str, id: Option<&str>) -> sindenrs::config::GunConfig {
+fn gun_config_for(
+    cfg: &sindenrs::config::Config,
+    port: &str,
+    id: Option<&str>,
+) -> sindenrs::config::GunConfig {
     let guns = discovery::find_guns().unwrap_or_default();
     let dev = guns.iter().find(|g| g.port.to_string_lossy() == port);
     let variant = dev.and_then(|g| g.variant).map(|v| match v {
@@ -565,8 +652,7 @@ fn gun_config_for(ctx: &Ctx, port: &str, id: Option<&str>) -> sindenrs::config::
         sindenrs::ids::GunVariant::Player2 => "player2",
     });
     let usb_path = dev.map_or("", |g| g.usb_path.as_str());
-    ctx.cfg
-        .gun_for(id, variant, usb_path, port)
+    cfg.gun_for(id, variant, usb_path, port)
         .cloned()
         .unwrap_or_default()
 }
@@ -609,7 +695,7 @@ fn probe(ctx: &Ctx, quick: bool) -> Result<()> {
                         .firmware_version()
                         .map(|((a, b), _)| format!("v{a}.{b}"))
                         .unwrap_or_default();
-                    let gc = gun_config_for(ctx, &port, Some(&id));
+                    let gc = gun_config_for(&ctx.cfg, &port, Some(&id));
                     let matched = gc.matcher.id.as_deref() == Some(id.as_str());
                     println!(
                         "        id: {id}  firmware {fw}  config: [[gun]] \"{}\"{}",
@@ -1188,6 +1274,49 @@ fn power_cycle_port(_port: &str) -> Result<()> {
 fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
     let recover = ctx.cfg.global.auto_recover;
     match cmd {
+        GunCmd::RawSeq {
+            port,
+            frames,
+            gap_ms,
+        } => {
+            let parse = |t: &str| -> Result<u8> {
+                let v = t
+                    .strip_prefix("0x")
+                    .map_or_else(|| t.parse::<u8>(), |h| u8::from_str_radix(h, 16));
+                v.with_context(|| format!("bad byte {t:?}"))
+            };
+            let port = default_port(port)?;
+            let mut gun = connect(&port, recover)?;
+            gun.discard_input()?;
+            let t0 = Instant::now();
+            for spec in &frames {
+                if let Some(ms) = spec.strip_prefix("sleep:") {
+                    std::thread::sleep(Duration::from_millis(
+                        ms.parse().with_context(|| format!("bad sleep {ms:?}"))?,
+                    ));
+                    continue;
+                }
+                let parts: Vec<&str> = spec.split(':').collect();
+                let c = parse(parts[0])?;
+                let mut p = [0u8; 4];
+                for (i, t) in parts.iter().skip(1).take(4).enumerate() {
+                    p[i] = parse(t)?;
+                }
+                gun.send(sindenrs::protocol::Frame::new(c, p))?;
+                std::thread::sleep(Duration::from_millis(gap_ms));
+                let reply = gun.read_available()?;
+                println!(
+                    "{:>8.3}s cmd {c} {p:?}{}",
+                    t0.elapsed().as_secs_f64(),
+                    if reply.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" -> {reply:02x?}")
+                    }
+                );
+            }
+            Ok(())
+        }
         GunCmd::Raw {
             port,
             command,
@@ -1241,7 +1370,7 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
             let port = default_port(port)?;
             let mut gun = connect(&port, recover)?;
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(ctx, &port, id.as_deref());
+            let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
             let gap = recoil_gap_ms.map_or(ctx.cfg.recoil_gap(), Duration::from_millis);
             let t0 = Instant::now();
             gun.apply_config(&gc, gap)?;
@@ -1256,16 +1385,41 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
             interval_ms,
             recoil_gap_ms,
             strength,
+            strengths,
         } => {
             let port = default_port(port)?;
             let mut gun = connect(&port, recover)?;
             let id = gun.unique_id().ok();
-            let mut gc = gun_config_for(ctx, &port, id.as_deref());
+            let mut gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
             if let Some(st) = strength {
                 gc.recoil.strength = st;
             }
             let gap = recoil_gap_ms.map_or(ctx.cfg.recoil_gap(), Duration::from_millis);
             match action {
+                RecoilAction::Test if !strengths.is_empty() => {
+                    let t_all = Instant::now();
+                    for (gi, st) in strengths.iter().enumerate() {
+                        let mut r = gc.recoil.clone();
+                        r.strength = *st;
+                        gun.send_recoil_burst(&r, gap)?;
+                        gun.set_recoil_enabled(true)?;
+                        std::thread::sleep(Duration::from_millis(50));
+                        for i in 0..count {
+                            gun.fire_recoil()?;
+                            println!(
+                                "{:>8.3}s group {} strength {st} (wire {}): pulse {}",
+                                t_all.elapsed().as_secs_f64(),
+                                gi + 1,
+                                r.wire_level(),
+                                i + 1
+                            );
+                            std::thread::sleep(Duration::from_millis(interval_ms));
+                        }
+                        std::thread::sleep(Duration::from_millis(1500));
+                    }
+                    gun.set_recoil_enabled(gc.recoil.enabled)?;
+                    Ok(())
+                }
                 RecoilAction::Test => {
                     // Enable with the configured strength, pulse, then restore the configured state.
                     let t0 = Instant::now();
@@ -1386,6 +1540,69 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
                     fmt_ms(t.first_byte)
                 ),
                 Err(e) => println!("joystick probe: {e}"),
+            }
+            Ok(())
+        }
+        GunCmd::Events { port, seconds } => {
+            let port = default_port(port)?;
+            let mut gun = connect(&port, recover)?;
+            let id = gun.unique_id().ok();
+            let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+            gun.apply_config(&gc, ctx.cfg.recoil_gap())?;
+            gun.start_streaming(Duration::from_millis(150))?;
+            // Each phase changes one mode, then asks for input, so a phase that produces
+            // bytes when the others do not identifies what gates the reports.
+            type Phase = (
+                &'static str,
+                fn(&mut sindenrs::gun::Gun) -> sindenrs::gun::Result<()>,
+            );
+            let phases: [Phase; 5] = [
+                ("as configured", |_g| Ok(())),
+                ("offscreen reload ON (cmd 54)", |g| {
+                    g.set_offscreen_reload(true)
+                }),
+                ("calibration mode ON (cmd 180)", |g| {
+                    g.set_calibration_mode_enabled(true)
+                }),
+                ("secondary serial ON (cmd 50)", |g| {
+                    g.set_secondary_serial(true)
+                }),
+                ("joystick mode ON (cmd 182)", |g| g.set_joystick_mode(true)),
+            ];
+            let mut totals = Vec::new();
+            for (i, (label, apply)) in phases.iter().enumerate() {
+                apply(&mut gun)?;
+                std::thread::sleep(Duration::from_millis(100));
+                gun.discard_input()?;
+                println!("\n=== phase {}/{}: {label}", i + 1, phases.len());
+                println!("    PULL THE TRIGGER and press the side buttons now ({seconds}s)");
+                let start = Instant::now();
+                let mut bytes = Vec::new();
+                while start.elapsed() < Duration::from_secs(seconds) {
+                    let got = gun.read_available()?;
+                    if !got.is_empty() {
+                        println!("    {:>6.2}s  {:02x?}", start.elapsed().as_secs_f64(), got);
+                        bytes.extend(got);
+                    }
+                    gun.set_position(percent_to_axis(50.0), percent_to_axis(50.0))?;
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                println!("    -> {} bytes in this phase", bytes.len());
+                totals.push((*label, bytes.len()));
+            }
+            // Leave the gun as the config says.
+            gun.apply_config(&gc, ctx.cfg.recoil_gap())?;
+            println!("\nsummary:");
+            for (label, n) in &totals {
+                println!("  {n:>5} bytes  {label}");
+            }
+            if totals.iter().all(|(_, n)| *n == 0) {
+                println!(
+                    "\nThe gun sent nothing in any mode. Either it never reports buttons over"
+                );
+                println!(
+                    "serial on this firmware, or the buttons were not pressed during the run."
+                );
             }
             Ok(())
         }
@@ -1530,223 +1747,212 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_lines)]
 fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
-    use sindenrs::camera::v4l2::Device;
-    use sindenrs::vision::acquire::{acquire, aim_pixel, AcquireParams};
-    use sindenrs::vision::luma;
-    use std::io::Write as _;
+    use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
-    let display = &ctx.display;
-    let path = default_camera(a.settings.device.clone())?;
-    let dev = Device::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let settings = camera_settings_from(display, &a.settings);
-    apply_settings(&dev, &settings)?;
-    let fmt = dev.get_format()?;
-    let (w, h) = (fmt.width as usize, fmt.height as usize);
-
-    let threshold = a.threshold.unwrap_or(display.threshold);
-    let min_size = a.min_size.unwrap_or(display.min_size);
-    let orientation = a.orientation.unwrap_or(display.orientation);
-    let flip = a.flip.map_or(flip_from_config(display.flip), Into::into);
-    let mut display = display.clone();
-    if let Some(g) = a.gunsight_y {
-        display.gunsight_y = g;
-    }
-
+    let camera = default_camera(a.settings.device.clone())?;
     let mut gun = None;
-    let (mut cal_x, mut cal_y) = (a.cal_x, a.cal_y);
+    let mut name = "track".to_owned();
     if a.send {
         let port = default_port(a.port.clone())?;
         let mut g = connect(&port, ctx.cfg.global.auto_recover)?;
         let id = g.unique_id().ok();
-        let mut gun_cfg = gun_config_for(ctx, &port, id.as_deref());
+        let mut gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
         if a.joystick {
-            gun_cfg.joystick = true;
+            gc.joystick = true;
         }
-        cal_x = cal_x.or(gun_cfg.calibration_x);
-        cal_y = cal_y.or(gun_cfg.calibration_y);
-        if cal_x.is_none() {
-            cal_x = Some(g.calibration_x()?.0);
-        }
-        if cal_y.is_none() {
-            cal_y = Some(g.calibration_y()?.0);
-        }
-        g.apply_config(&gun_cfg, ctx.cfg.recoil_gap())?;
-        g.start_streaming(Duration::from_millis(150))?;
+        sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
         info!(
-            "gun \"{}\" streaming (joystick={}, recoil={}); bore offset X {:+.2}% Y {:+.2}%",
-            gun_cfg.name,
-            gun_cfg.joystick,
-            gun_cfg.recoil.enabled,
-            cal_x.unwrap_or(0.0),
-            cal_y.unwrap_or(0.0)
+            "gun \"{}\" streaming (joystick={}, recoil={})",
+            gc.name, gc.joystick, gc.recoil.enabled
         );
-        gun = Some(g);
+        name.clone_from(&gc.name);
+        gun = Some((g, gc));
     }
-    let (cal_x, cal_y) = (cal_x.unwrap_or(0.0), cal_y.unwrap_or(0.0));
-    let aim_px = aim_pixel(w, h, cal_x, cal_y, orientation);
-    let params = AcquireParams {
-        threshold,
-        min_size,
-        ..Default::default()
+    let mut display = ctx.display.clone();
+    if let Some(g) = a.gunsight_y {
+        display.gunsight_y = g;
+    }
+    // Camera flags on the CLI override the display profile.
+    let cs = camera_settings_from(&display, &a.settings);
+    if let Some(e) = &cs.exposure {
+        display.exposure = if e == "auto" {
+            sindenrs::config::Exposure::Auto(sindenrs::config::AutoWord::Auto)
+        } else {
+            sindenrs::config::Exposure::Manual(
+                e.parse().with_context(|| format!("bad --exposure {e:?}"))?,
+            )
+        };
+    }
+    display.brightness = cs.brightness;
+    display.contrast = cs.contrast;
+    display.gain = cs.gain;
+    display.gamma = cs.gamma;
+    display.sharpness = cs.sharpness;
+    display.fps = cs.fps;
+    let opts = TrackerOptions {
+        display,
+        threshold: a.threshold,
+        min_size: a.min_size,
+        flip: a.flip.map(Into::into),
+        orientation: a.orientation,
+        cal_x: a.cal_x,
+        cal_y: a.cal_y,
+        buffers: a.settings.buffers,
+        frames: a.frames,
+        record: a.record.clone(),
+        per_frame: a.per_frame,
+        report_every: Some(Duration::from_secs(1)),
     };
-    info!(
-        "tracking {}x{} {}, aim pixel ({:.1}, {:.1}), threshold {}, flip {:?}",
-        w, h, fmt.format, aim_px[0], aim_px[1], threshold, flip
-    );
-
-    let mut csv = None;
-    if let Some(dir) = &a.record {
-        std::fs::create_dir_all(dir)?;
-        let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("frames.csv"))?);
-        writeln!(
-            f,
-            "seq,ts_us,age_us,proc_us,found,clipped,tlx,tly,trx,try,brx,bry,blx,bly,aimx,aimy"
-        )?;
-        csv = Some(f);
-    }
-
-    let mut stream = dev.start_stream(a.settings.buffers)?;
-    let start = Instant::now();
-    let mut n = 0u32;
-    let mut found = 0u32;
-    let mut proc_times: Vec<Duration> = Vec::new();
-    let mut last_report = Instant::now();
-    let mut last_aim: Option<[f64; 2]> = None;
-    let mut last_quad = None;
-    let mut luma_buf = Vec::new();
-    while n < a.frames {
-        let Some(frame) = stream.next(Some(Duration::from_secs(3)), true)? else {
-            warn!("frame timeout");
-            break;
-        };
-        n += 1;
-        let t0 = Instant::now();
-        let decoded = match fmt.format {
-            PixelFormat::Mjpeg => match luma::mjpeg_to_luma(frame.data) {
-                Ok((_, _, l)) => Some(l),
-                Err(e) => {
-                    warn!("jpeg decode failed: {e}");
-                    None
-                }
-            },
-            PixelFormat::Yuyv => {
-                luma::yuyv_to_luma(frame.data, &mut luma_buf);
-                Some(luma_buf.clone())
-            }
-            PixelFormat::Other(_) => None,
-        };
-        let Some(mut l) = decoded else { continue };
-        if l.len() != w * h {
-            warn!("decoded {} bytes, expected {}", l.len(), w * h);
-            continue;
-        }
-        sindenrs::vision::acquire::flip_luma(&mut l, w, flip);
-        let quad = acquire(&l, w, h, &params);
-        let mut aim = None;
-        if let Some(q) = &quad {
-            found += 1;
-            // A solve that lands far outside the screen means the quad was not the border.
-            if let Some(p) = q
-                .to_screen()
-                .apply(aim_px)
-                .filter(|p| (-25.0..=125.0).contains(&p[0]) && (-25.0..=125.0).contains(&p[1]))
-            {
-                let (x, y) = display.finish_aim(p[0], p[1]);
-                aim = Some([x, y]);
-                if let Some(g) = gun.as_mut() {
-                    g.set_position(percent_to_axis(x), percent_to_axis(y))?;
-                }
-            }
-            last_quad = Some(*q);
-        } else if let (Some(g), Some(prev)) = (gun.as_mut(), last_aim) {
-            // Stock behaviour: keep the last position when the border is lost.
-            g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
-        }
-        if aim.is_some() {
-            last_aim = aim;
-        }
-        let proc = t0.elapsed();
-        proc_times.push(proc);
-        if let Some(g) = gun.as_mut() {
-            for ev in g.poll_events()? {
-                println!("{:>8.3}s  event {:?}", start.elapsed().as_secs_f64(), ev);
-            }
-        }
-        if let Some(f) = csv.as_mut() {
-            let (c, clipped) = quad.map_or(([[f64::NAN; 2]; 4], false), |q| (q.corners, q.clipped));
-            let am = aim.unwrap_or([f64::NAN; 2]);
-            writeln!(
-                f,
-                "{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
-                frame.sequence,
-                frame.timestamp.map_or(0, |t| t.as_micros()),
-                frame.age().map_or(0, |t| t.as_micros()),
-                proc.as_micros(),
-                u8::from(quad.is_some()),
-                u8::from(clipped),
-                c[0][0],
-                c[0][1],
-                c[1][0],
-                c[1][1],
-                c[2][0],
-                c[2][1],
-                c[3][0],
-                c[3][1],
-                am[0],
-                am[1]
-            )?;
-            if let Some(dir) = &a.record {
-                std::fs::write(
-                    dir.join(format!("frame_{:06}.jpg", frame.sequence)),
-                    frame.data,
-                )?;
-            }
-        }
-        if a.per_frame || last_report.elapsed() >= Duration::from_secs(1) {
-            last_report = Instant::now();
-            match (&quad, aim) {
-                (Some(q), Some(am)) => println!(
-                    "{:>7.2}s seq={:<6} aim=({:6.2}%, {:6.2}%) corners TL({:.0},{:.0}) TR({:.0},{:.0}) BR({:.0},{:.0}) BL({:.0},{:.0}){} blob {}x{} proc={} age={}",
-                    start.elapsed().as_secs_f64(), frame.sequence, am[0], am[1],
-                    q.corners[0][0], q.corners[0][1], q.corners[1][0], q.corners[1][1],
-                    q.corners[2][0], q.corners[2][1], q.corners[3][0], q.corners[3][1],
-                    if q.clipped { " CLIPPED" } else { "" }, q.blob.width() * 2, q.blob.height() * 2,
-                    fmt_ms(proc), frame.age().map_or("-".into(), fmt_ms)
-                ),
-                _ => {
-                    let (mean, max) = luma::luma_stats(&l);
-                    println!("{:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={}", start.elapsed().as_secs_f64(), frame.sequence, mean, max, fmt_ms(proc));
-                }
-            }
-        }
-    }
-    let wall = start.elapsed();
-    let mut pt = proc_times.clone();
-    pt.sort_unstable();
-    let p95 = pt
-        .get(pt.len().saturating_sub(1) * 95 / 100)
-        .copied()
-        .unwrap_or_default();
+    let stop = AtomicBool::new(false);
+    let status = Arc::new(Mutex::new(Status::default()));
+    run_tracker(&name, &camera, gun, &opts, &stop, &status)?;
+    let s = status.lock().map(|s| s.clone()).unwrap_or_default();
     println!(
-        "frames={} found={} ({:.0}%) fps={:.1} processing mean={} p95={} max={}",
-        n,
-        found,
-        if n > 0 {
-            f64::from(found) * 100.0 / f64::from(n)
+        "frames={} found={} ({:.0}%) processing mean={} age mean={} events={}",
+        s.frames,
+        s.found,
+        if s.frames > 0 {
+            s.found as f64 * 100.0 / s.frames as f64
         } else {
             0.0
         },
-        f64::from(n) / wall.as_secs_f64().max(1e-9),
-        fmt_ms(pt.iter().sum::<Duration>() / u32::try_from(pt.len().max(1)).unwrap_or(1)),
-        fmt_ms(p95),
-        fmt_ms(pt.last().copied().unwrap_or_default())
+        fmt_ms(s.proc_mean),
+        fmt_ms(s.age_mean),
+        s.events
     );
-    if let Some(q) = last_quad {
-        println!("last corners: {:?}", q.corners);
+    if let Some(q) = s.last_quad {
+        println!("last corners: {q:?}");
     }
     Ok(())
+}
+
+/// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
+#[cfg(target_os = "linux")]
+fn run_all(ctx: &Ctx) -> Result<()> {
+    use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
+            .context("installing Ctrl-C handler")?;
+    }
+    let guns = discovery::find_guns()?;
+    let cams = discovery::find_cameras()?;
+    if guns.is_empty() {
+        bail!("no guns attached");
+    }
+    let mut handles = Vec::new();
+    let mut statuses = Vec::new();
+    for g in &guns {
+        let port = g.port.to_string_lossy().into_owned();
+        let Some(cam) = g.sibling_camera(&cams) else {
+            warn!("{port}: no camera paired on the same hub; skipping");
+            continue;
+        };
+        let mut gun = match connect(&port, ctx.cfg.global.auto_recover) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("{port}: {e:#}; skipping");
+                continue;
+            }
+        };
+        let id = gun.unique_id().ok();
+        let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+        sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap())?;
+        info!(
+            "[{}] {port} + {} (id {})",
+            gc.name,
+            cam.node.display(),
+            id.as_deref().unwrap_or("?")
+        );
+        let opts = TrackerOptions {
+            display: ctx.display.clone(),
+            threshold: None,
+            min_size: None,
+            flip: None,
+            orientation: None,
+            cal_x: None,
+            cal_y: None,
+            buffers: 4,
+            frames: 0,
+            record: None,
+            per_frame: false,
+            report_every: None,
+        };
+        let status = Arc::new(Mutex::new(Status {
+            name: gc.name.clone(),
+            ..Default::default()
+        }));
+        statuses.push(status.clone());
+        let stop = stop.clone();
+        let name = gc.name.clone();
+        let camera = cam.node.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(name.clone())
+                .spawn(move || {
+                    let r = run_tracker(&name, &camera, Some((gun, gc)), &opts, &stop, &status);
+                    if let Err(e) = &r {
+                        if let Ok(mut s) = status.lock() {
+                            s.error = Some(format!("{e:#}"));
+                        }
+                    }
+                    r
+                })?,
+        );
+    }
+    if handles.is_empty() {
+        bail!("no gun could be started");
+    }
+    info!("running {} gun(s); Ctrl-C to stop", handles.len());
+    let started = Instant::now();
+    while !stop.load(Ordering::Relaxed) && handles.iter().any(|h| !h.is_finished()) {
+        std::thread::sleep(Duration::from_secs(1));
+        let mut line = format!("{:>6.0}s", started.elapsed().as_secs_f64());
+        for st in &statuses {
+            let s = st.lock().map(|s| s.clone()).unwrap_or_default();
+            let aim = s.last_aim.map_or("   --  ,   --  ".into(), |a| {
+                format!("{:6.2}%,{:6.2}%", a[0], a[1])
+            });
+            line.push_str(&format!(
+                " | {}: {:.0}fps found {:.0}% aim {} proc {:.2}ms{}{}",
+                s.name,
+                s.fps,
+                if s.frames > 0 {
+                    s.found as f64 * 100.0 / s.frames as f64
+                } else {
+                    0.0
+                },
+                aim,
+                s.proc_mean.as_secs_f64() * 1000.0,
+                if s.clipped { " clipped" } else { "" },
+                s.error
+                    .as_deref()
+                    .map_or(String::new(), |e| format!(" ERROR {e}"))
+            ));
+        }
+        println!("{line}");
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("tracker failed: {e:#}"),
+            Err(_) => warn!("tracker panicked"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_all(_ctx: &Ctx) -> Result<()> {
+    bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1858,10 +2064,9 @@ fn firmware(cmd: FirmwareCmd) -> Result<()> {
         FirmwareCmd::Backup { port, out } => {
             let port = default_port(port)?;
             let out = out.unwrap_or_else(|| {
-                PathBuf::from(format!(
-                    "corpus/firmware/backup-{}.hex",
-                    chrono_like_stamp()
-                ))
+                sindenrs::config::default_data_dir()
+                    .join("firmware")
+                    .join(format!("backup-{}.hex", chrono_like_stamp()))
             });
             let mut bl = open_bootloader(&port)?;
             let data = bl.read_flash(0, FLASH_SIZE, |done| {
@@ -1909,10 +2114,9 @@ fn firmware(cmd: FirmwareCmd) -> Result<()> {
                 app_end,
                 app_end / PAGE_SIZE
             );
-            let backup = PathBuf::from(format!(
-                "corpus/firmware/backup-{}-before-flash.hex",
-                chrono_like_stamp()
-            ));
+            let backup = sindenrs::config::default_data_dir()
+                .join("firmware")
+                .join(format!("backup-{}-before-flash.hex", chrono_like_stamp()));
             let mut bl = open_bootloader(&port)?;
             let current = bl.read_flash(0, FLASH_SIZE, |_| {})?;
             save_image(&backup, &Image::from_binary(&current))?;
@@ -1979,4 +2183,542 @@ fn chrono_like_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     format!("{secs}")
+}
+
+/// Target positions in screen percent, row-major and 1-indexed to match `tools/targets.html`.
+fn grid_targets(n: u32) -> Vec<[f64; 2]> {
+    let mut out = Vec::new();
+    let d = f64::from(n - 1);
+    for r in 0..n {
+        for c in 0..n {
+            out.push([
+                10.0 + 80.0 * f64::from(c) / d,
+                10.0 + 80.0 * f64::from(r) / d,
+            ]);
+        }
+    }
+    out
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    if v.len() % 2 == 1 {
+        v[v.len() / 2]
+    } else {
+        (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0
+    }
+}
+
+/// The image transform the tracker applies, from the display profile.
+fn flip_from_config(f: sindenrs::config::Flip) -> sindenrs::vision::acquire::Flip {
+    use sindenrs::config::Flip as C;
+    use sindenrs::vision::acquire::Flip as V;
+    match f {
+        C::None => V::None,
+        C::Horizontal => V::Horizontal,
+        C::Vertical => V::Vertical,
+        C::Both => V::Both,
+    }
+}
+
+/// Short tag for a frame's tracking quality, used in debug capture filenames.
+#[cfg(target_os = "linux")]
+fn quality_tag(q: sindenrs::overlay::Quality) -> &'static str {
+    use sindenrs::overlay::Quality;
+    match q {
+        Quality::Good => "ok",
+        Quality::Clipped => "clipped",
+        Quality::Lost => "lost",
+    }
+}
+
+/// What the measuring thread hands back.
+#[derive(Default)]
+struct AimResult {
+    measured: Vec<Option<[f64; 2]>>,
+    /// The border quad seen at each capture, needed to turn a screen-space error back into a
+    /// camera-space bore offset.
+    quads: Vec<Option<[[f64; 2]; 4]>>,
+    gun_id: Option<String>,
+    gun_name: String,
+    frames: u64,
+    usable: u64,
+    clipped: u64,
+    events: std::collections::BTreeMap<String, u32>,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
+    use sindenrs::overlay::{Quality, Scene};
+    use sindenrs::protocol::event::Event;
+    use sindenrs::runtime::{run_tracker_with, Flow, Sample, Status, TrackerOptions};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    if !(3..=5).contains(&a.grid) {
+        bail!("--grid must be 3, 4 or 5");
+    }
+    let targets = grid_targets(a.grid);
+    let camera = default_camera(a.settings.device.clone())?;
+    let port = default_port(a.port.clone())?;
+
+    // Camera settings: the display profile, with any CLI flags taking precedence.
+    let mut display = ctx.display.clone();
+    let cs = camera_settings_from(&display, &a.settings);
+    if let Some(e) = &cs.exposure {
+        display.exposure = if e == "auto" {
+            sindenrs::config::Exposure::Auto(sindenrs::config::AutoWord::Auto)
+        } else {
+            sindenrs::config::Exposure::Manual(
+                e.parse().with_context(|| format!("bad --exposure {e:?}"))?,
+            )
+        };
+    }
+    display.brightness = cs.brightness;
+    display.contrast = cs.contrast;
+    let opts = TrackerOptions {
+        display,
+        threshold: None,
+        min_size: None,
+        flip: None,
+        orientation: None,
+        cal_x: None,
+        cal_y: None,
+        buffers: a.settings.buffers,
+        frames: 0,
+        record: None,
+        per_frame: false,
+        report_every: None,
+    };
+
+    let scene = Arc::new(Mutex::new(Scene {
+        border_frac: a.thickness / 100.0,
+        targets: targets.clone(),
+        current: Some(0),
+        measured: vec![None; targets.len()],
+        ..Default::default()
+    }));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
+            .context("installing Ctrl-C handler")?;
+    }
+
+    println!("Aim at the ringed target and pull the trigger. Escape quits.");
+    println!("The overlay shows everything: the ring is the target, the dot is where the driver");
+    println!("thinks you are pointing, and the square bottom-left is green only while the whole");
+    println!("border is in the camera's view.");
+
+    // The window event loop must own the main thread, so the measuring runs on a worker.
+    let debug_dir = match &a.debug_dir {
+        Some(p) if p.as_os_str().is_empty() => None,
+        Some(p) => Some(p.clone()),
+        None => Some(
+            sindenrs::config::default_cache_dir()
+                .join("aim")
+                .join(chrono_like_stamp()),
+        ),
+    };
+    if let Some(d) = &debug_dir {
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+        println!("saving a frame per shot to {}", d.display());
+    }
+    let status = Arc::new(Mutex::new(Status::default()));
+    let cfg = ctx.cfg.clone();
+    let recoil_gap = ctx.cfg.recoil_gap();
+    let recover = ctx.cfg.global.auto_recover;
+    let worker = {
+        let (scene, stop, targets) = (scene.clone(), stop.clone(), targets.clone());
+        let debug_dir = debug_dir.clone();
+        let status = status.clone();
+        std::thread::Builder::new().name("aim-test".into()).spawn(move || -> Result<AimResult> {
+            let finish = |stop: &AtomicBool| stop.store(true, Ordering::Relaxed);
+            let mut gun = match connect(&port, recover) {
+                Ok(g) => g,
+                Err(e) => {
+                    finish(&stop);
+                    return Err(e);
+                }
+            };
+            let id = gun.unique_id().ok();
+            let gc = gun_config_for(&cfg, &port, id.as_deref());
+            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
+                finish(&stop);
+                return Err(e);
+            }
+
+            // A capture needs the whole border in view: when it runs off the edge of the
+            // camera frame the detected quad is only the visible part, so the solve is badly
+            // wrong. The reading is the median of the usable aim points in a short window
+            // around the pull, so the pull itself cannot drag it. The press is latched rather
+            // than serviced immediately, because it usually lands on a frame with no usable
+            // aim, and dropping it there silently desynchronises the target numbering from
+            // where the shooter is actually pointing.
+            let window = Duration::from_millis(600);
+            // Six frames inside a 600 ms window can straddle a movement between targets when
+            // most frames are unusable, which produced a 38%-error outlier; require enough of
+            // them, and that they agree, before trusting a reading.
+            let min_good = 12usize;
+            let give_up = Duration::from_millis(1200);
+            let use_dwell = matches!(a.capture, CaptureMode::Dwell | CaptureMode::Either);
+            let use_trigger = matches!(a.capture, CaptureMode::Trigger | CaptureMode::Either);
+            let mut out = AimResult {
+                measured: vec![None; targets.len()],
+                quads: vec![None; targets.len()],
+                gun_id: id.clone(),
+                gun_name: gc.name.clone(),
+                ..Default::default()
+            };
+            // Every shot's frame is kept so a bad reading can be looked at afterwards.
+            let mut shot = 0u32;
+            let save = |dir: &Option<PathBuf>, name: &str, raw: &[u8]| {
+                if let Some(d) = dir {
+                    if let Err(e) = std::fs::write(d.join(name), raw) {
+                        warn!("could not save {name}: {e}");
+                    }
+                }
+            };
+            let mut idx = 0usize;
+            let mut trigger_was_down = false;
+            let mut ring: std::collections::VecDeque<(Instant, [f64; 2])> = std::collections::VecDeque::new();
+            let mut pending: Option<Instant> = None;
+            let mut dwell_armed = true;
+            let mut captured_at: Option<[f64; 2]> = None;
+            let mut hook = |s: &Sample| -> Flow {
+                out.frames += 1;
+                let mut pressed = false;
+                for ev in s.events {
+                    *out.events.entry(format!("{ev:?}")).or_default() += 1;
+                    match ev {
+                        Event::Buttons { state1, .. } => {
+                            let down = state1 & 1 != 0;
+                            if down && !trigger_was_down {
+                                pressed = true;
+                            }
+                            trigger_was_down = down;
+                        }
+                        Event::TriggerEnabled => pressed = true,
+                        _ => {}
+                    }
+                }
+                let now = Instant::now();
+                let (usable, quality) = match (s.aim, s.quad.as_ref()) {
+                    (Some(aim), Some(q)) if !q.clipped => {
+                        out.usable += 1;
+                        (Some(aim), Quality::Good)
+                    }
+                    (_, Some(q)) if q.clipped => {
+                        out.clipped += 1;
+                        (None, Quality::Clipped)
+                    }
+                    _ => (None, Quality::Lost),
+                };
+                if let Some(aim) = usable {
+                    ring.push_back((now, aim));
+                }
+                while ring.front().is_some_and(|(t, _)| now.duration_since(*t) > window) {
+                    ring.pop_front();
+                }
+                if let Ok(mut sc) = scene.lock() {
+                    sc.aim = s.aim;
+                    sc.quality = quality;
+                }
+                if use_trigger && pressed && pending.is_none() {
+                    pending = Some(now);
+                    shot += 1;
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-pull-{}.jpg", idx + 1, shot, quality_tag(quality)), s.raw);
+                }
+                let steady = use_dwell && dwell_armed && ring.len() >= a.samples.max(4) as usize && {
+                    let mx = median(ring.iter().map(|(_, p)| p[0]).collect());
+                    let my = median(ring.iter().map(|(_, p)| p[1]).collect());
+                    ring.iter().all(|(_, p)| (p[0] - mx).hypot(p[1] - my) <= a.dwell_radius)
+                };
+                let ready = ring.len() >= min_good;
+                if !(ready && (steady || pending.is_some())) {
+                    if pending.is_some_and(|t| now.duration_since(t) > give_up) {
+                        println!(
+                            "  target {:>2}: could not measure, only {} usable frame(s); the border is not fully in the camera's view. Step back, then pull again.",
+                            idx + 1,
+                            ring.len()
+                        );
+                        if let Ok(mut sc) = scene.lock() {
+                            sc.flash_until = Some(now + Duration::from_millis(700));
+                        }
+                        save(&debug_dir, &format!("t{:02}-shot{:02}-unmeasurable.jpg", idx + 1, shot), s.raw);
+                        pending = None;
+                    }
+                    if !dwell_armed
+                        && captured_at.is_some_and(|c| usable.is_some_and(|aim| (aim[0] - c[0]).hypot(aim[1] - c[1]) > a.rearm_distance))
+                    {
+                        dwell_armed = true;
+                    }
+                    return Flow::Continue;
+                }
+                let got = [
+                    median(ring.iter().map(|(_, p)| p[0]).collect()),
+                    median(ring.iter().map(|(_, p)| p[1]).collect()),
+                ];
+                let scatter = ring
+                    .iter()
+                    .map(|(_, p)| (p[0] - got[0]).hypot(p[1] - got[1]))
+                    .fold(0.0_f64, f64::max);
+                if scatter > a.steady_tolerance {
+                    println!(
+                        "  target {:>2}: aim was not steady (samples spread {scatter:.1}% of screen); pull again.",
+                        idx + 1
+                    );
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-unsteady.jpg", idx + 1, shot), s.raw);
+                    if let Ok(mut sc) = scene.lock() {
+                        sc.flash_until = Some(now + Duration::from_millis(700));
+                    }
+                    pending = None;
+                    ring.clear();
+                    return Flow::Continue;
+                }
+                let want = targets[idx];
+                let err = (got[0] - want[0]).hypot(got[1] - want[1]);
+                println!(
+                    "  target {:>2}: want ({:5.1}%, {:5.1}%)  got ({:5.1}%, {:5.1}%)  dx {:+6.2} dy {:+6.2}  err {:5.2}%  [{}, {} frames]",
+                    idx + 1,
+                    want[0], want[1], got[0], got[1],
+                    got[0] - want[0], got[1] - want[1], err,
+                    if pending.is_some() { "trigger" } else { "held steady" },
+                    ring.len()
+                );
+                save(&debug_dir, &format!("t{:02}-shot{:02}-measured.jpg", idx + 1, shot), s.raw);
+                out.measured[idx] = Some(got);
+                out.quads[idx] = s.quad.as_ref().map(|q| q.corners);
+                captured_at = Some(got);
+                pending = None;
+                dwell_armed = false;
+                ring.clear();
+                idx += 1;
+                if let Ok(mut sc) = scene.lock() {
+                    sc.measured[idx - 1] = Some(got);
+                    sc.current = (idx < targets.len()).then_some(idx);
+                    sc.done = idx >= targets.len();
+                }
+                if idx >= targets.len() {
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            };
+            let r = run_tracker_with(
+                "aim-test",
+                &camera,
+                Some((gun, gc)),
+                &opts,
+                &stop,
+                &status,
+                &mut hook,
+            );
+            finish(&stop);
+            r.map(|()| out)
+        })?
+    };
+
+    sindenrs::overlay::run(scene, stop)?;
+    let out = worker
+        .join()
+        .map_err(|_| anyhow!("the measuring thread panicked"))??;
+
+    println!(
+        "\nframes {}: {} usable ({:.0}%), {} with the border clipped at the frame edge ({:.0}%)",
+        out.frames,
+        out.usable,
+        if out.frames > 0 {
+            out.usable as f64 * 100.0 / out.frames as f64
+        } else {
+            0.0
+        },
+        out.clipped,
+        if out.frames > 0 {
+            out.clipped as f64 * 100.0 / out.frames as f64
+        } else {
+            0.0
+        }
+    );
+    if out.events.is_empty() {
+        println!("no events were received from the gun, so the trigger could not be used");
+    }
+    let done: Vec<(usize, [f64; 2], [f64; 2])> = out
+        .measured
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.map(|g| (i, targets[i], g)))
+        .collect();
+    if done.is_empty() {
+        println!("no targets measured");
+        return Ok(());
+    }
+    let errs: Vec<f64> = done
+        .iter()
+        .map(|(_, w, g)| (g[0] - w[0]).hypot(g[1] - w[1]))
+        .collect();
+    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+    let max = errs.iter().copied().fold(0.0_f64, f64::max);
+    let dx: Vec<f64> = done.iter().map(|(_, w, g)| g[0] - w[0]).collect();
+    let dy: Vec<f64> = done.iter().map(|(_, w, g)| g[1] - w[1]).collect();
+    let bias = [
+        dx.iter().sum::<f64>() / dx.len() as f64,
+        dy.iter().sum::<f64>() / dy.len() as f64,
+    ];
+    println!("\n{} of {} targets measured", done.len(), targets.len());
+    println!("error: mean {mean:.2}% of screen, max {max:.2}%");
+    println!(
+        "systematic bias: dx {:+.2}%, dy {:+.2}%  (cancel with display.offset_x / offset_y)",
+        bias[0], bias[1]
+    );
+    let spread = [
+        (dx.iter().map(|v| (v - bias[0]).powi(2)).sum::<f64>() / dx.len() as f64).sqrt(),
+        (dy.iter().map(|v| (v - bias[1]).powi(2)).sum::<f64>() / dy.len() as f64).sqrt(),
+    ];
+    println!(
+        "after removing that bias: dx spread {:.2}%, dy spread {:.2}%  (what a correction field would have to fix)",
+        spread[0], spread[1]
+    );
+    // Turn the constant part of the error into a bore offset. It has to be expressed in the
+    // camera's frame rather than as a screen-percent trim: the bore is an angular property of
+    // the gun, so a frame-relative offset stays correct when you move closer or further away,
+    // whereas a screen-percent trim only holds at the distance it was measured.
+    let geom = status
+        .lock()
+        .map(|s| (s.aim_pixel, s.frame))
+        .unwrap_or(([0.0; 2], (0, 0)));
+    let (aim_px, (fw, fh)) = geom;
+    if fw > 0 && fh > 0 {
+        let d = &ctx.display;
+        let flip = flip_from_config(d.flip);
+        let mut cals = Vec::new();
+        for (i, want, _got) in &done {
+            let Some(corners) = out.quads[*i] else {
+                continue;
+            };
+            // Undo the trims to get the raw solve the homography must produce.
+            let raw = [
+                (want[0] - d.offset_x) / d.ratio_x,
+                (want[1] + d.gunsight_y - d.offset_y) / d.ratio_y,
+            ];
+            let to_camera = sindenrs::vision::homography::quad_to_quad(
+                &sindenrs::vision::homography::SCREEN_PERCENT,
+                &corners,
+            );
+            let Some(p_want) = to_camera.apply(raw) else {
+                continue;
+            };
+            // Where the bore axis should sit, back in unflipped camera pixels.
+            let unflipped = sindenrs::vision::acquire::flip_point(p_want, fw, fh, flip);
+            #[allow(clippy::cast_precision_loss)]
+            let (fwf, fhf) = (fw as f64, fh as f64);
+            cals.push([
+                (unflipped[0] - fwf / 2.0) * 100.0 / (fwf * d.orientation),
+                (unflipped[1] - fhf / 2.0) * 100.0 / (fhf * d.orientation),
+            ]);
+        }
+        if !cals.is_empty() {
+            let n = cals.len() as f64;
+            let cal = [
+                cals.iter().map(|c| c[0]).sum::<f64>() / n,
+                cals.iter().map(|c| c[1]).sum::<f64>() / n,
+            ];
+            let spread = [
+                (cals.iter().map(|c| (c[0] - cal[0]).powi(2)).sum::<f64>() / n).sqrt(),
+                (cals.iter().map(|c| (c[1] - cal[1]).powi(2)).sum::<f64>() / n).sqrt(),
+            ];
+            println!(
+                "\nbore calibration from {} point(s): x {:+.2}%, y {:+.2}% of frame (agreement +/-{:.2}, {:.2})",
+                cals.len(), cal[0], cal[1], spread[0], spread[1]
+            );
+            println!(
+                "current aim pixel ({:.1}, {:.1}) of {fw}x{fh}",
+                aim_px[0], aim_px[1]
+            );
+            if a.apply {
+                let path = ctx.path.clone();
+                apply_calibration(&path, out.gun_id.as_deref(), &out.gun_name, cal)?;
+                println!("wrote calibration_x/calibration_y into {}", path.display());
+                println!("re-run the aim test to confirm the error drops to the spread above");
+            } else {
+                println!("pass --apply to write this into the config, or set it by hand:");
+                println!(
+                    "  [[gun]] calibration_x = {:.2}\n  [[gun]] calibration_y = {:.2}",
+                    cal[0], cal[1]
+                );
+            }
+        }
+    }
+
+    if let Some(out_path) = &a.out {
+        if let Some(d) = out_path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let mut f = std::fs::File::create(out_path)?;
+        use std::io::Write as _;
+        writeln!(f, "target,want_x,want_y,got_x,got_y,dx,dy,err")?;
+        for (i, w, g) in &done {
+            writeln!(
+                f,
+                "{},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3}",
+                i + 1,
+                w[0],
+                w[1],
+                g[0],
+                g[1],
+                g[0] - w[0],
+                g[1] - w[1],
+                (g[0] - w[0]).hypot(g[1] - w[1])
+            )?;
+        }
+        println!("wrote {}", out_path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn aim_test(_ctx: &Ctx, _a: AimTestArgs) -> Result<()> {
+    bail!("the aim test needs the camera backend, which is not implemented on this platform yet")
+}
+
+/// Write the measured bore offsets into the gun's config entry, preserving formatting and
+/// comments. Matches the entry by the gun's unique id, falling back to its name.
+fn apply_calibration(path: &Path, id: Option<&str>, name: &str, cal: [f64; 2]) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let guns = doc
+        .get_mut("gun")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} has no [[gun]] entries; run `sindenrs config init` first",
+                path.display()
+            )
+        })?;
+    let mut done = false;
+    for t in guns.iter_mut() {
+        let matches_id = id.is_some_and(|want| {
+            t.get("match")
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(want)
+        });
+        let matches_name = t.get("name").and_then(|v| v.as_str()) == Some(name);
+        if matches_id || (id.is_none() && matches_name) {
+            t["calibration_x"] = toml_edit::value(cal[0]);
+            t["calibration_y"] = toml_edit::value(cal[1]);
+            done = true;
+            break;
+        }
+    }
+    if !done {
+        bail!("no [[gun]] entry matched this gun (id {id:?}, name {name:?})");
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }

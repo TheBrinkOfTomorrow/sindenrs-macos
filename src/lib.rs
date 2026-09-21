@@ -18,6 +18,8 @@ pub mod discovery;
 pub mod firmware;
 pub mod gun;
 pub mod ids;
+pub mod overlay;
 pub mod protocol;
+pub mod runtime;
 pub mod usb;
 pub mod vision;

@@ -413,7 +413,7 @@ impl Gun {
         debug!(n = frames.len(), "button map sent");
         self.send_recoil_burst(&cfg.recoil, recoil_gap)?;
         self.set_calibration_mode_enabled(cfg.calibration_mode)?;
-        self.set_secondary_serial(false)?;
+        self.set_secondary_serial(cfg.buttons_over_serial)?;
         self.set_recoil_toggle_enabled(cfg.recoil_toggle)?;
         self.set_joystick_mode(cfg.joystick)?;
         self.set_low_resource_mode(false)?;

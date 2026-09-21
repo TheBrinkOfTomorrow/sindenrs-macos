@@ -24,6 +24,18 @@
     let
       eachSystem = nixpkgs.lib.genAttrs (import systems);
 
+      # The overlay window (winit + softbuffer) loads these at runtime with dlopen, so they
+      # never appear as DT_NEEDED and cannot be found by rpath patching; the binary and the
+      # dev shell both get them on LD_LIBRARY_PATH instead.
+      graphicsLibs = pkgs: with pkgs; [
+        wayland
+        libxkbcommon
+        libx11
+        libxcursor
+        libxrandr
+        libxi
+      ];
+
       # Helper to get pkgs for a system with rust-overlay applied
       pkgsFor = system: import nixpkgs {
         inherit system;
@@ -57,7 +69,8 @@
 
           buildInputs = [
             # Add additional build inputs here
-          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux (graphicsLibs pkgs)
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
             pkgs.darwin.apple_sdk.frameworks.Security
           ];
@@ -171,6 +184,14 @@
             inherit cargoArtifacts;
             # Only run tests during the check phase, not during build
             doCheck = false;
+
+            nativeBuildInputs = commonArgs.nativeBuildInputs
+              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.makeWrapper ];
+
+            postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              wrapProgram $out/bin/sindenrs \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (graphicsLibs pkgs)}
+            '';
           });
 
           sindenrs = self.packages.${system}.default;
@@ -261,6 +282,9 @@
             # Environment variables for development
             RUST_BACKTRACE = "1";
             RUST_LOG = "debug";
+
+            # winit/softbuffer dlopen these, so `cargo run` needs them on the library path.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (graphicsLibs pkgs);
           };
         });
 

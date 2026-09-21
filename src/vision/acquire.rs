@@ -440,6 +440,24 @@ pub fn flip_luma(luma: &mut [u8], w: usize, flip: Flip) {
     }
 }
 
+/// Map a point through the same [`Flip`] that is applied to the image.
+///
+/// The bore offset is measured in the camera's own frame, so once the image is flipped for
+/// detection the aim point has to be flipped with it. Leaving it unflipped applies the offset
+/// backwards, which shows up as a constant aim bias of twice the bore offset.
+pub fn flip_point(p: P2, w: usize, h: usize, flip: Flip) -> P2 {
+    // `flip_luma` reverses the pixel order, so index i becomes len-1-i; the point transform
+    // has to use the same convention or it lands a pixel out.
+    #[allow(clippy::cast_precision_loss)]
+    let (fw, fh) = ((w - 1) as f64, (h - 1) as f64);
+    match flip {
+        Flip::None => p,
+        Flip::Horizontal => [fw - p[0], p[1]],
+        Flip::Vertical => [p[0], fh - p[1]],
+        Flip::Both => [fw - p[0], fh - p[1]],
+    }
+}
+
 /// The stock aim model: the camera pixel the bore points at, given the bore offset in percent
 /// of frame and the camera orientation sign (-1 for modern boards, +1 for legacy).
 pub fn aim_pixel(
@@ -509,6 +527,23 @@ mod tests {
         assert!(
             (aim[0] - 50.0).abs() < 1.0 && (aim[1] - 50.0).abs() < 1.0,
             "{aim:?}"
+        );
+    }
+
+    #[test]
+    fn flip_point_matches_image_flip() {
+        let p = [347.9, 219.9];
+        assert_eq!(flip_point(p, 640, 480, Flip::None), p);
+        let b = flip_point(p, 640, 480, Flip::Both);
+        assert!(
+            (b[0] - 291.1).abs() < 1e-9 && (b[1] - 259.1).abs() < 1e-9,
+            "{b:?}"
+        );
+        // Flipping twice is the identity (to within floating-point noise).
+        let back = flip_point(b, 640, 480, Flip::Both);
+        assert!(
+            (back[0] - p[0]).abs() < 1e-9 && (back[1] - p[1]).abs() < 1e-9,
+            "{back:?}"
         );
     }
 
