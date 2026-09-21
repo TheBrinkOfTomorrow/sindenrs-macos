@@ -61,6 +61,9 @@ enum Cmd {
     },
     /// Measure aim accuracy: aim at each target the overlay lights up and pull the trigger.
     AimTest(Box<AimTestArgs>),
+    /// Run border detection over recorded frames (from `track --record`) and report how each
+    /// frame was solved; optionally fit the lens distortion coefficient to them.
+    Replay(ReplayArgs),
     /// Camera capture and measurement.
     Camera {
         #[command(subcommand)]
@@ -71,6 +74,28 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GunCmd,
     },
+}
+
+#[derive(Args)]
+struct ReplayArgs {
+    /// Directories of recorded .jpg frames.
+    #[arg(required = true)]
+    dirs: Vec<PathBuf>,
+    /// Use every Nth frame.
+    #[arg(long, default_value_t = 1)]
+    every: usize,
+    /// Luma threshold (config: display.threshold).
+    #[arg(long)]
+    threshold: Option<u8>,
+    /// Lens distortion coefficient to detect with (config: global.lens_k1).
+    #[arg(long, allow_hyphen_values = true)]
+    lens_k1: Option<f64>,
+    /// Search for the lens coefficient that straightens the border edges, and report it.
+    #[arg(long)]
+    fit_lens: bool,
+    /// Print one line per frame.
+    #[arg(long)]
+    per_frame: bool,
 }
 
 #[derive(Subcommand)]
@@ -559,6 +584,7 @@ fn main() -> Result<()> {
             sindenrs::overlay::run(scene, Arc::new(AtomicBool::new(false)))
         }
         Cmd::AimTest(a) => aim_test(&ctx, *a),
+        Cmd::Replay(a) => replay(&ctx, &a),
         Cmd::Camera { cmd } => camera(cmd),
         Cmd::Gun { cmd } => gun(&ctx, cmd),
     }
@@ -2203,6 +2229,125 @@ fn grid_targets(n: u32) -> Vec<[f64; 2]> {
         }
     }
     out
+}
+
+/// Detection over recorded frames, with an optional lens fit.
+fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
+    use sindenrs::vision::acquire::{acquire, flip_luma, AcquireParams};
+    use sindenrs::vision::lensfit::{fit_k1, score, FitFrame};
+    use sindenrs::vision::luma::mjpeg_to_luma;
+
+    let flip = flip_from_config(ctx.display.flip);
+    let mut params = AcquireParams {
+        threshold: a.threshold.unwrap_or(ctx.display.threshold),
+        min_size: ctx.display.min_size,
+        lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
+        ..Default::default()
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in &a.dirs {
+        let mut in_dir: Vec<PathBuf> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .collect();
+        in_dir.sort();
+        files.extend(in_dir.into_iter().step_by(a.every.max(1)));
+    }
+    if files.is_empty() {
+        bail!("no .jpg frames found");
+    }
+    let mut frames: Vec<(PathBuf, usize, usize, Vec<u8>)> = Vec::new();
+    for f in &files {
+        let data = std::fs::read(f)?;
+        let Ok((w, h, mut l)) = mjpeg_to_luma(&data) else {
+            warn!("{}: jpeg decode failed", f.display());
+            continue;
+        };
+        let (w, h) = (w as usize, h as usize);
+        flip_luma(&mut l, w, flip);
+        frames.push((f.clone(), w, h, l));
+    }
+    println!(
+        "{} frames, threshold {}, flip {flip:?}",
+        frames.len(),
+        params.threshold
+    );
+
+    if a.fit_lens {
+        let fit_frames: Vec<FitFrame> = frames
+            .iter()
+            .filter_map(|(_, w, h, l)| FitFrame::prepare(l, *w, *h, &params))
+            .collect();
+        println!(
+            "fitting lens k1 on {} frames with a border blob",
+            fit_frames.len()
+        );
+        let (best, sweep) = fit_k1(&fit_frames, -0.3, 0.1, &params);
+        println!("{:>8} {:>8} {:>7}", "k1", "inliers", "rms_px");
+        for s in &sweep {
+            println!("{:>8.3} {:>8} {:>7.2}", s.k1, s.inliers, s.rms);
+        }
+        let zero = score(&fit_frames, 0.0, &params);
+        println!(
+            "\nbest k1 = {:.4} (inliers {}, rms {:.2} px); k1 = 0 gives inliers {}, rms {:.2} px",
+            best.k1, best.inliers, best.rms, zero.inliers, zero.rms
+        );
+        println!(
+            "set [global] lens_k1 = {:.4} in the config to use it",
+            best.k1
+        );
+        params.lens_k1 = best.k1;
+    }
+
+    let (mut lines, mut hull, mut none) = (0u32, 0u32, 0u32);
+    let t0 = Instant::now();
+    for (path, w, h, l) in &frames {
+        let q = acquire(l, *w, *h, &params);
+        let tag = match q {
+            Some(q) if q.from_lines => {
+                lines += 1;
+                "lines"
+            }
+            Some(_) => {
+                hull += 1;
+                "hull"
+            }
+            None => {
+                none += 1;
+                "none"
+            }
+        };
+        if a.per_frame {
+            let c = q.map_or([[f64::NAN; 2]; 4], |q| q.corners);
+            println!(
+                "{} {tag:<12} TL({:.1},{:.1}) TR({:.1},{:.1}) BR({:.1},{:.1}) BL({:.1},{:.1})",
+                path.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                c[0][0],
+                c[0][1],
+                c[1][0],
+                c[1][1],
+                c[2][0],
+                c[2][1],
+                c[3][0],
+                c[3][1]
+            );
+        }
+    }
+    let n = frames.len().max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let pct = |k: u32| f64::from(k) * 100.0 / n as f64;
+    println!(
+        "lens k1 {:.4}: {lines} solved from edge lines ({:.0}%), {hull} hull only, unreliable ({:.0}%), {none} not found ({:.0}%); {:.2} ms/frame",
+        params.lens_k1,
+        pct(lines),
+        pct(hull),
+        pct(none),
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+    );
+    Ok(())
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
