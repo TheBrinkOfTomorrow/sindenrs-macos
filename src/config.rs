@@ -107,6 +107,11 @@ pub struct Global {
     /// Pause between the frames of the recoil configuration burst, in ms. The vendor uses
     /// 100; measured: three of the frames answer within 2 ms and are drained, so 5 suffices.
     pub recoil_gap_ms: u64,
+    /// Camera lens radial distortion (division model, radius in half-frame-widths; negative
+    /// is barrel). A property of the camera module, so it lives here rather than per display.
+    /// The default was fitted on one gun with `sindenrs replay --fit-lens <recorded frames>`;
+    /// refit if the edges still bow in `replay --per-frame` output.
+    pub lens_k1: f64,
 }
 
 impl Default for Global {
@@ -115,6 +120,7 @@ impl Default for Global {
             log: "info".into(),
             auto_recover: true,
             recoil_gap_ms: 100,
+            lens_k1: -0.178,
         }
     }
 }

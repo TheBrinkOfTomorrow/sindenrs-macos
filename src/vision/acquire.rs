@@ -1,11 +1,15 @@
 //! Border acquisition: find the bright quadrilateral (the screen border) in a luma frame.
 //!
-//! This is the "ACQUIRE" mode of the redesign: threshold and 2x2 decimate, label connected
-//! components, take each large blob's outer boundary, reduce its convex hull to four
-//! corners, then push those corners back to full resolution. It is deliberately the plain,
-//! robust version; the sub-pixel edge tracker replaces it in steady state later.
+//! Threshold and 2x2 decimate, label connected components, take each large blob's boundary,
+//! undistort it, fit straight lines to it and intersect the outermost line on each side to
+//! get the corners. Because a line is pinned by any visible stretch of it, this works when
+//! the corners are outside the frame as long as all four edges cross it. When fewer than
+//! four sides are visible it falls back to the convex-hull quad of the blob, which is only
+//! honest if the blob is not clipped; a clipped hull quad is flagged as such.
 
 use super::homography::{quad_to_quad, Mat3, P2, SCREEN_PERCENT};
+use super::lens::Lens;
+use super::lines::{extract_lines, Line, Segment};
 
 #[derive(Clone, Copy, Debug)]
 pub struct AcquireParams {
@@ -13,8 +17,14 @@ pub struct AcquireParams {
     pub threshold: u8,
     /// Minimum blob width and height, in half-resolution pixels.
     pub min_size: u32,
-    /// Corner-refinement search radius at full resolution, in pixels.
+    /// Corner-refinement search radius at full resolution, in pixels (hull fallback only).
     pub refine_radius: i32,
+    /// Radial lens distortion coefficient; see [`Lens`].
+    pub lens_k1: f64,
+    /// Line-fit inlier tolerance at full resolution, in pixels.
+    pub line_tol: f64,
+    /// Minimum boundary points supporting a line, in half-resolution pixels.
+    pub line_min_points: usize,
 }
 
 impl Default for AcquireParams {
@@ -23,6 +33,9 @@ impl Default for AcquireParams {
             threshold: 128,
             min_size: 20,
             refine_radius: 3,
+            lens_k1: 0.0,
+            line_tol: 3.0,
+            line_min_points: 20,
         }
     }
 }
@@ -340,14 +353,19 @@ pub fn refine_corner(
     best
 }
 
-/// A detected border quad, corners at full resolution ordered TL, TR, BR, BL.
+/// A detected border quad, corners in undistorted full-resolution pixels ordered TL, TR,
+/// BR, BL.
 #[derive(Clone, Copy, Debug)]
 pub struct Quad {
     pub corners: [P2; 4],
     /// Half-resolution blob bounding box, for diagnostics.
     pub blob: Blob,
-    /// True if the blob touches the frame edge (the border is clipped; corners are unreliable).
+    /// True if the corners are unreliable: they came from the blob's hull rather than from
+    /// four fitted edge lines, so the border is clipped or malformed. Good for showing where
+    /// the border roughly is, not for aiming.
     pub clipped: bool,
+    /// True if the corners are intersections of fitted edge lines (false: hull fallback).
+    pub from_lines: bool,
 }
 
 impl Quad {
@@ -365,12 +383,146 @@ impl Quad {
     }
 }
 
+/// Which screen edge a boundary line belongs to, from its outward normal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn side_of(l: &Line) -> Side {
+    if l.b.abs() >= l.a.abs() {
+        if l.b < 0.0 {
+            Side::Top
+        } else {
+            Side::Bottom
+        }
+    } else if l.a < 0.0 {
+        Side::Left
+    } else {
+        Side::Right
+    }
+}
+
+/// Half-resolution boundary points pooled over every sizeable blob (long in at least one
+/// dimension), plus the first such blob. Line fitting works on the pool because a border
+/// with its corners off frame breaks into one strip per edge.
+#[must_use]
+pub fn pooled_boundary(
+    labels: &[u32],
+    mask_w: usize,
+    mask_h: usize,
+    blobs: &[Blob],
+    min_size: usize,
+) -> (Vec<P2>, Option<Blob>) {
+    let mut pooled: Vec<P2> = Vec::new();
+    let mut first: Option<Blob> = None;
+    for blob in blobs.iter().take(8) {
+        if blob.width().max(blob.height()) < min_size || (blob.area as usize) < 2 * min_size {
+            continue;
+        }
+        first.get_or_insert(*blob);
+        pooled.extend(boundary_points(labels, mask_w, mask_h, blob));
+    }
+    (pooled, first)
+}
+
+/// Fit straight lines to pooled half-resolution boundary points. Points on the frame edge
+/// are discarded (they are where the border leaves the frame, not an edge of it); the rest
+/// are pushed to full resolution, undistorted, and handed to the line extractor.
+#[must_use]
+pub fn edge_segments(
+    pts: &[P2],
+    mask_w: usize,
+    mask_h: usize,
+    lens: &Lens,
+    p: &AcquireParams,
+) -> Vec<Segment> {
+    #[allow(clippy::cast_precision_loss)]
+    let (xe, ye) = ((mask_w - 1) as f64, (mask_h - 1) as f64);
+    let full: Vec<P2> = pts
+        .iter()
+        .filter(|q| q[0] > 0.0 && q[1] > 0.0 && q[0] < xe && q[1] < ye)
+        .map(|q| lens.undistort([q[0] * 2.0 + 0.5, q[1] * 2.0 + 0.5]))
+        .collect();
+    if full.len() < 4 * p.line_min_points {
+        return Vec::new();
+    }
+    extract_lines(&full, p.line_tol, p.line_min_points, 8)
+}
+
+/// Corners from fitted edge lines: the outermost line on each of the four sides,
+/// intersected. Returns `None` unless all four sides were seen and the result is a convex
+/// quad of plausible size.
+#[must_use]
+pub fn quad_from_segments(segs: &[Segment], mask_w: usize, mask_h: usize) -> Option<[P2; 4]> {
+    let all: usize = segs.iter().map(|s| s.inliers.len()).sum();
+    if all == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = all as f64;
+    let centroid = segs
+        .iter()
+        .flat_map(|s| s.inliers.iter())
+        .fold([0.0, 0.0], |a, q| [a[0] + q[0] / n, a[1] + q[1] / n]);
+    // Outermost line per side: the largest distance from the centroid along its outward
+    // normal. The outer edge of a boundary pixel is one full-resolution pixel beyond its
+    // centre, so push each line out by that much.
+    let mut best: [Option<(f64, Line)>; 4] = [None; 4];
+    for s in segs {
+        let l = s.line.oriented_away_from(centroid).offset(1.0);
+        let d = -l.signed_dist(centroid);
+        let i = side_of(&l) as usize;
+        if best[i].is_none_or(|(bd, _)| d > bd) {
+            best[i] = Some((d, l));
+        }
+    }
+    let [top, right, bottom, left] = best.map(|b| b.map(|(_, l)| l));
+    let (top, right, bottom, left) = (top?, right?, bottom?, left?);
+    let q = [
+        top.intersect(&left)?,
+        top.intersect(&right)?,
+        bottom.intersect(&right)?,
+        bottom.intersect(&left)?,
+    ];
+    // Sanity: a convex quad with the expected winding and no absurd extrapolation.
+    #[allow(clippy::cast_precision_loss)]
+    let limit = 8.0 * (mask_w + mask_h) as f64;
+    if q.iter()
+        .any(|c| !c[0].is_finite() || !c[1].is_finite() || c[0].abs() > limit || c[1].abs() > limit)
+    {
+        return None;
+    }
+    for i in 0..4 {
+        if cross(q[i], q[(i + 1) % 4], q[(i + 2) % 4]) <= 0.0 {
+            return None;
+        }
+    }
+    Some(q)
+}
+
 /// Run the whole acquisition on a full-resolution luma frame.
 pub fn acquire(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Option<Quad> {
     let mask = decimate_threshold(luma, w, h, p.threshold);
     let (labels, blobs) = label(&mask);
+    let lens = Lens::centred(p.lens_k1, w, h);
+    let min = p.min_size as usize;
+    let (pooled, first) = pooled_boundary(&labels, mask.w, mask.h, &blobs, min);
+    if let Some(blob) = first {
+        let segs = edge_segments(&pooled, mask.w, mask.h, &lens, p);
+        if let Some(corners) = quad_from_segments(&segs, mask.w, mask.h) {
+            return Some(Quad {
+                corners,
+                blob,
+                clipped: false,
+                from_lines: true,
+            });
+        }
+    }
     for blob in blobs.iter().take(8) {
-        let min = p.min_size as usize;
         if blob.width() < min || blob.height() < min {
             continue;
         }
@@ -397,14 +549,25 @@ pub fn acquire(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Option<Qua
             (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0,
         ];
         let corners: [P2; 4] = core::array::from_fn(|i| {
-            refine_corner(luma, w, h, q[i], centroid, p.threshold, p.refine_radius)
+            lens.undistort(refine_corner(
+                luma,
+                w,
+                h,
+                q[i],
+                centroid,
+                p.threshold,
+                p.refine_radius,
+            ))
         });
-        let clipped =
-            blob.x0 == 0 || blob.y0 == 0 || blob.x1 == mask.w - 1 || blob.y1 == mask.h - 1;
+        // A hull quad is never trusted. If the line fit failed on a blob that does not touch
+        // the frame edge, the shape is not a four-sided border at all (recorded: a border
+        // page that was not yet fullscreen gave the hull a confident, wrong quad for 133
+        // frames), and if it does touch the edge the corners are synthesised.
         return Some(Quad {
             corners,
             blob: *blob,
-            clipped,
+            clipped: true,
+            from_lines: false,
         });
     }
     None
@@ -476,8 +639,42 @@ pub fn aim_pixel(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Draw a hollow quad border given in undistorted coordinates, as a lens with
+    /// coefficient `k1` would image it.
+    pub(crate) fn synth_through_lens(
+        w: usize,
+        h: usize,
+        outer: &[P2; 4],
+        inset: f64,
+        k1: f64,
+    ) -> Vec<u8> {
+        let lens = Lens::centred(k1, w, h);
+        let c = [
+            (outer[0][0] + outer[1][0] + outer[2][0] + outer[3][0]) / 4.0,
+            (outer[0][1] + outer[1][1] + outer[2][1] + outer[3][1]) / 4.0,
+        ];
+        let inner: [P2; 4] = core::array::from_fn(|i| {
+            [
+                c[0] + (outer[i][0] - c[0]) * inset,
+                c[1] + (outer[i][1] - c[1]) * inset,
+            ]
+        });
+        let inside = |q: &[P2; 4], p: P2| (0..4).all(|i| cross(q[i], q[(i + 1) % 4], p) >= 0.0);
+        let mut img = vec![10u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                #[allow(clippy::cast_precision_loss)]
+                let u = lens.undistort([x as f64, y as f64]);
+                if inside(outer, u) && !inside(&inner, u) {
+                    img[y * w + x] = 230;
+                }
+            }
+        }
+        img
+    }
 
     /// Draw a hollow quad border (white ring) into a black luma frame.
     fn synth(w: usize, h: usize, outer: &[P2; 4], inset: f64) -> Vec<u8> {
@@ -513,7 +710,7 @@ mod tests {
         let truth = [[95.0, 70.0], [548.0, 52.0], [566.0, 415.0], [78.0, 398.0]];
         let img = synth(w, h, &truth, 0.94);
         let q = acquire(&img, w, h, &AcquireParams::default()).expect("border found");
-        assert!(!q.clipped);
+        assert!(!q.clipped && q.from_lines);
         for (i, (got, want)) in q.corners.iter().zip(truth.iter()).enumerate() {
             let d = ((got[0] - want[0]).powi(2) + (got[1] - want[1]).powi(2)).sqrt();
             assert!(d <= 2.5, "corner {i}: got {got:?} want {want:?} (d={d:.2})");
@@ -528,6 +725,56 @@ mod tests {
             (aim[0] - 50.0).abs() < 1.0 && (aim[1] - 50.0).abs() < 1.0,
             "{aim:?}"
         );
+    }
+
+    /// All four corners outside the frame, all four edges crossing it: the line fits must
+    /// still recover the corners.
+    #[test]
+    fn finds_border_with_corners_off_frame() {
+        let (w, h) = (640, 480);
+        let truth = [[30.0, -30.0], [700.0, 30.0], [600.0, 510.0], [-30.0, 440.0]];
+        let img = synth(w, h, &truth, 0.96);
+        let q = acquire(&img, w, h, &AcquireParams::default()).expect("border found");
+        assert!(!q.clipped && q.from_lines, "{q:?}");
+        for (i, (got, want)) in q.corners.iter().zip(truth.iter()).enumerate() {
+            let d = ((got[0] - want[0]).powi(2) + (got[1] - want[1]).powi(2)).sqrt();
+            assert!(d <= 4.0, "corner {i}: got {got:?} want {want:?} (d={d:.2})");
+        }
+    }
+
+    /// Only two sides visible: no line solution, and whatever the hull fallback returns
+    /// must not claim to be a trustworthy quad.
+    #[test]
+    fn two_sides_is_not_a_quad() {
+        let (w, h) = (640, 480);
+        let truth = [
+            [-300.0, -200.0],
+            [500.0, -220.0],
+            [520.0, 400.0],
+            [-320.0, 420.0],
+        ];
+        let img = synth(w, h, &truth, 0.96);
+        let q = acquire(&img, w, h, &AcquireParams::default());
+        assert!(q.is_none_or(|q| q.clipped && !q.from_lines), "{q:?}");
+    }
+
+    /// A barrel-distorted view of a straight border is recovered once the lens is known.
+    #[test]
+    fn undistorts_before_fitting() {
+        let (w, h) = (640, 480);
+        let k1 = -0.08;
+        let truth = [[60.0, 40.0], [590.0, 30.0], [600.0, 450.0], [50.0, 440.0]];
+        let img = synth_through_lens(w, h, &truth, 0.95, k1);
+        let p = AcquireParams {
+            lens_k1: k1,
+            ..Default::default()
+        };
+        let q = acquire(&img, w, h, &p).expect("border found");
+        assert!(q.from_lines, "{q:?}");
+        for (i, (got, want)) in q.corners.iter().zip(truth.iter()).enumerate() {
+            let d = ((got[0] - want[0]).powi(2) + (got[1] - want[1]).powi(2)).sqrt();
+            assert!(d <= 2.5, "corner {i}: got {got:?} want {want:?} (d={d:.2})");
+        }
     }
 
     #[test]

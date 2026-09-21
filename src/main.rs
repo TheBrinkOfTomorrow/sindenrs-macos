@@ -264,6 +264,9 @@ struct TrackArgs {
     /// Image flip applied before detection (config: display.flip).
     #[arg(long, value_enum)]
     flip: Option<FlipArg>,
+    /// Lens distortion coefficient (config: global.lens_k1).
+    #[arg(long, allow_hyphen_values = true)]
+    lens_k1: Option<f64>,
     /// Save every frame (.jpg) and a frames.csv of results here, for regression replay.
     #[arg(long)]
     record: Option<PathBuf>,
@@ -1800,6 +1803,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         orientation: a.orientation,
         cal_x: a.cal_x,
         cal_y: a.cal_y,
+        lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
         buffers: a.settings.buffers,
         frames: a.frames,
         record: a.record.clone(),
@@ -1879,6 +1883,7 @@ fn run_all(ctx: &Ctx) -> Result<()> {
             orientation: None,
             cal_x: None,
             cal_y: None,
+            lens_k1: ctx.cfg.global.lens_k1,
             buffers: 4,
             frames: 0,
             record: None,
@@ -2288,6 +2293,7 @@ fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
         orientation: None,
         cal_x: None,
         cal_y: None,
+        lens_k1: ctx.cfg.global.lens_k1,
         buffers: a.settings.buffers,
         frames: 0,
         record: None,

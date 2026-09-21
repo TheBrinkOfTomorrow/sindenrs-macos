@@ -20,6 +20,7 @@ use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
     acquire, aim_pixel, flip_luma, flip_point, AcquireParams, Flip, Quad,
 };
+use crate::vision::lens::Lens;
 use crate::vision::luma;
 
 /// What one tracking loop does.
@@ -33,6 +34,8 @@ pub struct TrackerOptions {
     pub orientation: Option<f64>,
     pub cal_x: Option<f64>,
     pub cal_y: Option<f64>,
+    /// Camera lens distortion coefficient (config: global.lens_k1).
+    pub lens_k1: f64,
     /// Requested mmap buffer count.
     pub buffers: u32,
     /// Stop after this many frames; 0 = until `stop` is set.
@@ -170,11 +173,14 @@ pub fn run_tracker_with(
     let params = AcquireParams {
         threshold,
         min_size,
+        lens_k1: opts.lens_k1,
         ..Default::default()
     };
+    // Corners come out in undistorted pixels, so the aim pixel has to be undistorted too.
+    let aim_undist = Lens::centred(opts.lens_k1, w, h).undistort(aim_px);
     info!(
-        "[{name}] tracking {}x{} {} on {}, aim pixel ({:.1}, {:.1}), threshold {threshold}, flip {flip:?}, bore ({cal_x:+.2}%, {cal_y:+.2}%)",
-        w, h, fmt.format, camera.display(), aim_px[0], aim_px[1]
+        "[{name}] tracking {}x{} {} on {}, aim pixel ({:.1}, {:.1}), threshold {threshold}, flip {flip:?}, bore ({cal_x:+.2}%, {cal_y:+.2}%), lens k1 {}",
+        w, h, fmt.format, camera.display(), aim_px[0], aim_px[1], opts.lens_k1
     );
 
     let mut csv = None;
@@ -229,7 +235,7 @@ pub fn run_tracker_with(
             found += 1;
             if let Some(p) = q
                 .to_screen()
-                .apply(aim_px)
+                .apply(aim_undist)
                 .filter(|p| (-25.0..=125.0).contains(&p[0]) && (-25.0..=125.0).contains(&p[1]))
             {
                 let (x, y) = d.finish_aim(p[0], p[1]);
@@ -298,7 +304,7 @@ pub fn run_tracker_with(
                     start.elapsed().as_secs_f64(), frame.sequence, am[0], am[1],
                     q.corners[0][0], q.corners[0][1], q.corners[1][0], q.corners[1][1],
                     q.corners[2][0], q.corners[2][1], q.corners[3][0], q.corners[3][1],
-                    if q.clipped { " CLIPPED" } else { "" },
+                    if q.from_lines { "" } else { " CLIPPED" },
                     proc.as_secs_f64() * 1000.0, frame.age().map_or(0.0, |a| a.as_secs_f64() * 1000.0)
                 ),
                 _ => {
