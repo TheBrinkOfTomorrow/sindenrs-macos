@@ -17,13 +17,15 @@ the border tracker is next. See [Roadmap](#roadmap).
 | Camera control enumeration and exposure sweeps | done |
 | Resetting a wedged gun (bootloader touch; hub port power-cycle as fallback) | done, validated |
 | Homography (border quad to screen) | done, unit tested |
-| Border acquisition (threshold, blobs, hull, quad, corner refine) + live `track` | done, first light on the OLED |
+| Border acquisition (threshold, blobs, undistort, edge-line fit, corner intersection) + live `track` | done, first light on the OLED |
+| Lens distortion model and corpus fit (`replay --fit-lens`) | done, k1 = -0.178 on this gun |
 | Multi-gun runtime (`run`: one thread per gun, camera paired by hub, Ctrl-C) | done, two guns |
 | Fullscreen overlay: draws the border, calibration UI (Wayland + X11) | done |
 | Aim accuracy harness (`aim-test`) | done, not yet measured |
 | TOML config (display profiles, per-gun buttons/recoil by unique id) | done |
 | Firmware backup/flash, bootloader reset, joystick device switch | done, both guns on 2.1 |
-| Sub-pixel edge tracker, lens/curvature correction | not started |
+| Sub-pixel edge tracker | not started |
+| Self-locating border (coarse glyph code) for the close-range, two-or-three-sides case | design |
 | Calibration overlay (Wayland / X11 / Windows) | not started |
 | Windows capture and discovery backends | stubs |
 
@@ -169,6 +171,7 @@ sindenrs config init|show|path          # TOML config (see Configuration)
 sindenrs gun setup                      # apply the config's modes, button map and recoil to the gun
 sindenrs gun recoil test|auto|off       # on-demand recoil pulses (168), automatic recoil (169), or off
 sindenrs track [--send] [--threshold N] [--contrast N] [--record DIR]   # camera -> border -> aim -> gun
+sindenrs replay DIR... [--fit-lens] [--per-frame]                       # detection over recorded frames
 sindenrs track --send --threshold 48 --contrast 50                     # what worked on the OLED
 sindenrs camera info                    # formats, frame rates, every control with its range
 sindenrs camera capture [--format mjpeg|yuyv] [--exposure N|auto] [--frames N] [--out DIR]
@@ -233,12 +236,25 @@ exposure of 7.8 ms the border peaks around luma 100 on this display, so the stoc
 threshold misses it; threshold 48 with contrast 50 detects it in 100% of frames with all four
 corners visible, and 86% while swinging the gun around with the border partly out of frame.
 Processing is 11 ms per frame in a debug build. The border edges bow visibly in the camera
-image on this flat panel, about 10 px over the top edge: that is the lens's barrel distortion,
-and a straight-edge homography will carry roughly 2% of screen error at edge midpoints until
-the tracker fits curves. The camera is mounted **upside down** (the cursor moved opposite to the gun on both axes
+image on this flat panel, about 10 px over the top edge: that is the lens's barrel distortion.
+A one-parameter division model fitted on 200 recorded frames (`replay --fit-lens`) gives
+k1 = -0.178 with a clear optimum, and takes the line-fit residual from 1.36 px to 0.81 px;
+it is the default in `[global] lens_k1`. The camera is mounted **upside down** (the cursor moved opposite to the gun on both axes
 until the frame was rotated 180°; `track --flip both` is the default), which is what the
 vendor driver's "camera is upside down" sign encodes. Recorded frames from the session are kept under `corpus/` (not in
 git) for regression replay.
+
+**Edge lines instead of corners.** The finder undistorts the boundary of every sizeable blob,
+pulls straight lines out of it with sequential RANSAC, and intersects the outermost line on
+each side. A line is pinned by any visible stretch of it, so the corners can all be off frame
+as long as the four edges cross it; the ring then breaks into four separate strips, which is
+why the boundaries are pooled across blobs before fitting. On the recorded full-view corpus
+every frame with the whole border showing solves this way. The convex-hull quad is kept only
+as a fallback and is always flagged unreliable: on 133 frames of a border page that was not
+yet fullscreen it returned a confident quad with one side invented. The recorded close-range
+corpus is the other story: 600 frames of which almost all show only two or three sides, and a
+plain border carries no information about which stretch of an edge is in view, so those need
+a border that encodes position (a coarse glyph code, thickness is not a usable cue on a CRT).
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
@@ -318,7 +334,8 @@ The Windows target type-checks today (`cargo check --target x86_64-pc-windows-ms
 
 1. Border acquisition (downsample, threshold, connected components, convex quad) against a
    white-border page on the OLED.
-2. Sub-pixel gradient tracker with RANSAC edge fits; recorded-frame regression corpus.
+2. Self-locating border: coarse glyphs so two visible sides give a full solve. Then the
+   sub-pixel gradient tracker.
 3. Predictive filter and end-to-end latency measurement.
 4. Correction field fitted from the aim test; virtual gamepad with rumble-to-recoil; hotplug in `run`.
 5. Windows backends (Media Foundation capture, SetupAPI discovery).

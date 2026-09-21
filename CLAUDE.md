@@ -43,7 +43,7 @@ Sinden Lightgun driver; the reverse-engineering notes it is built from live in
 `~/re-shell/artifacts/sinden-lightgun/` (read `rust-redesign.md` first). README.md has the
 hardware findings and the roadmap.
 
-- **src/main.rs** — CLI (`probe`, `camera ...`, `gun ...`)
+- **src/main.rs** — CLI (`probe`, `track`, `run`, `aim-test`, `replay`, `camera ...`, `gun ...`)
 - **src/protocol/** — wire protocol, auth, events (pure, unit tested)
 - **src/config.rs** — TOML config (global / display+profiles / per-gun buttons+recoil); `~/.config/sindenrs/config.toml`
 - **src/gun.rs** — serial session with one gun; `apply_config` sends the vendor startup burst
@@ -51,7 +51,10 @@ hardware findings and the roadmap.
 - **src/overlay.rs** — fullscreen window (winit + softbuffer): draws the tracking border and the calibration UI. The event loop owns the main thread, so tracking runs on a worker.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle
-- **src/vision/** — homography (verified), luma helpers, `acquire.rs` border finder
+- **src/vision/** — homography (verified), luma helpers, `lens.rs` division-model
+  undistortion, `lines.rs` RANSAC line extraction, `acquire.rs` border finder (edge lines →
+  corners; hull fallback is always flagged unreliable), `lensfit.rs` fits `k1` from recorded
+  frames (`sindenrs replay --fit-lens corpus/<dir>`)
 - **tools/border.html** — fullscreen white-border page for testing; `corpus/` holds recorded frames (gitignored)
 - **flake.nix** also exports `nixosModules.default` (udev rules, groups, optional service)
 
