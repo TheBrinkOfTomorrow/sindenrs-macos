@@ -96,6 +96,9 @@ struct ReplayArgs {
     /// Print one line per frame.
     #[arg(long)]
     per_frame: bool,
+    /// With --per-frame: also print every fitted edge line (side, support, residual).
+    #[arg(long)]
+    lines: bool,
 }
 
 #[derive(Subcommand)]
@@ -2233,7 +2236,8 @@ fn grid_targets(n: u32) -> Vec<[f64; 2]> {
 
 /// Detection over recorded frames, with an optional lens fit.
 fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
-    use sindenrs::vision::acquire::{acquire, flip_luma, AcquireParams};
+    use sindenrs::vision::acquire::{acquire, edge_segments, flip_luma, AcquireParams};
+    use sindenrs::vision::lens::Lens;
     use sindenrs::vision::lensfit::{fit_k1, score, FitFrame};
     use sindenrs::vision::luma::mjpeg_to_luma;
 
@@ -2319,6 +2323,26 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
                 "none"
             }
         };
+        if a.per_frame && a.lines {
+            if let Some(f) = FitFrame::prepare(l, *w, *h, &params) {
+                let lens = Lens::centred(params.lens_k1, *w, *h);
+                for s in edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, &params) {
+                    let (lo, hi) = s.inliers.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                        let t = -s.line.b * p[0] + s.line.a * p[1];
+                        (lo.min(t), hi.max(t))
+                    });
+                    println!(
+                        "    line n={:<4} rms={:.2} normal=({:+.3},{:+.3}) c={:8.2} span={:.0}px",
+                        s.inliers.len(),
+                        s.rms,
+                        s.line.a,
+                        s.line.b,
+                        s.line.c,
+                        hi - lo
+                    );
+                }
+            }
+        }
         if a.per_frame {
             let c = q.map_or([[f64::NAN; 2]; 4], |q| q.corners);
             println!(
