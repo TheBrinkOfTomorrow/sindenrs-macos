@@ -889,7 +889,7 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
         // boundary pixel is one full-resolution pixel beyond its centre.
         let refined_outer = edges.refine_line(&outer, span, dir);
         let outer_line = refined_outer.unwrap_or_else(|| outer.offset(1.0));
-        let thickness = inner.map(|(m, d)| {
+        let mut thickness = inner.map(|(m, d)| {
             let inner_line = outward[m];
             match (refined_outer, edges.refine_line(&inner_line, span, dir)) {
                 (Some(o), Some(i)) => {
@@ -899,6 +899,16 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 _ => d + 2.0,
             }
         });
+        // The mask itself says how thick the border is here: the median bright run inward
+        // from the outer edge. It overrides a partner that sits much further in (the line
+        // the tab tips form, when the inner edge was not fitted or the strip test let it
+        // through) and supplies a thickness when no inner line was found at all.
+        if let Some(walked) = walk_thickness(edges, &outer_line, dir, span) {
+            match thickness {
+                Some(t) if t <= 1.6 * walked => {}
+                _ => thickness = Some(walked),
+            }
+        }
         out[side as usize] = Some(SideLines {
             outer: outer_line,
             outer_seg: outer_k,
@@ -909,6 +919,37 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
         });
     }
     out
+}
+
+/// Median bright run inward from `outer` (normal outward, at the true edge) at points
+/// every few pixels along `span`, in full-resolution pixels. Runs are measured between
+/// mask pixel centres, so one pixel is added for the half pixel at each end. `None` if
+/// too few samples found any border at all.
+fn walk_thickness(edges: &Edges, outer: &Line, dir: f64, span: (f64, f64)) -> Option<f64> {
+    let mut runs = Vec::new();
+    let mut t = span.0;
+    while t <= span.1 {
+        let base = outer.point_at(dir * t);
+        let mut run = 0.0;
+        let mut d = 1.0;
+        while d < 80.0 {
+            let p = [base[0] - outer.a * d, base[1] - outer.b * d];
+            if !edges.bright_at(p) {
+                break;
+            }
+            run = d;
+            d += 1.0;
+        }
+        if run > 0.0 {
+            runs.push(run + 1.0);
+        }
+        t += 6.0;
+    }
+    if runs.len() < 4 {
+        return None;
+    }
+    runs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(runs[runs.len() / 2])
 }
 
 /// The band of inward distances from a side's outer edge that its tab walls and tips
@@ -1236,10 +1277,24 @@ pub fn decode_tabs(
                     break;
                 }
                 for lo in 0..=n - len {
-                    if let Some(pl) = place(&symbols[lo..lo + len]) {
-                        found = Some((lo, lo + len, pl));
-                        break 'search;
+                    let Some(pl) = place(&symbols[lo..lo + len]) else {
+                        continue;
+                    };
+                    // The whole stretch is contiguous tabs, so the symbols outside the
+                    // placed sub-run must still fit on that side: a placement that puts
+                    // tabs before the side's first tab or past its last is a misread
+                    // sub-run matching another side by accident.
+                    let total = code::tabs(pl.side).len();
+                    let (before, after) = if pl.reversed {
+                        (n - (lo + len), lo)
+                    } else {
+                        (lo, n - (lo + len))
+                    };
+                    if before > pl.index || pl.index + len + after > total {
+                        continue;
                     }
+                    found = Some((lo, lo + len, pl));
+                    break 'search;
                 }
             }
             let Some((lo, hi, pl)) = found else {
