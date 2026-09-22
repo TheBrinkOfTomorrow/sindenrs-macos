@@ -43,13 +43,18 @@ Sinden Lightgun driver; the reverse-engineering notes it is built from live in
 `~/re-shell/artifacts/sinden-lightgun/` (read `rust-redesign.md` first). README.md has the
 hardware findings and the roadmap.
 
-- **src/main.rs** — CLI (`probe`, `track`, `run`, `aim-test`, `replay`, `camera ...`, `gun ...`)
+- **src/main.rs** — CLI (`list`, `run`, `calibrate`, `border`, `config`, `gun ...`, and `debug ...` for
+  `track`, `replay`, `camera`, raw frames)
 - **src/protocol/** — wire protocol, auth, events (pure, unit tested)
-- **src/config.rs** — TOML config (global / display+profiles / per-gun buttons+recoil); `~/.config/sindenrs/config.toml`
+- **src/config.rs** — TOML config (global / display+profiles / `[gun]` baseline + `[guns."<id>"]`
+  overrides); `~/.config/sindenrs/config.toml`; `to_toml` writes only non-default keys
 - **src/gun.rs** — serial session with one gun; `apply_config` sends the vendor startup burst
-- **src/runtime.rs** — the per-gun tracking loop shared by `track`, `run` and `aim-test`;
+- **src/runtime.rs** — the per-gun tracking loop shared by `debug track`, `run` and `calibrate`;
   `JumpGuard` holds a frame that leaps on a weaker solve
-- **src/overlay.rs** — fullscreen window (winit + softbuffer): draws the tracking border and the calibration UI. The event loop owns the main thread, so tracking runs on a worker.
+- **src/overlay/** — the on-screen border and calibration UI: `draw.rs` CPU renderer, `scene.rs`
+  shared state, `x11.rs` (x11rb: override-redirect, shaped, click-through, re-raised) and
+  `wayland.rs` (layer shell) behind the `Backend` trait, `artwork.rs` MAME artwork export.
+  No main-thread requirement; `run` draws it from a worker.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle
 - **src/vision/** — `homography.rs` (quad map plus a DLT over line and point
@@ -57,9 +62,10 @@ hardware findings and the roadmap.
   line extraction, `code.rs` the coded-border tab layout (shared by overlay and detector),
   `acquire.rs` border finder (edge lines and decoded tabs → corners; hull fallback is always
   flagged unreliable), `lensfit.rs` fits `k1` from recorded frames
-  (`sindenrs replay --fit-lens corpus/<dir>`; `replay --per-frame --lines` dumps sides and tabs)
-- **tools/border.html** — fullscreen white-border page for testing; `corpus/` holds recorded frames (gitignored)
-- **flake.nix** also exports `nixosModules.default` (udev rules, groups, optional service)
+  (`sindenrs debug replay --fit-lens corpus/<dir>`; `--per-frame --lines` dumps sides and tabs)
+- **udev/** — the udev rules files; **docs/notes.md** — the hardware-session dev log; `corpus/` holds
+  recorded frames (gitignored)
+- **flake.nix** also exports `nixosModules.default` (udev rules, groups, settings, user service)
 
 - **Cargo.toml** — package manifest; lints configured under `[lints.rust]` and `[lints.clippy]`
 - **flake.nix** — Nix build (Crane), dev shell, and CI checks
