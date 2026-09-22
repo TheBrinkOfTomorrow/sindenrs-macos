@@ -309,10 +309,12 @@
               default = [ ];
               example = [ "alice" ];
               description = ''
-                Users added to the dialout, video and input groups. Whoever is logged in on
-                the seat can already open the gun and camera (udev uaccess), but recovering a
-                gun through its hub's sysfs attribute needs dialout, and a user that is not on
-                a seat (autologin on a console, SSH) needs all three. List your user here.
+                Users added to the dialout and video groups. Whoever is logged in on the seat
+                can already open the gun and camera (udev uaccess), but recovering a gun
+                through its hub's sysfs attribute needs dialout, and a user that is not on a
+                seat (autologin on a console, SSH) needs both. A game that reads the gun's
+                input devices directly (MAME's udev provider) also needs that user in
+                `input`, which is the game's business rather than the driver's.
               '';
             };
             tagAsGun = lib.mkOption {
@@ -370,7 +372,7 @@
           config = lib.mkIf cfg.enable {
             environment.systemPackages = [ cfg.package ];
             services.udev.packages = [ udevRules ];
-            users.users = lib.genAttrs cfg.users (_: { extraGroups = [ "dialout" "video" "input" ]; });
+            users.users = lib.genAttrs cfg.users (_: { extraGroups = [ "dialout" "video" ]; });
             services.sindenrs.session.command = runCommand;
 
             # A user service, because the border is a window on the user's display: a system

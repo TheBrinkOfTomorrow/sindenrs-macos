@@ -35,7 +35,7 @@ compiles for it, but the camera and window backends do not exist yet.
   imports = [ inputs.sindenrs.nixosModules.default ];
   services.sindenrs = {
     enable = true;               # udev rules and the sindenrs command
-    users = [ "alice" ];         # who may open the gun without root
+    users = [ "alice" ];         # dialout + video: recover a wedged gun, work off-seat
     session.enable = true;       # run the driver in your graphical session
     hideFromDesktop = true;      # cabinet: keep the gun off the desktop pointer
   };
@@ -56,7 +56,8 @@ Configuration).
 2. Copy `udev/70-sinden-lightgun.rules` to `/etc/udev/rules.d/`. If you want MAME to see
    the gun as a lightgun, copy `udev/71-sinden-lightgun-input.rules` too. Then run
    `udevadm control --reload && udevadm trigger`.
-3. Add yourself to the `dialout`, `video` and `input` groups, and log in again.
+3. Add yourself to the `dialout` and `video` groups, and log in again. A game that reads
+   the gun's input devices directly (MAME) also needs you in `input`.
 
 ## Use
 
