@@ -166,7 +166,11 @@ mod tests {
     /// The shape rectangles must cover exactly the pixels the border paints, or the game
     /// would show through a gap in the border (or be hidden behind an invisible strip).
     #[test]
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     fn border_rects_match_drawn_border() {
         let (w, h) = (1280u32, 960u32);
         let mut buf = vec![0u32; (w * h) as usize];
