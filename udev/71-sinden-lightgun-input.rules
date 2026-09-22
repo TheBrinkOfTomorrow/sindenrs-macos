@@ -1,0 +1,9 @@
+# Sinden Lightgun: how the gun's own HID devices appear to the rest of the system. Optional;
+# the NixOS module installs it when services.sindenrs.hideFromDesktop / tagAsGun are set.
+#
+# The gun reports its aim on its own HID mouse (absolute axes) and its buttons as mouse
+# buttons and keys. A game reading evdev (MAME's udev lightgun provider) wants those; the
+# desktop does not, or the gun drags the desktop pointer around and types into whatever
+# has focus. ID_INPUT_GUN=1 is what MAME's provider looks for.
+SUBSYSTEM=="input", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="0f01|0f02|0f38|0f39", ENV{ID_INPUT_GUN}="1", TAG+="uaccess"
+# @HIDE@SUBSYSTEM=="input", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="0f01|0f02|0f38|0f39", ENV{ID_INPUT_MOUSE}="0", ENV{ID_INPUT_KEYBOARD}="0", ENV{ID_INPUT_KEY}="0", ENV{ID_INPUT_TABLET}="0", ENV{LIBINPUT_IGNORE_DEVICE}="1"

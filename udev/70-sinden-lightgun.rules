@@ -1,0 +1,19 @@
+# Sinden Lightgun: device access for the sindenrs driver.
+#
+# Numbered below 73-seat-late.rules so TAG+="uaccess" takes effect (the logged-in seat user
+# gets an ACL on each node); the GROUP fallbacks cover headless use. On NixOS the flake's
+# module installs this file with the paths in the RUN line substituted.
+
+# The gun: an ATmega32U4 with CDC-ACM serial + HID. All firmware variants.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="0f01|0f02|0f38|0f39", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="0f01|0f02|0f38|0f39", ENV{ID_MM_DEVICE_IGNORE}="1"
+# The gun's Caterina bootloader (Arduino Leonardo), used for resets and firmware updates.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0036", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2341", ATTR{idProduct}=="0036", ENV{ID_MM_DEVICE_IGNORE}="1"
+# Sinden camera boards (video capture + metadata nodes).
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="05a3|32e4|16d0", ATTRS{idProduct}=="9210|0109", MODE="0660", GROUP="video", TAG+="uaccess"
+# The hub inside the gun (Microchip USB2512, manufacturer string "KSB"). Access to its ports'
+# sysfs `disable` attribute (Linux >= 6.0) lets the driver power-cycle a gun whose firmware
+# has stopped answering; the usbfs node is the fallback for old kernels.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="2512", ATTR{manufacturer}=="KSB", ATTR{bDeviceClass}=="09", MODE="0660", GROUP="dialout", TAG+="uaccess"
+SUBSYSTEM=="usb", DRIVER=="hub", ATTRS{idVendor}=="0424", ATTRS{idProduct}=="2512", ATTRS{manufacturer}=="KSB", RUN+="/bin/sh -c 'chgrp -f dialout $sys$devpath/*-port*/disable; chmod -f 660 $sys$devpath/*-port*/disable'"

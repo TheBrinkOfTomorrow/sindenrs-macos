@@ -27,15 +27,6 @@
       # The overlay window (winit + softbuffer) loads these at runtime with dlopen, so they
       # never appear as DT_NEEDED and cannot be found by rpath patching; the binary and the
       # dev shell both get them on LD_LIBRARY_PATH instead.
-      graphicsLibs = pkgs: with pkgs; [
-        wayland
-        libxkbcommon
-        libx11
-        libxcursor
-        libxrandr
-        libxi
-      ];
-
       # Helper to get pkgs for a system with rust-overlay applied
       pkgsFor = system: import nixpkgs {
         inherit system;
@@ -69,8 +60,7 @@
 
           buildInputs = [
             # Add additional build inputs here
-          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux (graphicsLibs pkgs)
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.libiconv
             pkgs.darwin.apple_sdk.frameworks.Security
           ];
@@ -185,13 +175,6 @@
             # Only run tests during the check phase, not during build
             doCheck = false;
 
-            nativeBuildInputs = commonArgs.nativeBuildInputs
-              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.makeWrapper ];
-
-            postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              wrapProgram $out/bin/sindenrs \
-                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (graphicsLibs pkgs)}
-            '';
           });
 
           sindenrs = self.packages.${system}.default;
@@ -282,45 +265,39 @@
             # Environment variables for development
             RUST_BACKTRACE = "1";
             RUST_LOG = "debug";
-
-            # winit/softbuffer dlopen these, so `cargo run` needs them on the library path.
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (graphicsLibs pkgs);
           };
         });
 
 
-      # NixOS module: udev rules so the gun, its camera and its internal hub are usable
-      # without root, ModemManager kept away from the gun's serial port, and an optional
-      # system service. Import as `sindenrs.nixosModules.default` and set
+      # NixOS module: device access (udev rules), the package, and optionally the driver as
+      # a user service. Import as `sindenrs.nixosModules.default` and set
       # `services.sindenrs.enable = true;`.
       nixosModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.services.sindenrs;
-          udevRules = pkgs.writeTextFile {
-            name = "sinden-lightgun-udev-rules";
-            destination = "/lib/udev/rules.d/70-sinden-lightgun.rules";
-            # Numbered below 73-seat-late.rules so TAG+="uaccess" takes effect (the logged-in
-            # seat user gets an ACL on each node); the GROUP fallbacks cover headless use.
-            text = ''
-              # Sinden Lightgun: ATmega32U4 with CDC-ACM serial + HID. All firmware variants.
-              SUBSYSTEM=="tty", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="0f01|0f02|0f38|0f39", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
-              SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="0f01|0f02|0f38|0f39", ENV{ID_MM_DEVICE_IGNORE}="1"
-              # The gun's Caterina bootloader (Arduino Leonardo), used for resets and firmware updates.
-              SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0036", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
-              SUBSYSTEM=="usb", ATTR{idVendor}=="2341", ATTR{idProduct}=="0036", ENV{ID_MM_DEVICE_IGNORE}="1"
-              # Sinden camera boards (video capture + metadata nodes).
-              SUBSYSTEM=="video4linux", ATTRS{idVendor}=="05a3|32e4|16d0", ATTRS{idProduct}=="9210|0109", MODE="0660", GROUP="video", TAG+="uaccess"
-              # The hub inside the gun (Microchip USB2512, manufacturer string "KSB"). Access to its
-              # ports' sysfs `disable` attribute (Linux >= 6.0) lets the driver power-cycle a gun
-              # whose firmware has stopped answering; the usbfs node is the fallback for old kernels.
-              SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="2512", ATTR{manufacturer}=="KSB", ATTR{bDeviceClass}=="09", MODE="0660", GROUP="dialout", TAG+="uaccess"
-              SUBSYSTEM=="usb", DRIVER=="hub", ATTRS{idVendor}=="0424", ATTRS{idProduct}=="2512", ATTRS{manufacturer}=="KSB", RUN+="${pkgs.runtimeShell} -c '${pkgs.coreutils}/bin/chgrp -f dialout $sys$devpath/*-port*/disable; ${pkgs.coreutils}/bin/chmod -f 660 $sys$devpath/*-port*/disable'"
-            '';
-          };
+          tomlFormat = pkgs.formats.toml { };
+          # The rules files live in udev/ so non-Nix users can copy them; the RUN line
+          # needs absolute paths here.
+          accessRules = builtins.replaceStrings
+            [ "/bin/sh" "chgrp" "chmod" ]
+            [ pkgs.runtimeShell "${pkgs.coreutils}/bin/chgrp" "${pkgs.coreutils}/bin/chmod" ]
+            (builtins.readFile ./udev/70-sinden-lightgun.rules);
+          inputRules = builtins.replaceStrings [ "# @HIDE@" ] [ (if cfg.hideFromDesktop then "" else "# ") ]
+            (builtins.readFile ./udev/71-sinden-lightgun-input.rules);
+          udevRules = pkgs.runCommand "sinden-lightgun-udev-rules" { } ''
+            mkdir -p $out/lib/udev/rules.d
+            cp ${pkgs.writeText "70-sinden-lightgun.rules" accessRules} $out/lib/udev/rules.d/70-sinden-lightgun.rules
+            ${lib.optionalString cfg.tagAsGun ''
+              cp ${pkgs.writeText "71-sinden-lightgun-input.rules" inputRules} $out/lib/udev/rules.d/71-sinden-lightgun-input.rules
+            ''}
+          '';
+          configFile = tomlFormat.generate "sindenrs-config.toml" cfg.settings;
+          configArgs = lib.optionals (cfg.settings != { }) [ "--config" "${configFile}" ];
+          runCommand = lib.escapeShellArgs ([ "${cfg.package}/bin/sindenrs" ] ++ configArgs ++ [ "run" ] ++ cfg.session.extraArgs);
         in
         {
           options.services.sindenrs = {
-            enable = lib.mkEnableOption "Sinden Lightgun support (udev rules, device access)";
+            enable = lib.mkEnableOption "Sinden Lightgun support (udev rules, device access, the sindenrs package)";
             package = lib.mkOption {
               type = lib.types.package;
               default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
@@ -332,18 +309,60 @@
               default = [ ];
               example = [ "alice" ];
               description = ''
-                Users added to the dialout and video groups. Seat users already get the
-                device nodes via uaccess, but power-cycling a wedged gun goes through a sysfs
-                attribute that only the dialout group can write, so list your desktop user
-                here too if you want `sindenrs` to recover the gun without root.
+                Users added to the dialout, video and input groups. Whoever is logged in on
+                the seat can already open the gun and camera (udev uaccess), but recovering a
+                gun through its hub's sysfs attribute needs dialout, and a user that is not on
+                a seat (autologin on a console, SSH) needs all three. List your user here.
               '';
             };
-            daemon = {
-              enable = lib.mkEnableOption "the sindenrs system service (not yet functional; the tracker is in progress)";
+            tagAsGun = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Tag the gun's input devices ID_INPUT_GUN=1, which MAME's udev lightgun provider looks for.";
+            };
+            hideFromDesktop = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                Hide the gun's HID mouse and keyboard from libinput (and so from the desktop
+                and X server), so the gun cannot move the desktop pointer or type. Games that
+                read evdev directly (MAME with the udev provider) still see it. Turn this on
+                for a cabinet; leave it off if you want the gun to work as a mouse.
+              '';
+            };
+            settings = lib.mkOption {
+              type = tomlFormat.type;
+              default = { };
+              example = lib.literalExpression ''
+                {
+                  display = { aspect = 1.3333; border_thickness = 3.0; overlay = false; };
+                  gun.recoil.enabled = true;
+                  guns."2146665221".name = "player1";
+                }
+              '';
+              description = ''
+                The driver's configuration, written to a file in the Nix store and passed to
+                the session service with `--config`. Empty means the driver reads
+                `~/.config/sindenrs/config.toml` instead. The file is read-only, which is
+                fine: `sindenrs calibrate` saves its result into the gun, not the config.
+              '';
+            };
+            session = {
+              enable = lib.mkEnableOption "running `sindenrs run` as a user service in the graphical session";
               extraArgs = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
-                description = "Extra command-line arguments for the service.";
+                example = [ "--profile" "crt" ];
+                description = "Extra command-line arguments for `sindenrs run`.";
+              };
+              command = lib.mkOption {
+                type = lib.types.str;
+                readOnly = true;
+                description = ''
+                  The full `sindenrs run` command line the service runs, for sessions that
+                  are not managed by systemd (a bare `startx` session): run it in the
+                  background from the session script before starting the frontend.
+                '';
               };
             };
           };
@@ -351,19 +370,24 @@
           config = lib.mkIf cfg.enable {
             environment.systemPackages = [ cfg.package ];
             services.udev.packages = [ udevRules ];
-            users.users = lib.genAttrs cfg.users (_: { extraGroups = [ "dialout" "video" ]; });
+            users.users = lib.genAttrs cfg.users (_: { extraGroups = [ "dialout" "video" "input" ]; });
+            services.sindenrs.session.command = runCommand;
 
-            systemd.services.sindenrs = lib.mkIf cfg.daemon.enable {
+            # A user service, because the border is a window on the user's display: a system
+            # service has no DISPLAY / WAYLAND_DISPLAY and no seat ACLs. Sessions started by a
+            # display manager or a Wayland compositor reach graphical-session.target and
+            # import the display variables; a bare startx session does neither, so it runs
+            # `services.sindenrs.session.command` itself instead.
+            systemd.user.services.sindenrs = lib.mkIf cfg.session.enable {
               description = "Sinden Lightgun driver";
-              wantedBy = [ "multi-user.target" ];
-              after = [ "systemd-udev-settle.service" ];
+              wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              after = [ "graphical-session.target" ];
               serviceConfig = {
-                ExecStart = "${cfg.package}/bin/sindenrs run ${lib.escapeShellArgs cfg.daemon.extraArgs}";
-                Restart = "on-failure";
-                RestartSec = 2;
-                DynamicUser = true;
-                SupplementaryGroups = [ "dialout" "video" ];
-                DeviceAllow = [ "char-ttyACM rw" "char-video4linux rw" "char-usb_device rw" ];
+                ExecStart = runCommand;
+                # `run` exits when no gun is attached; keep trying in case one is plugged in.
+                Restart = "always";
+                RestartSec = 5;
               };
             };
           };
