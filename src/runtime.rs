@@ -36,6 +36,9 @@ pub struct TrackerOptions {
     pub cal_y: Option<f64>,
     /// Camera lens distortion coefficient (config: global.lens_k1).
     pub lens_k1: f64,
+    /// Aim jump, in screen percent, above which a frame whose solve rests on less than the
+    /// previous one is held for a frame (config: display.jump_limit).
+    pub jump_limit: f64,
     /// Requested mmap buffer count.
     pub buffers: u32,
     /// Stop after this many frames; 0 = until `stop` is set.
@@ -62,6 +65,71 @@ pub struct Sample<'a> {
     pub events: &'a [crate::protocol::event::Event],
 }
 
+/// How much a solve rests on: sides with an edge line, and decoded tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Support {
+    pub sides: u32,
+    pub tabs: u8,
+}
+
+/// Holds back a single frame whose aim leaps away from the last one while its solve rests
+/// on less than the last one did. A change of regime (four edges to three, three to two
+/// plus tabs) is where a wrong solve slips through, and it shows as exactly that: a big
+/// jump on a weaker frame. Real motion is let through unchanged, and a jump that the next
+/// frame confirms is accepted then, so the cost is one frame of delay on a fast flick that
+/// coincides with a regime change.
+#[derive(Clone, Copy, Debug)]
+pub struct JumpGuard {
+    /// Jump size in screen percent above which a weaker frame is held.
+    pub limit: f64,
+    last: Option<([f64; 2], Support)>,
+    pending: Option<[f64; 2]>,
+}
+
+impl JumpGuard {
+    #[must_use]
+    pub fn new(limit: f64) -> Self {
+        Self {
+            limit,
+            last: None,
+            pending: None,
+        }
+    }
+
+    /// Feed a frame's aim and support; get back the aim to act on, or `None` to hold.
+    pub fn filter(&mut self, aim: [f64; 2], support: Support) -> Option<[f64; 2]> {
+        let dist = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        let suspicious = self.last.is_some_and(|(prev, ps)| {
+            let weaker = support.sides < ps.sides
+                || (support.sides == ps.sides && support.sides < 4 && support.tabs + 2 < ps.tabs);
+            weaker && dist(aim, prev) > self.limit
+        });
+        if suspicious {
+            match self.pending {
+                Some(p) if dist(aim, p) <= self.limit => {
+                    // Two frames in a row agree: it was real.
+                    self.pending = None;
+                    self.last = Some((aim, support));
+                    Some(aim)
+                }
+                _ => {
+                    self.pending = Some(aim);
+                    None
+                }
+            }
+        } else {
+            self.pending = None;
+            self.last = Some((aim, support));
+            Some(aim)
+        }
+    }
+
+    /// No aim this frame: forget any pending jump.
+    pub fn lost(&mut self) {
+        self.pending = None;
+    }
+}
+
 /// What the hook wants the loop to do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
@@ -84,6 +152,8 @@ pub struct Status {
     pub last_aim: Option<[f64; 2]>,
     pub last_quad: Option<[[f64; 2]; 4]>,
     pub clipped: bool,
+    /// Frames whose aim the jump guard held back.
+    pub held: u64,
     pub proc_mean: Duration,
     pub age_mean: Duration,
     pub events: u64,
@@ -231,6 +301,8 @@ pub fn run_tracker_with(
     let mut last_report = Instant::now();
     let mut last_aim: Option<[f64; 2]> = None;
     let mut last_quad: Option<Quad> = None;
+    let mut guard = JumpGuard::new(opts.jump_limit);
+    let mut held = 0u64;
     let mut events = 0u64;
     let mut window_start = Instant::now();
     let mut window_frames = 0u32;
@@ -266,20 +338,36 @@ pub fn run_tracker_with(
             if vs.iter().all(Option::is_some) {
                 view = Some(vs.map(|v| v.unwrap_or([0.0, 0.0])));
             }
-            if let Some(p) = q
+            let candidate = q
                 .to_screen()
                 .apply(aim_undist)
                 .filter(|p| (-25.0..=125.0).contains(&p[0]) && (-25.0..=125.0).contains(&p[1]))
-            {
-                let (x, y) = d.finish_aim(p[0], p[1]);
-                aim = Some([x, y]);
-                if let Some((g, _)) = gun.as_mut() {
+                .map(|p| {
+                    let (x, y) = d.finish_aim(p[0], p[1]);
+                    [x, y]
+                });
+            let support = Support {
+                sides: q.sides.count_ones(),
+                tabs: q.tabs,
+            };
+            aim = candidate.and_then(|a| guard.filter(a, support));
+            if candidate.is_some() && aim.is_none() {
+                held += 1;
+            }
+            if candidate.is_none() {
+                guard.lost();
+            }
+            if let Some((g, _)) = gun.as_mut() {
+                if let Some([x, y]) = aim.or(last_aim) {
                     g.set_position(percent_to_axis(x), percent_to_axis(y))?;
                 }
             }
             last_quad = Some(*q);
-        } else if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
-            g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
+        } else {
+            guard.lost();
+            if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
+                g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
+            }
         }
         if aim.is_some() {
             last_aim = aim;
@@ -379,6 +467,7 @@ pub fn run_tracker_with(
                 Duration::ZERO
             };
             s.events = events;
+            s.held = held;
         }
         if flow == Flow::Stop {
             break;
@@ -404,4 +493,40 @@ pub fn prepare_gun(gun: &mut Gun, cfg: &GunConfig, recoil_gap: Duration) -> Resu
     gun.apply_config(cfg, recoil_gap)?;
     gun.start_streaming(Duration::from_millis(150))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STRONG: Support = Support { sides: 4, tabs: 20 };
+    const WEAK: Support = Support { sides: 3, tabs: 6 };
+
+    #[test]
+    fn guard_passes_motion_and_holds_a_weak_leap() {
+        let mut g = JumpGuard::new(5.0);
+        assert_eq!(g.filter([10.0, 10.0], STRONG), Some([10.0, 10.0]));
+        // Steady motion on a strong solve is never held, however far it goes.
+        assert_eq!(g.filter([30.0, 10.0], STRONG), Some([30.0, 10.0]));
+        // A weaker solve leaping away is held once...
+        assert_eq!(g.filter([80.0, 60.0], WEAK), None);
+        // ...and accepted when the next frame agrees with it.
+        assert_eq!(g.filter([81.0, 61.0], WEAK), Some([81.0, 61.0]));
+    }
+
+    #[test]
+    fn guard_drops_a_one_frame_glitch() {
+        let mut g = JumpGuard::new(5.0);
+        g.filter([10.0, 10.0], STRONG);
+        assert_eq!(g.filter([80.0, 60.0], WEAK), None);
+        // Back near where we were: the glitch is gone, nothing was sent for it.
+        assert_eq!(g.filter([11.0, 10.0], STRONG), Some([11.0, 10.0]));
+    }
+
+    #[test]
+    fn guard_lets_small_regime_shifts_through() {
+        let mut g = JumpGuard::new(5.0);
+        g.filter([10.0, 10.0], STRONG);
+        assert_eq!(g.filter([12.0, 11.0], WEAK), Some([12.0, 11.0]));
+    }
 }

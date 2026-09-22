@@ -175,6 +175,9 @@ pub struct Display {
     pub orientation: f64,
     /// Requested camera frame rate; None leaves the camera default.
     pub fps: Option<u32>,
+    /// Aim jump, in percent of screen between consecutive frames, above which a frame whose
+    /// solve rests on fewer edges or tabs than the previous one is held for a frame.
+    pub jump_limit: f64,
 }
 
 impl Default for Display {
@@ -196,6 +199,7 @@ impl Default for Display {
             ratio_y: 1.0,
             orientation: -1.0,
             fps: None,
+            jump_limit: 5.0,
         }
     }
 }
@@ -220,6 +224,7 @@ pub struct DisplayOverrides {
     pub ratio_y: Option<f64>,
     pub orientation: Option<f64>,
     pub fps: Option<u32>,
+    pub jump_limit: Option<f64>,
 }
 
 impl Display {
@@ -241,6 +246,7 @@ impl Display {
             ratio_y: o.ratio_y.unwrap_or(self.ratio_y),
             orientation: o.orientation.unwrap_or(self.orientation),
             fps: o.fps.or(self.fps),
+            jump_limit: o.jump_limit.unwrap_or(self.jump_limit),
         }
     }
 
