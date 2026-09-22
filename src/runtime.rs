@@ -197,6 +197,8 @@ pub struct Status {
     pub clipped: bool,
     /// Frames whose aim the jump guard held back.
     pub held: u64,
+    /// Frames the camera link delivered truncated or undecodable.
+    pub corrupt: u64,
     pub proc_mean: Duration,
     pub age_mean: Duration,
     pub events: u64,
@@ -347,6 +349,10 @@ pub fn run_tracker_with(
     let mut last_aim: Option<[f64; 2]> = None;
     let mut last_quad: Option<Quad> = None;
     let mut guard = JumpGuard::new(opts.jump_limit);
+    let mut sizes: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut corrupt = 0u64;
+    let mut corrupt_window = 0u64;
+    let mut last_corrupt_report = Instant::now();
     let mut smoother = HoverSmoother::new(1.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
@@ -366,8 +372,41 @@ pub fn run_tracker_with(
             window_frames = 0;
         }
         let t0 = Instant::now();
-        let Ok((_, _, mut l)) = luma::mjpeg_to_luma(frame.data) else {
-            warn!("[{name}] jpeg decode failed");
+        // A frame the USB link truncated decodes (non-strict) with its missing part as flat
+        // grey, which the solver would then read as a bright screen. A truncated frame is
+        // far smaller than its neighbours, so compare against the recent median size.
+        // Corrupt frames are counted and reported once a second: a stream of them means
+        // the camera's link (hub, cable, EMI from the recoil) is failing, and a warning
+        // per frame at 60 fps would bury everything else.
+        let size = frame.data.len();
+        let median_size = {
+            let mut v: Vec<usize> = sizes.iter().copied().collect();
+            v.sort_unstable();
+            v.get(v.len() / 2).copied()
+        };
+        let truncated = median_size.is_some_and(|m| sizes.len() >= 10 && size * 10 < m * 6);
+        if !truncated {
+            sizes.push_back(size);
+            if sizes.len() > 30 {
+                sizes.pop_front();
+            }
+        }
+        let decoded = if truncated {
+            None
+        } else {
+            luma::mjpeg_to_luma(frame.data).ok()
+        };
+        let Some((_, _, mut l)) = decoded else {
+            corrupt += 1;
+            corrupt_window += 1;
+            if last_corrupt_report.elapsed() >= Duration::from_secs(1) {
+                warn!(
+                    "[{name}] {corrupt_window} corrupt frames in the last second ({} total): the camera's USB link is dropping data (hub, cable, or EMI from the recoil?)",
+                    corrupt
+                );
+                last_corrupt_report = Instant::now();
+                corrupt_window = 0;
+            }
             continue;
         };
         if l.len() != w * h {
@@ -521,6 +560,7 @@ pub fn run_tracker_with(
             };
             s.events = events;
             s.held = held;
+            s.corrupt = corrupt;
         }
         if flow == Flow::Stop {
             break;
