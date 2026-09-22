@@ -74,19 +74,31 @@ impl Tab {
     }
 }
 
-/// Symbol sequence, every window of three unique (checked by test). Sides take a prefix.
-pub const SEQUENCE: [u8; 16] = [1, 0, 2, 2, 1, 1, 2, 0, 1, 0, 0, 2, 1, 2, 2, 2];
+/// Each side's symbol sequence. Every window of three consecutive symbols, read in either
+/// direction, occurs exactly once across all four sides and is not its own reverse
+/// (checked by test), so three adjacent tabs identify the side, the position and the
+/// reading direction. That is what makes the solve independent of how the gun is rolled:
+/// an edge's normal only guesses which side it is; the tabs settle it.
+pub const SEQUENCES: [&[u8]; 4] = [
+    &[0, 0, 1, 1, 2, 0, 0, 3, 1], // top
+    &[1, 1, 3, 2, 1, 3],          // right
+    &[2, 2, 3, 3, 0, 2, 2, 1, 0], // bottom
+    &[3, 3, 1, 0, 3, 2],          // left
+];
+
+/// Number of symbols; symbol `s` is a tab `s + 1` units wide.
+pub const SYMBOLS: u8 = 4;
 
 /// Centre-to-centre spacing of tabs, in units. The gap after a tab is what is left.
-pub const PITCH_UNITS: f64 = 5.0;
+pub const PITCH_UNITS: f64 = 6.0;
 
 /// Tab width unit and end margin for each side, in percent of the side.
 #[must_use]
 pub fn unit_and_margin(side: Side) -> (f64, f64) {
     if side.is_horizontal() {
-        (1.7, 5.0)
+        (1.6, 5.0)
     } else {
-        (3.0, 6.0)
+        (2.5, 6.0)
     }
 }
 
@@ -102,7 +114,7 @@ pub fn tabs(side: Side) -> Vec<Tab> {
     let (unit, margin) = unit_and_margin(side);
     let mut out = Vec::new();
     let pitch = PITCH_UNITS * unit;
-    for (i, &symbol) in SEQUENCE.iter().enumerate() {
+    for (i, &symbol) in SEQUENCES[side as usize].iter().enumerate() {
         #[allow(clippy::cast_precision_loss)]
         let centre = margin + (i as f64 + 0.5) * pitch;
         let w = width_units(symbol) * unit;
@@ -119,20 +131,46 @@ pub fn tabs(side: Side) -> Vec<Tab> {
     out
 }
 
-/// Positions in the side's tab list where the symbol run `seen` occurs contiguously.
+/// Where a run of symbols sits: the side, the index of the run's first symbol in that
+/// side's tab list, and whether the run was read against the side's direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub side: Side,
+    pub index: usize,
+    pub reversed: bool,
+}
+
+/// Identify a run of at least three symbols. `None` if it matches nowhere or, which the
+/// design rules out for correct reads but a misread can produce, in more than one place.
 #[must_use]
-pub fn matches(side: Side, seen: &[u8]) -> Vec<usize> {
-    let all = tabs(side);
-    if seen.is_empty() || seen.len() > all.len() {
-        return Vec::new();
+pub fn identify(run: &[u8]) -> Option<Placement> {
+    if run.len() < 3 {
+        return None;
     }
-    (0..=all.len() - seen.len())
-        .filter(|&i| {
-            seen.iter()
-                .enumerate()
-                .all(|(k, &s)| all[i + k].symbol == s)
-        })
-        .collect()
+    let rev: Vec<u8> = run.iter().rev().copied().collect();
+    let mut found = None;
+    for side in Side::ALL {
+        let all = tabs(side);
+        let syms: Vec<u8> = all.iter().map(|t| t.symbol).collect();
+        for (reversed, r) in [(false, run), (true, rev.as_slice())] {
+            if r.len() > syms.len() {
+                continue;
+            }
+            for i in 0..=syms.len() - r.len() {
+                if syms[i..i + r.len()] == *r {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(Placement {
+                        side,
+                        index: i,
+                        reversed,
+                    });
+                }
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -140,10 +178,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_window_of_three_is_unique() {
+    fn every_window_is_unique_across_sides_and_directions() {
         let mut seen = std::collections::HashSet::new();
-        for w in SEQUENCE.windows(3) {
-            assert!(seen.insert(w.to_vec()), "repeated window {w:?}");
+        for seq in SEQUENCES {
+            for w in seq.windows(3) {
+                let r: Vec<u8> = w.iter().rev().copied().collect();
+                assert_ne!(w, r.as_slice(), "palindromic window {w:?}");
+                assert!(seen.insert(w.to_vec()), "repeated window {w:?}");
+                assert!(seen.insert(r), "window {w:?} is another's reverse");
+            }
+            assert!(seq.iter().all(|&s| s < SYMBOLS));
         }
     }
 
@@ -151,7 +195,8 @@ mod tests {
     fn tabs_fit_and_do_not_overlap() {
         for side in Side::ALL {
             let t = tabs(side);
-            assert!(t.len() >= 5, "{side:?}: only {} tabs", t.len());
+            let want = if side.is_horizontal() { 9 } else { 6 };
+            assert_eq!(t.len(), want, "{side:?}: {} tabs", t.len());
             for pair in t.windows(2) {
                 assert!(pair[0].end < pair[1].start);
             }
@@ -169,12 +214,32 @@ mod tests {
     }
 
     #[test]
-    fn three_symbols_match_uniquely() {
-        let t = tabs(Side::Top);
-        for i in 0..t.len() - 2 {
-            let seen = [t[i].symbol, t[i + 1].symbol, t[i + 2].symbol];
-            assert_eq!(matches(Side::Top, &seen), vec![i]);
+    fn three_symbols_identify_side_position_and_direction() {
+        for side in Side::ALL {
+            let t = tabs(side);
+            for i in 0..t.len() - 2 {
+                let run = [t[i].symbol, t[i + 1].symbol, t[i + 2].symbol];
+                let fwd = identify(&run).expect("placed");
+                assert_eq!(
+                    fwd,
+                    Placement {
+                        side,
+                        index: i,
+                        reversed: false
+                    }
+                );
+                let back = [run[2], run[1], run[0]];
+                let rev = identify(&back).expect("placed");
+                assert_eq!(
+                    rev,
+                    Placement {
+                        side,
+                        index: i,
+                        reversed: true
+                    }
+                );
+            }
         }
-        assert!(matches(Side::Top, &[]).is_empty());
+        assert!(identify(&[0, 0]).is_none());
     }
 }

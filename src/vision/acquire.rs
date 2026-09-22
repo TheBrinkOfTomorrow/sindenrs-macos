@@ -874,18 +874,27 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
     out
 }
 
-/// Decode the tabs seen on a side into (image point on the outer line, screen point)
+/// What decoding one side's tabs produced.
+#[derive(Clone, Debug, Default)]
+pub struct Decoded {
+    /// (image point on the outer line, screen point) correspondences.
+    pub points: Vec<(P2, P2)>,
+    /// The side the code says this is, if any run identified it.
+    pub side: Option<Side>,
+}
+
+/// Decode the tabs seen on an edge into (image point on the outer line, screen point)
 /// correspondences. The local unit comes from the centre-to-centre spacing of whole
 /// neighbouring tabs (constant pitch on screen), each width is read against it, and runs
-/// of contiguous whole tabs are matched against the side's code, used only when the match
-/// is unique.
+/// of three or more confident symbols are looked up in the code, which names the side,
+/// the position and the reading direction. `lines` is the edge as classified from its
+/// normal; the code overrides that guess, which is what makes the solve roll-invariant.
 #[must_use]
-pub fn decode_tabs(side: Side, lines: &SideLines, seen: &[SeenTab]) -> Vec<(P2, P2)> {
+pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab]) -> Decoded {
+    let mut out = Decoded::default();
     let Some(t) = lines.thickness else {
-        return Vec::new();
+        return out;
     };
-    let table = code::tabs(side);
-    let mut out = Vec::new();
     // Split into runs wherever the spacing is not one pitch. The unit is about one
     // thickness on a 16:9 screen and three quarters of it on 4:3, and perspective can
     // squeeze or stretch a pitch by a third, while a missed tab doubles it.
@@ -893,7 +902,7 @@ pub fn decode_tabs(side: Side, lines: &SideLines, seen: &[SeenTab]) -> Vec<(P2, 
     for (k, tab) in seen.iter().enumerate() {
         let contiguous = k > 0 && {
             let d = tab.along - seen[k - 1].along;
-            d >= 2.8 * t && d <= 7.0 * t
+            d >= 3.3 * t && d <= 8.5 * t
         };
         if contiguous {
             if let Some(r) = runs.last_mut() {
@@ -922,49 +931,62 @@ pub fn decode_tabs(side: Side, lines: &SideLines, seen: &[SeenTab]) -> Vec<(P2, 
             #[allow(clippy::cast_precision_loss)]
             let unit = pitches.iter().sum::<f64>() / pitches.len() as f64 / code::PITCH_UNITS;
             let w = seen[k].width / unit;
-            // A width near a decision boundary (1.5 or 2.5 units) is a coin toss, and one
-            // misread symbol matches the code somewhere else with a plausible position, so
-            // an uncertain tab ends the run instead of joining it.
-            if (w - w.round()).abs() > 0.3 || !(0.6..=3.4).contains(&w) {
+            // A width near a decision boundary is a coin toss, and one misread symbol can
+            // match the code somewhere else, so an uncertain tab ends the run.
+            let max = f64::from(code::SYMBOLS);
+            if (w - w.round()).abs() > 0.3 || !(0.6..=max + 0.4).contains(&w) {
                 syms.push((k, u8::MAX));
                 continue;
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let sym = (w.round() as i64 - 1).clamp(0, 2) as u8;
+            let sym = (w.round() as i64 - 1).clamp(0, i64::from(code::SYMBOLS) - 1) as u8;
             syms.push((k, sym));
         }
         // Split at uncertain tabs; each confident stretch needs three symbols, the window
-        // size the code guarantees unique.
+        // size the code makes unique.
         let stretches: Vec<Vec<(usize, u8)>> = syms
             .split(|s| s.1 == u8::MAX)
             .filter(|st| st.len() >= 3)
             .map(<[(usize, u8)]>::to_vec)
             .collect();
         for syms in stretches {
-            // A stray cluster at either end (a reflection, the far side's corner) would spoil
-            // the whole run, so try trimming one symbol off each end before giving up.
+            // A stray cluster at either end (a reflection, the far side's corner) would
+            // spoil the whole run, so try trimming one symbol off each end before giving up.
             let symbols: Vec<u8> = syms.iter().map(|s| s.1).collect();
-            let mut found: Option<(usize, usize)> = None;
+            let mut found: Option<(usize, usize, code::Placement)> = None;
             for (lo, hi) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
                 if symbols.len() < lo + hi + 3 {
                     continue;
                 }
-                let m = code::matches(side, &symbols[lo..symbols.len() - hi]);
-                if m.len() == 1 {
-                    found = Some((lo, m[0]));
+                if let Some(pl) = code::identify(&symbols[lo..symbols.len() - hi]) {
+                    found = Some((lo, symbols.len() - hi, pl));
                     break;
                 }
             }
-            let Some((lo, at)) = found else {
+            let Some((lo, hi, pl)) = found else {
                 continue;
             };
-            for (i, &(k, _)) in syms.iter().enumerate().skip(lo) {
-                let Some(tab) = table.get(at + i - lo) else {
+            if out.side.is_some_and(|s| s != pl.side) {
+                // Two runs on one edge naming different sides: trust neither.
+                out.points.clear();
+                out.side = None;
+                return out;
+            }
+            out.side = Some(pl.side);
+            let table = code::tabs(pl.side);
+            let n = hi - lo;
+            for (i, &(k, _)) in syms[lo..hi].iter().enumerate() {
+                let at = if pl.reversed {
+                    pl.index + n - 1 - i
+                } else {
+                    pl.index + i
+                };
+                let Some(tab) = table.get(at) else {
                     break;
                 };
-                out.push((
+                out.points.push((
                     lines.point_at(seen[k].along),
-                    side.outer_point(tab.centre()),
+                    pl.side.outer_point(tab.centre()),
                 ));
             }
         }
@@ -986,6 +1008,8 @@ pub struct Report {
     pub decoded: [usize; 4],
     /// Every (image point, screen point) correspondence used.
     pub points: Vec<(P2, P2)>,
+    /// Why no corners came out, if they did not.
+    pub refused: Option<&'static str>,
 }
 
 /// Solve the border from whatever sides and tabs are visible. With all four outer lines
@@ -1001,19 +1025,49 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
         ..Default::default()
     };
     let mut points: Vec<(P2, P2)> = Vec::new();
-    for side in Side::ALL {
-        if let Some(sl) = &sides[side as usize] {
-            let seen = find_tabs(edges, &sides, sl);
-            let dec = decode_tabs(side, sl, &seen);
-            report.decoded[side as usize] = dec.len();
-            report.seen[side as usize] = seen;
-            points.extend(dec);
+    // Decode each classified edge, then let the code say which side it really is: the
+    // normal's guess fails past 45 degrees of roll, the tabs do not.
+    let guessed = sides;
+    let mut sides: [Option<SideLines>; 4] = [None; 4];
+    let mut decoded: [Vec<(P2, P2)>; 4] = Default::default();
+    for guess in Side::ALL {
+        let Some(sl) = &guessed[guess as usize] else {
+            continue;
+        };
+        let seen = find_tabs(edges, &guessed, sl);
+        let dec = decode_tabs(sl, &seen);
+        let side = dec.side.unwrap_or(guess);
+        // Two edges claiming one side: keep the one with tab evidence, else the first.
+        if sides[side as usize].is_some_and(|_| dec.points.len() <= decoded[side as usize].len()) {
+            continue;
         }
+        sides[side as usize] = Some(*sl);
+        decoded[side as usize] = dec.points;
+        report.seen[side as usize] = seen;
     }
+    for side in Side::ALL {
+        report.decoded[side as usize] = decoded[side as usize].len();
+        points.extend(decoded[side as usize].iter().copied());
+    }
+    report.sides = sides;
     let n_tabs = u8::try_from(points.len()).unwrap_or(u8::MAX);
     report.points.clone_from(&points);
     let per_side = report.decoded;
     let mut corners = solve_corners(&sides, &points, &per_side, mask_w, mask_h);
+    if corners.is_none() {
+        let n_sides = sides.iter().filter(|s| s.is_some()).count();
+        let starved = n_sides == 2
+            && Side::ALL
+                .iter()
+                .any(|&sd| sides[sd as usize].is_some() && per_side[sd as usize] < 2);
+        report.refused = Some(if n_sides == 0 {
+            "no sides"
+        } else if 2 * n_sides + points.len() < 9 || starved {
+            "too few constraints"
+        } else {
+            "degenerate quad (not convex, too small, or far off frame)"
+        });
+    }
     // A solve must agree with the tabs it decoded. A four-line solve built on a
     // misassigned edge, or a run matched at the wrong place, lands them far from their
     // screen positions; first retry as a least-squares fit over lines and tabs, then give
@@ -1028,6 +1082,9 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     if let Some(q) = &corners {
         if !fits(q) {
             corners = solve_corners_dlt(&sides, &points, &per_side, mask_w, mask_h).filter(fits);
+            if corners.is_none() {
+                report.refused = Some("solve disagrees with its own tabs");
+            }
         }
     }
     (corners.map(|q| (q, n_tabs)), report)

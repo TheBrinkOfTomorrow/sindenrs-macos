@@ -2334,6 +2334,9 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
                 let lens = Lens::centred(params.lens_k1, *w, *h);
                 let edges = edge_segments(&f.pts, &f.mask, &lens, &params);
                 let (_, report) = solve(&edges, f.mask.w, f.mask.h);
+                if let Some(why) = report.refused {
+                    println!("    refused: {why}");
+                }
                 for side in Side::ALL {
                     let Some(sl) = &report.sides[side as usize] else {
                         continue;

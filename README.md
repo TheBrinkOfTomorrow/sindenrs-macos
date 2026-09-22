@@ -257,10 +257,16 @@ plain border carries no information about which stretch of an edge is in view, s
 a border that encodes position (thickness is not a usable cue on a CRT).
 
 **The coded border.** Each side carries a row of tabs on the inner edge of the border, one
-border-thickness deep, at a constant pitch; a tab's width (one, two or three units) is a
-ternary symbol, and the sequence is chosen so that every window of three consecutive symbols
-is unique (`src/vision/code.rs`, shared by the overlay that draws it and the detector that
-reads it). The detector finds the tabs as boundary points in the band just inside a side's
+border-thickness deep, at a constant pitch; a tab's width (one to four units) is a symbol,
+and each side has its own sequence, chosen so that every window of three consecutive
+symbols, read in either direction, occurs exactly once across all four sides
+(`src/vision/code.rs`, shared by the overlay that draws it and the detector that reads it).
+Three adjacent tabs therefore name the side, the position and the reading direction, and the
+solve does not depend on how the gun is rolled: an edge's normal only guesses which side it
+is, the tabs settle it. (The second recording, `corpus/wow2`, was shot with the gun rolled
+about 45 degrees, where a normal-based guess flips between two sides frame by frame; the
+tabs shared one sequence then, so the wrong guess still decoded and produced a mirrored quad
+that was refused, giving a 30 Hz flicker between solve and no solve with the gun held still.) The detector finds the tabs as boundary points in the band just inside a side's
 inner edge that belong to no fitted line, clusters them along the outer line, takes the unit
 from the centre-to-centre spacing (thresholding fattens bright regions, which biases widths
 and gaps but not centres) and matches runs of symbols against the side's code. Each decoded
@@ -285,7 +291,9 @@ its own tabs within 2% is refused. The worst remaining frame-to-frame spike is 2
 tracker holds back a frame that leaps on a weaker solve until the next frame confirms it. What
 is left is physical: the OLED caught mid-refresh draws one side a third as thick, and at the
 far end of the range a six-pixel border can have both edges fitted as one line; both show up
-as small spikes or a missed frame, not as a wrong cursor.
+as small spikes or a missed frame, not as a wrong cursor. Recordings made before the per-side
+code (`2026-09-22-coded`, `wow`, `wow2`) still exercise the four-line path but their tabs no
+longer decode.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
