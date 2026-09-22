@@ -52,7 +52,7 @@ pub fn score(frames: &[FitFrame], k1: f64, p: &AcquireParams) -> Score {
     let mut sum_sq = 0.0;
     for f in frames {
         let lens = Lens::centred(k1, f.w, f.h);
-        for s in edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, p) {
+        for s in edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, p).segments {
             inliers += s.inliers.len();
             #[allow(clippy::cast_precision_loss)]
             {

@@ -54,6 +54,9 @@ pub struct Sample<'a> {
     pub raw: &'a [u8],
     pub aim: Option<[f64; 2]>,
     pub quad: Option<Quad>,
+    /// The camera frame's corners in screen percent (TL, TR, BR, BL of the image), i.e.
+    /// where on the screen the camera is looking, when a quad was solved.
+    pub view: Option<[[f64; 2]; 4]>,
     pub sequence: u32,
     pub age: Option<Duration>,
     pub events: &'a [crate::protocol::event::Event],
@@ -177,7 +180,16 @@ pub fn run_tracker_with(
         ..Default::default()
     };
     // Corners come out in undistorted pixels, so the aim pixel has to be undistorted too.
-    let aim_undist = Lens::centred(opts.lens_k1, w, h).undistort(aim_px);
+    let lens = Lens::centred(opts.lens_k1, w, h);
+    let aim_undist = lens.undistort(aim_px);
+    #[allow(clippy::cast_precision_loss)]
+    let frame_corners = [
+        [0.0, 0.0],
+        [(w - 1) as f64, 0.0],
+        [(w - 1) as f64, (h - 1) as f64],
+        [0.0, (h - 1) as f64],
+    ]
+    .map(|c| lens.undistort(c));
     info!(
         "[{name}] tracking {}x{} {} on {}, aim pixel ({:.1}, {:.1}), threshold {threshold}, flip {flip:?}, bore ({cal_x:+.2}%, {cal_y:+.2}%), lens k1 {}",
         w, h, fmt.format, camera.display(), aim_px[0], aim_px[1], opts.lens_k1
@@ -189,7 +201,7 @@ pub fn run_tracker_with(
         let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("frames.csv"))?);
         writeln!(
             f,
-            "seq,ts_us,age_us,proc_us,found,clipped,tlx,tly,trx,try,brx,bry,blx,bly,aimx,aimy"
+            "seq,ts_us,age_us,proc_us,found,clipped,tabs,tlx,tly,trx,try,brx,bry,blx,bly,aimx,aimy"
         )?;
         csv = Some(f);
     }
@@ -231,8 +243,14 @@ pub fn run_tracker_with(
         flip_luma(&mut l, w, flip);
         let quad = acquire(&l, w, h, &params);
         let mut aim = None;
+        let mut view = None;
         if let Some(q) = &quad {
             found += 1;
+            let m = q.to_screen();
+            let vs = frame_corners.map(|c| m.apply(c));
+            if vs.iter().all(Option::is_some) {
+                view = Some(vs.map(|v| v.unwrap_or([0.0, 0.0])));
+            }
             if let Some(p) = q
                 .to_screen()
                 .apply(aim_undist)
@@ -263,17 +281,20 @@ pub fn run_tracker_with(
             events += frame_events.len() as u64;
         }
         if let Some(f) = csv.as_mut() {
-            let (c, clipped) = quad.map_or(([[f64::NAN; 2]; 4], false), |q| (q.corners, q.clipped));
+            let (c, clipped, tabs) = quad.map_or(([[f64::NAN; 2]; 4], false, 0), |q| {
+                (q.corners, q.clipped, q.tabs)
+            });
             let am = aim.unwrap_or([f64::NAN; 2]);
             writeln!(
                 f,
-                "{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
+                "{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
                 frame.sequence,
                 frame.timestamp.map_or(0, |t| t.as_micros()),
                 frame.age().map_or(0, |t| t.as_micros()),
                 proc.as_micros(),
                 u8::from(quad.is_some()),
                 u8::from(clipped),
+                tabs,
                 c[0][0],
                 c[0][1],
                 c[1][0],
@@ -304,7 +325,11 @@ pub fn run_tracker_with(
                     start.elapsed().as_secs_f64(), frame.sequence, am[0], am[1],
                     q.corners[0][0], q.corners[0][1], q.corners[1][0], q.corners[1][1],
                     q.corners[2][0], q.corners[2][1], q.corners[3][0], q.corners[3][1],
-                    if q.from_lines { "" } else { " CLIPPED" },
+                    match (q.from_lines, q.tabs) {
+                        (false, _) => " CLIPPED",
+                        (true, 0) => "",
+                        (true, _) => " coded",
+                    },
                     proc.as_secs_f64() * 1000.0, frame.age().map_or(0.0, |a| a.as_secs_f64() * 1000.0)
                 ),
                 _ => {
@@ -317,6 +342,7 @@ pub fn run_tracker_with(
             raw: frame.data,
             aim,
             quad,
+            view,
             sequence: frame.sequence,
             age: frame.age(),
             events: &frame_events,

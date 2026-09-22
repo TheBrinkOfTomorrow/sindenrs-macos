@@ -2236,7 +2236,8 @@ fn grid_targets(n: u32) -> Vec<[f64; 2]> {
 
 /// Detection over recorded frames, with an optional lens fit.
 fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
-    use sindenrs::vision::acquire::{acquire, edge_segments, flip_luma, AcquireParams};
+    use sindenrs::vision::acquire::{acquire, edge_segments, flip_luma, solve, AcquireParams};
+    use sindenrs::vision::code::Side;
     use sindenrs::vision::lens::Lens;
     use sindenrs::vision::lensfit::{fit_k1, score, FitFrame};
     use sindenrs::vision::luma::mjpeg_to_luma;
@@ -2326,7 +2327,28 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         if a.per_frame && a.lines {
             if let Some(f) = FitFrame::prepare(l, *w, *h, &params) {
                 let lens = Lens::centred(params.lens_k1, *w, *h);
-                for s in edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, &params) {
+                let edges = edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, &params);
+                let (_, report) = solve(&edges, f.mask_w, f.mask_h);
+                for side in Side::ALL {
+                    let Some(sl) = &report.sides[side as usize] else {
+                        continue;
+                    };
+                    println!(
+                        "    {side:?}: thickness {} tabs seen {} decoded {}",
+                        sl.thickness.map_or("?".into(), |t| format!("{t:.1}px")),
+                        report.seen[side as usize].len(),
+                        report.decoded[side as usize]
+                    );
+                    for t in &report.seen[side as usize] {
+                        println!(
+                            "        tab at {:.1} width {:.1}px{}",
+                            t.along,
+                            t.width,
+                            if t.partial { " (cut off)" } else { "" }
+                        );
+                    }
+                }
+                for s in &edges.segments {
                     let (lo, hi) = s.inliers.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
                         let t = -s.line.b * p[0] + s.line.a * p[1];
                         (lo.min(t), hi.max(t))
@@ -2346,9 +2368,10 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         if a.per_frame {
             let c = q.map_or([[f64::NAN; 2]; 4], |q| q.corners);
             println!(
-                "{} {tag:<12} TL({:.1},{:.1}) TR({:.1},{:.1}) BR({:.1},{:.1}) BL({:.1},{:.1})",
+                "{} {tag:<12} tabs={:<2} TL({:.1},{:.1}) TR({:.1},{:.1}) BR({:.1},{:.1}) BL({:.1},{:.1})",
                 path.file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                q.map_or(0, |q| q.tabs),
                 c[0][0],
                 c[0][1],
                 c[1][0],
@@ -2602,6 +2625,12 @@ fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
                 if let Ok(mut sc) = scene.lock() {
                     sc.aim = s.aim;
                     sc.quality = quality;
+                    sc.solve = sindenrs::overlay::SolveInfo {
+                        sides: s.quad.map_or(0, |q| q.sides),
+                        tabs: s.quad.map_or(0, |q| q.tabs),
+                        from_lines: s.quad.is_some_and(|q| q.from_lines),
+                        view: s.view,
+                    };
                 }
                 if use_trigger && pressed && pending.is_none() {
                     pending = Some(now);

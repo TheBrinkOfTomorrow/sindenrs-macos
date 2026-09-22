@@ -48,9 +48,25 @@ pub struct Scene {
     /// Live aim point in screen percent.
     pub aim: Option<[f64; 2]>,
     pub quality: Quality,
+    /// What the last solve rested on.
+    pub solve: SolveInfo,
     /// Set to flash the current target when a shot could not be measured.
     pub flash_until: Option<Instant>,
     pub done: bool,
+}
+
+/// What the tracker's last solve was built from, shown so the operator can tell a
+/// four-edge solve from a two-edge-plus-tabs one and see where the camera is looking.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SolveInfo {
+    /// Sides with a fitted outer edge, one bit per `vision::code::Side` index.
+    pub sides: u8,
+    /// Decoded tabs used.
+    pub tabs: u8,
+    /// True if the corners came from edge lines (false: hull, unreliable).
+    pub from_lines: bool,
+    /// The camera frame's corners in screen percent, if solved.
+    pub view: Option<[[f64; 2]; 4]>,
 }
 
 impl Scene {
@@ -215,6 +231,30 @@ impl Canvas<'_> {
     }
 }
 
+/// Draw the tracked border: the white frame plus the tabs that make it self-locating (one
+/// border thickness inward from the inner edge, spanning the percent range the code table
+/// gives). Returns the thickness in pixels.
+fn draw_border(c: &mut Canvas, w: u32, h: u32, border_frac: f64) -> i64 {
+    use crate::vision::code::{tabs, Side};
+    let t = px(f64::from(w.min(h)) * border_frac).max(2);
+    let (wi, hi) = (i64::from(w), i64::from(h));
+    c.frame(0, 0, wi, hi, t, WHITE);
+    for side in Side::ALL {
+        for tab in tabs(side) {
+            let len = if side.is_horizontal() { w } else { h };
+            let a = px(tab.start / 100.0 * f64::from(len));
+            let b = px(tab.end / 100.0 * f64::from(len));
+            match side {
+                Side::Top => c.rect(a, t, b - a, t, WHITE),
+                Side::Bottom => c.rect(a, hi - 2 * t, b - a, t, WHITE),
+                Side::Left => c.rect(t, a, t, b - a, WHITE),
+                Side::Right => c.rect(wi - 2 * t, a, t, b - a, WHITE),
+            }
+        }
+    }
+    t
+}
+
 struct App {
     window: Option<Rc<Window>>,
     context: Option<softbuffer::Context<Rc<Window>>>,
@@ -247,8 +287,7 @@ impl App {
         c.fill(BLACK);
 
         // The border the gun actually tracks. Everything else is smaller than it and inside.
-        let t = px(f64::from(w.min(h)) * scene.border_frac).max(2);
-        c.frame(0, 0, i64::from(w), i64::from(h), t, WHITE);
+        let t = draw_border(&mut c, w, h, scene.border_frac);
 
         let to_px = |p: [f64; 2]| -> (i64, i64) {
             (
@@ -313,13 +352,52 @@ impl App {
             c.ring(x, y, unit, (unit / 3).max(2), colour);
         }
 
+        // Where the camera is looking: its frame projected onto the screen.
+        if let Some(v) = scene.solve.view {
+            let p: Vec<(i64, i64)> = v.iter().map(|q| to_px(*q)).collect();
+            let colour = if scene.solve.from_lines { GREY } else { RED };
+            for i in 0..4 {
+                let (a, b) = (p[i], p[(i + 1) % 4]);
+                c.line(a.0, a.1, b.0, b.1, (unit / 6).max(1), colour);
+            }
+        }
+
         // Tracking quality, inside the border so it never interferes with detection.
         let q = match scene.quality {
             Quality::Good => GREEN,
             Quality::Clipped => AMBER,
             Quality::Lost => RED,
         };
-        c.rect(t * 2, i64::from(h) - t * 2 - unit, unit * 3, unit, q);
+        let y0 = i64::from(h) - t * 2 - unit * 3;
+        c.rect(t * 2, y0, unit * 3, unit, q);
+        // Which sides the solve had: a small frame with one bar per fitted side.
+        let (fx, fy, fw, fh, bar) = (
+            t * 2 + unit * 4,
+            y0 - unit,
+            unit * 4,
+            unit * 3,
+            (unit / 3).max(2),
+        );
+        for (i, (x, y, bw, bh)) in [
+            (fx, fy, fw, bar),
+            (fx + fw - bar, fy, bar, fh),
+            (fx, fy + fh - bar, fw, bar),
+            (fx, fy, bar, fh),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let on = scene.solve.sides & (1 << i) != 0;
+            c.rect(x, y, bw, bh, if on { GREEN } else { GREY });
+        }
+        // Decoded tab count.
+        let g = Glyph {
+            w: unit,
+            h: unit * 2,
+            thickness: (unit / 4).max(2),
+            colour: if scene.solve.tabs > 0 { CYAN } else { GREY },
+        };
+        c.number(u32::from(scene.solve.tabs), fx + fw + unit * 2, fy, g);
 
         if scene.done {
             let g = Glyph {
@@ -423,6 +501,42 @@ pub fn run(scene: Arc<Mutex<Scene>>, stop: Arc<AtomicBool>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The border the overlay draws must be one the detector decodes: render it, take it
+    /// as a camera frame, and check every side and most tabs come back.
+    #[test]
+    fn drawn_border_decodes() {
+        use crate::vision::acquire::{acquire, AcquireParams};
+        let (w, h) = (1280u32, 720u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        let mut c = Canvas {
+            px: &mut buf,
+            w: i64::from(w),
+            h: i64::from(h),
+        };
+        c.fill(BLACK);
+        draw_border(&mut c, w, h, 0.03);
+        // Seen from a little further back: the border inside a black margin.
+        let (m, fw, fh) = (60usize, 1280 + 120, 720 + 120);
+        let mut luma = vec![5u8; fw * fh];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                if buf[y * w as usize + x] == WHITE {
+                    luma[(y + m) * fw + x + m] = 230;
+                }
+            }
+        }
+        let q = acquire(&luma, fw, fh, &AcquireParams::default()).expect("found");
+        assert!(q.from_lines && q.sides == 0b1111, "{q:?}");
+        assert!(q.tabs >= 24, "only {} tabs decoded", q.tabs);
+        let want = [[60.0, 60.0], [1339.0, 60.0], [1339.0, 779.0], [60.0, 779.0]];
+        for (got, want) in q.corners.iter().zip(want) {
+            assert!(
+                (got[0] - want[0]).abs() < 3.0 && (got[1] - want[1]).abs() < 3.0,
+                "{got:?} vs {want:?}"
+            );
+        }
+    }
 
     #[test]
     fn canvas_primitives_stay_in_bounds() {

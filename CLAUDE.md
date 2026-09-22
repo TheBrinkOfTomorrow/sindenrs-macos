@@ -51,10 +51,12 @@ hardware findings and the roadmap.
 - **src/overlay.rs** — fullscreen window (winit + softbuffer): draws the tracking border and the calibration UI. The event loop owns the main thread, so tracking runs on a worker.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle
-- **src/vision/** — homography (verified), luma helpers, `lens.rs` division-model
-  undistortion, `lines.rs` RANSAC line extraction, `acquire.rs` border finder (edge lines →
-  corners; hull fallback is always flagged unreliable), `lensfit.rs` fits `k1` from recorded
-  frames (`sindenrs replay --fit-lens corpus/<dir>`)
+- **src/vision/** — `homography.rs` (quad map plus a DLT over line and point
+  correspondences), luma helpers, `lens.rs` division-model undistortion, `lines.rs` RANSAC
+  line extraction, `code.rs` the coded-border tab layout (shared by overlay and detector),
+  `acquire.rs` border finder (edge lines and decoded tabs → corners; hull fallback is always
+  flagged unreliable), `lensfit.rs` fits `k1` from recorded frames
+  (`sindenrs replay --fit-lens corpus/<dir>`; `replay --per-frame --lines` dumps sides and tabs)
 - **tools/border.html** — fullscreen white-border page for testing; `corpus/` holds recorded frames (gitignored)
 - **flake.nix** also exports `nixosModules.default` (udev rules, groups, optional service)
 

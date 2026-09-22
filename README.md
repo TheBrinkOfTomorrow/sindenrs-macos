@@ -25,7 +25,7 @@ the border tracker is next. See [Roadmap](#roadmap).
 | TOML config (display profiles, per-gun buttons/recoil by unique id) | done |
 | Firmware backup/flash, bootloader reset, joystick device switch | done, both guns on 2.1 |
 | Sub-pixel edge tracker | not started |
-| Self-locating border (coarse glyph code) for the close-range, two-or-three-sides case | design |
+| Self-locating border: coded tabs, line-plus-point solve for two or three visible sides | done, synthetic tests; not yet shot on hardware |
 | Calibration overlay (Wayland / X11 / Windows) | not started |
 | Windows capture and discovery backends | stubs |
 
@@ -254,7 +254,23 @@ as a fallback and is always flagged unreliable: on 133 frames of a border page t
 yet fullscreen it returned a confident quad with one side invented. The recorded close-range
 corpus is the other story: 600 frames of which almost all show only two or three sides, and a
 plain border carries no information about which stretch of an edge is in view, so those need
-a border that encodes position (a coarse glyph code, thickness is not a usable cue on a CRT).
+a border that encodes position (thickness is not a usable cue on a CRT).
+
+**The coded border.** Each side carries a row of tabs on the inner edge of the border, one
+border-thickness deep, at a constant pitch; a tab's width (one, two or three units) is a
+ternary symbol, and the sequence is chosen so that every window of three consecutive symbols
+is unique (`src/vision/code.rs`, shared by the overlay that draws it and the detector that
+reads it). The detector finds the tabs as boundary points in the band just inside a side's
+inner edge that belong to no fitted line, clusters them along the outer line, takes the unit
+from the centre-to-centre spacing (thresholding fattens bright regions, which biases widths
+and gaps but not centres) and matches runs of symbols against the side's code. Each decoded
+tab is a known point on that side's outer edge. The solve is then a direct linear transform
+over line correspondences (two constraints each) and tab points (one each beyond their line):
+two visible sides need four decoded tabs, three sides need two, four sides need none. Every
+result carries the decoded tab count, which also tells a Sinden border from any other bright
+rectangle; the calibration overlay shows the sides used, the tab count and the camera's field
+of view projected onto the screen. Tabs stay readable down to roughly nine pixels of border
+thickness in synthetic frames; how far that reaches on hardware is not yet measured.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
@@ -334,8 +350,9 @@ The Windows target type-checks today (`cargo check --target x86_64-pc-windows-ms
 
 1. Border acquisition (downsample, threshold, connected components, convex quad) against a
    white-border page on the OLED.
-2. Self-locating border: coarse glyphs so two visible sides give a full solve. Then the
-   sub-pixel gradient tracker.
+2. Shoot the coded border on hardware: measure at what distance tabs decode, and whether
+   a zero-tab four-line solve should be rejected as "not our border". Then the sub-pixel
+   gradient tracker.
 3. Predictive filter and end-to-end latency measurement.
 4. Correction field fitted from the aim test; virtual gamepad with rumble-to-recoil; hotplug in `run`.
 5. Windows backends (Media Foundation capture, SetupAPI discovery).
