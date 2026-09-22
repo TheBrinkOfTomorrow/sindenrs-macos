@@ -52,6 +52,24 @@ impl Line {
         }
     }
 
+    /// Unit direction along the line (the normal rotated a quarter turn).
+    #[must_use]
+    pub fn direction(&self) -> P2 {
+        [-self.b, self.a]
+    }
+
+    /// Coordinate of `p` along the line, measured along [`Line::direction`].
+    #[must_use]
+    pub fn along(&self, p: P2) -> f64 {
+        -self.b * p[0] + self.a * p[1]
+    }
+
+    /// The point on the line at coordinate `t` along it.
+    #[must_use]
+    pub fn point_at(&self, t: f64) -> P2 {
+        [self.a * self.c - self.b * t, self.b * self.c + self.a * t]
+    }
+
     /// Translate along the normal by `d`.
     #[must_use]
     pub fn offset(self, d: f64) -> Self {
@@ -129,6 +147,8 @@ impl Line {
 pub struct Segment {
     pub line: Line,
     pub inliers: Vec<P2>,
+    /// Indices of the inliers in the input slice.
+    pub idx: Vec<usize>,
     /// Root-mean-square distance of the inliers to the refit line.
     pub rms: f64,
 }
@@ -158,21 +178,21 @@ pub fn extract_lines(
     min_inliers: usize,
     max_lines: usize,
 ) -> Vec<Segment> {
-    let mut remaining: Vec<P2> = points.to_vec();
+    let mut remaining: Vec<usize> = (0..points.len()).collect();
     let mut out = Vec::new();
     let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
     let iters = 64;
     while remaining.len() >= min_inliers && out.len() < max_lines {
         let mut best: Option<(Line, usize)> = None;
         for _ in 0..iters {
-            let i = rng.next_below(remaining.len());
-            let j = rng.next_below(remaining.len());
-            let Some(l) = Line::through(remaining[i], remaining[j]) else {
+            let i = remaining[rng.next_below(remaining.len())];
+            let j = remaining[rng.next_below(remaining.len())];
+            let Some(l) = Line::through(points[i], points[j]) else {
                 continue;
             };
             let n = remaining
                 .iter()
-                .filter(|p| l.signed_dist(**p).abs() <= tol)
+                .filter(|&&k| l.signed_dist(points[k]).abs() <= tol)
                 .count();
             if best.is_none_or(|(_, bn)| n > bn) {
                 best = Some((l, n));
@@ -186,16 +206,17 @@ pub fn extract_lines(
         // support reflects the least-squares line rather than the two seed points.
         let first: Vec<P2> = remaining
             .iter()
-            .copied()
+            .map(|&k| points[k])
             .filter(|p| l.signed_dist(*p).abs() <= tol)
             .collect();
         let line = Line::fit(&first).unwrap_or(l);
-        let (inliers, rest): (Vec<P2>, Vec<P2>) = remaining
+        let (idx, rest): (Vec<usize>, Vec<usize>) = remaining
             .iter()
-            .partition(|p| line.signed_dist(**p).abs() <= tol);
-        if inliers.len() < min_inliers {
+            .partition(|&&k| line.signed_dist(points[k]).abs() <= tol);
+        if idx.len() < min_inliers {
             break;
         }
+        let inliers: Vec<P2> = idx.iter().map(|&k| points[k]).collect();
         let line = Line::fit(&inliers).unwrap_or(line);
         #[allow(clippy::cast_precision_loss)]
         let rms = (inliers
@@ -204,7 +225,12 @@ pub fn extract_lines(
             .sum::<f64>()
             / inliers.len() as f64)
             .sqrt();
-        out.push(Segment { line, inliers, rms });
+        out.push(Segment {
+            line,
+            inliers,
+            idx,
+            rms,
+        });
         remaining = rest;
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.inliers.len()));

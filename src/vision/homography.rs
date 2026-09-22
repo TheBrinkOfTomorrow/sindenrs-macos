@@ -102,6 +102,185 @@ pub fn quad_to_quad(src: &[P2; 4], dst: &[P2; 4]) -> Mat3 {
 /// the result is directly a percentage.
 pub const SCREEN_PERCENT: [P2; 4] = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
 
+/// A line `a x + b y = c` as a homogeneous triple `(a, b, -c)`.
+pub type L3 = [f64; 3];
+
+/// Eigenvector of the smallest eigenvalue of a symmetric matrix (cyclic Jacobi).
+#[allow(clippy::needless_range_loop)] // index-heavy numeric kernel; iterators obscure it
+fn smallest_eigenvector(mut a: [[f64; 9]; 9]) -> [f64; 9] {
+    let mut v = [[0.0; 9]; 9];
+    for (i, row) in v.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for _ in 0..60 {
+        let mut off = 0.0;
+        for p in 0..9 {
+            for q in p + 1..9 {
+                off += a[p][q] * a[p][q];
+            }
+        }
+        if off < 1e-24 {
+            break;
+        }
+        for p in 0..9 {
+            for q in p + 1..9 {
+                if a[p][q].abs() < 1e-300 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let sn = t * c;
+                for k in 0..9 {
+                    let (akp, akq) = (a[k][p], a[k][q]);
+                    a[k][p] = c * akp - sn * akq;
+                    a[k][q] = sn * akp + c * akq;
+                }
+                for k in 0..9 {
+                    let (apk, aqk) = (a[p][k], a[q][k]);
+                    a[p][k] = c * apk - sn * aqk;
+                    a[q][k] = sn * apk + c * aqk;
+                }
+                for row in &mut v {
+                    let (vp, vq) = (row[p], row[q]);
+                    row[p] = c * vp - sn * vq;
+                    row[q] = sn * vp + c * vq;
+                }
+            }
+        }
+    }
+    let mut best = 0;
+    for i in 1..9 {
+        if a[i][i] < a[best][best] {
+            best = i;
+        }
+    }
+    let mut out = [0.0; 9];
+    for (k, o) in out.iter_mut().enumerate() {
+        *o = v[k][best];
+    }
+    out
+}
+
+/// Similarity that moves `pts` to centroid 0 and typical radius 1, applied to a point.
+fn normaliser(pts: &[P2]) -> Mat3 {
+    #[allow(clippy::cast_precision_loss)]
+    let n = pts.len().max(1) as f64;
+    let (cx, cy) = pts
+        .iter()
+        .fold((0.0, 0.0), |(x, y), p| (x + p[0] / n, y + p[1] / n));
+    let mut r = pts
+        .iter()
+        .map(|p| ((p[0] - cx).powi(2) + (p[1] - cy).powi(2)).sqrt())
+        .sum::<f64>()
+        / n;
+    if r < 1e-9 {
+        r = 1.0;
+    }
+    let s = std::f64::consts::SQRT_2 / r;
+    Mat3([[s, 0.0, -s * cx], [0.0, s, -s * cy], [0.0, 0.0, 1.0]])
+}
+
+/// Direct linear transform from mixed correspondences: `points` are (source, destination)
+/// pairs, `lines` are (source, destination) homogeneous lines. Each point gives two
+/// equations and each line two, so eight are needed in total (four lines, or two lines and
+/// four points, ...). Returns the map from source to destination, or `None` if degenerate.
+#[must_use]
+pub fn fit_dlt(points: &[(P2, P2)], lines: &[(L3, L3)]) -> Option<Mat3> {
+    if 2 * (points.len() + lines.len()) < 8 {
+        return None;
+    }
+    // Hartley normalisation: condition both sides from the point-like content we have.
+    let src_pts: Vec<P2> = points
+        .iter()
+        .map(|(a, _)| *a)
+        .chain(lines.iter().filter_map(|(l, _)| line_anchor(*l)))
+        .collect();
+    let dst_pts: Vec<P2> = points
+        .iter()
+        .map(|(_, b)| *b)
+        .chain(lines.iter().filter_map(|(_, l)| line_anchor(*l)))
+        .collect();
+    let ts = normaliser(&src_pts);
+    let td = normaliser(&dst_pts);
+    // Lines transform by the inverse transpose; for a similarity T, l' = adj(T)^T l.
+    let ts_l = ts.adjugate();
+    let td_l = td.adjugate();
+    let tl = |t: &Mat3, l: L3| -> L3 {
+        let m = &t.0;
+        let out = [
+            m[0][0] * l[0] + m[1][0] * l[1] + m[2][0] * l[2],
+            m[0][1] * l[0] + m[1][1] * l[1] + m[2][1] * l[2],
+            m[0][2] * l[0] + m[1][2] * l[1] + m[2][2] * l[2],
+        ];
+        let n = (out[0] * out[0] + out[1] * out[1]).sqrt().max(1e-12);
+        [out[0] / n, out[1] / n, out[2] / n]
+    };
+    let mut rows: Vec<[f64; 9]> = Vec::new();
+    for (a, b) in points {
+        let (Some(a), Some(b)) = (ts.apply(*a), td.apply(*b)) else {
+            return None;
+        };
+        let (x, y, u, v) = (a[0], a[1], b[0], b[1]);
+        rows.push([0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v]);
+        rows.push([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, -u]);
+    }
+    for (l, m) in lines {
+        // m ∝ H^-T l, i.e. H^T m ∝ l: cross(H^T m, l) = 0.
+        let l = tl(&ts_l, *l);
+        let m = tl(&td_l, *m);
+        // (H^T m)_j = sum_i H_ij m_i ; h index = 3 i + j.
+        let coeff = |j: usize| -> [f64; 9] {
+            let mut r = [0.0; 9];
+            for i in 0..3 {
+                r[3 * i + j] = m[i];
+            }
+            r
+        };
+        let (c0, c1, c2) = (coeff(0), coeff(1), coeff(2));
+        let mut r1 = [0.0; 9];
+        let mut r2 = [0.0; 9];
+        let mut r3 = [0.0; 9];
+        for k in 0..9 {
+            r1[k] = c0[k] * l[2] - c2[k] * l[0];
+            r2[k] = c1[k] * l[2] - c2[k] * l[1];
+            r3[k] = c0[k] * l[1] - c1[k] * l[0];
+        }
+        rows.push(r1);
+        rows.push(r2);
+        rows.push(r3);
+    }
+    let mut ata = [[0.0; 9]; 9];
+    for r in &rows {
+        for i in 0..9 {
+            for j in 0..9 {
+                ata[i][j] += r[i] * r[j];
+            }
+        }
+    }
+    let h = smallest_eigenvector(ata);
+    let hn = Mat3([[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], h[8]]]);
+    let full = td.adjugate().mul(&hn).mul(&ts);
+    let m = &full.0;
+    let scale = m[2][2];
+    if !scale.is_finite() || scale.abs() < 1e-12 {
+        return None;
+    }
+    Some(Mat3(core::array::from_fn(|i| {
+        core::array::from_fn(|j| m[i][j] / scale)
+    })))
+}
+
+/// The point on a line closest to the origin, as something to normalise on.
+fn line_anchor(l: L3) -> Option<P2> {
+    let n = l[0] * l[0] + l[1] * l[1];
+    if n < 1e-18 {
+        return None;
+    }
+    Some([-l[0] * l[2] / n, -l[1] * l[2] / n])
+}
+
 /// Given the detected border corners in camera pixels (TL, TR, BR, BL) and the aim pixel,
 /// return the aim point in screen percent.
 pub fn aim_percent(corners: &[P2; 4], aim_pixel: P2) -> Option<P2> {
@@ -146,6 +325,65 @@ mod tests {
             max_err = max_err.max(err);
         }
         assert!(max_err < 1e-9, "max round-trip error {max_err}");
+    }
+
+    /// The line through two points as a homogeneous triple.
+    fn line3(p: P2, q: P2) -> L3 {
+        let a = -(q[1] - p[1]);
+        let b = q[0] - p[0];
+        [a, b, -(a * p[0] + b * p[1])]
+    }
+
+    #[test]
+    fn dlt_from_four_lines_matches_quad_solution() {
+        let cam = [[95.0, 70.0], [548.0, 52.0], [566.0, 415.0], [78.0, 398.0]];
+        let lines: Vec<(L3, L3)> = (0..4)
+            .map(|i| {
+                let (a, b) = (cam[i], cam[(i + 1) % 4]);
+                let (sa, sb) = (SCREEN_PERCENT[i], SCREEN_PERCENT[(i + 1) % 4]);
+                (line3(a, b), line3(sa, sb))
+            })
+            .collect();
+        let h = fit_dlt(&[], &lines).expect("solve");
+        for (c, s) in cam.iter().zip(SCREEN_PERCENT.iter()) {
+            let got = h.apply(*c).expect("finite");
+            assert!(
+                (got[0] - s[0]).abs() < 1e-6 && (got[1] - s[1]).abs() < 1e-6,
+                "{got:?} vs {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dlt_from_two_lines_and_four_points_on_them() {
+        let cam = [[95.0, 70.0], [548.0, 52.0], [566.0, 415.0], [78.0, 398.0]];
+        let fwd = quad_to_quad(&SCREEN_PERCENT, &cam);
+        // Top and left edges as lines, plus two known points on each.
+        let lines = vec![
+            (
+                line3(cam[0], cam[1]),
+                line3(SCREEN_PERCENT[0], SCREEN_PERCENT[1]),
+            ),
+            (
+                line3(cam[3], cam[0]),
+                line3(SCREEN_PERCENT[3], SCREEN_PERCENT[0]),
+            ),
+        ];
+        let screen_pts = [[20.0, 0.0], [55.0, 0.0], [0.0, 30.0], [0.0, 70.0]];
+        let points: Vec<(P2, P2)> = screen_pts
+            .iter()
+            .map(|s| (fwd.apply(*s).expect("finite"), *s))
+            .collect();
+        let h = fit_dlt(&points, &lines).expect("solve");
+        for (c, s) in cam.iter().zip(SCREEN_PERCENT.iter()) {
+            let got = h.apply(*c).expect("finite");
+            assert!(
+                (got[0] - s[0]).abs() < 1e-5 && (got[1] - s[1]).abs() < 1e-5,
+                "{got:?} vs {s:?}"
+            );
+        }
+        // Not enough constraints: refused.
+        assert!(fit_dlt(&points[..2], &lines).is_none());
     }
 
     #[test]
