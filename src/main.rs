@@ -44,7 +44,8 @@ enum Cmd {
         #[arg(long)]
         no_connect: bool,
     },
-    /// Run the driver: track every attached gun (or just --gun) until Ctrl-C.
+    /// Run the driver until Ctrl-C: track every attached gun, picking up guns as they are
+    /// plugged in and letting go of ones that are unplugged. What the service runs.
     Run {
         /// Draw the border on screen while running (config: display.overlay).
         #[arg(long, overrides_with = "no_overlay")]
@@ -1818,6 +1819,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1827,77 +1829,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
             .context("installing Ctrl-C handler")?;
     }
-    let guns = discovery::find_guns()?;
-    let cams = discovery::find_cameras()?;
-    if guns.is_empty() {
-        bail!("no guns attached");
-    }
-    let mut handles = Vec::new();
-    let mut statuses = Vec::new();
-    for g in &guns {
-        let port = g.port.to_string_lossy().into_owned();
-        let Some(cam) = g.sibling_camera(&cams) else {
-            warn!("{port}: no camera paired on the same hub; skipping");
-            continue;
-        };
-        let mut gun = match connect(&port, ctx.cfg.global.auto_recover) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("{port}: {e:#}; skipping");
-                continue;
-            }
-        };
-        let id = gun.unique_id().ok();
-        let gc = gun_config_for(&ctx.cfg, id.as_deref());
-        sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap())?;
-        info!(
-            "[{}] {port} + {} (id {})",
-            gc.name,
-            cam.node.display(),
-            id.as_deref().unwrap_or("?")
-        );
-        let opts = TrackerOptions {
-            display: ctx.display.clone(),
-            threshold: None,
-            min_size: None,
-            flip: None,
-            orientation: None,
-            cal_x: None,
-            cal_y: None,
-            lens_k1: ctx.cfg.global.lens_k1,
-            jump_limit: ctx.display.jump_limit,
-            hover_smoothing: ctx.display.hover_smoothing,
-            buffers: 4,
-            frames: 0,
-            record: None,
-            per_frame: false,
-            report_every: None,
-        };
-        let status = Arc::new(Mutex::new(Status {
-            name: gc.name.clone(),
-            ..Default::default()
-        }));
-        statuses.push(status.clone());
-        let stop = stop.clone();
-        let name = gc.name.clone();
-        let camera = cam.node.clone();
-        handles.push(
-            std::thread::Builder::new()
-                .name(name.clone())
-                .spawn(move || {
-                    let r = run_tracker(&name, &camera, Some((gun, gc)), &opts, &stop, &status);
-                    if let Err(e) = &r {
-                        if let Ok(mut s) = status.lock() {
-                            s.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    r
-                })?,
-        );
-    }
-    if handles.is_empty() {
-        bail!("no gun could be started");
-    }
+
     // The border the guns track. Its window is shaped to the border and takes no input, so
     // it can sit above a running game; if there is no display, tracking still runs (the
     // border may be coming from MAME artwork).
@@ -1914,38 +1846,161 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
                 }
             })
     });
-    info!("running {} gun(s); Ctrl-C to stop", handles.len());
-    let started = Instant::now();
-    while !stop.load(Ordering::Relaxed) && handles.iter().any(|h| !h.is_finished()) {
-        std::thread::sleep(Duration::from_secs(1));
-        let mut line = format!("{:>6.0}s", started.elapsed().as_secs_f64());
-        for st in &statuses {
-            let s = st.lock().map(|s| s.clone()).unwrap_or_default();
-            let aim = s.last_aim.map_or("   --  ,   --  ".into(), |a| {
-                format!("{:6.2}%,{:6.2}%", a[0], a[1])
-            });
-            line.push_str(&format!(
-                " | {}: {:.0}fps found {:.0}% aim {} proc {:.2}ms{}{}",
-                s.name,
-                s.fps,
-                if s.frames > 0 {
-                    s.found as f64 * 100.0 / s.frames as f64
-                } else {
-                    0.0
-                },
-                aim,
-                s.proc_mean.as_secs_f64() * 1000.0,
-                if s.clipped { " clipped" } else { "" },
-                s.error
-                    .as_deref()
-                    .map_or(String::new(), |e| format!(" ERROR {e}"))
-            ));
-        }
-        println!("{line}");
+
+    // One tracker thread per attached gun, keyed by the gun's USB path (stable per physical
+    // port while it stays plugged in). The loop below rediscovers every second: a gun that
+    // appears gets a thread, a gun that goes away makes its thread fail and be reaped, and
+    // a gun that failed waits a little before it is tried again, so a broken one does not
+    // spin. This is what a cabinet needs: guns plugged in after boot, or unplugged and
+    // replugged mid-session, without anything restarting the driver.
+    struct Running {
+        handle: std::thread::JoinHandle<Result<()>>,
+        status: Arc<Mutex<Status>>,
     }
+    let mut running: HashMap<String, Running> = HashMap::new();
+    let mut retry_after: HashMap<String, Instant> = HashMap::new();
+    let retry = Duration::from_secs(3);
+    let started = Instant::now();
+    let mut announced_empty = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        // Reap trackers that ended: a gun unplugged, its camera gone, or a real fault.
+        let finished: Vec<String> = running
+            .iter()
+            .filter(|(_, r)| r.handle.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in finished {
+            if let Some(r) = running.remove(&key) {
+                let name = r.status.lock().map(|s| s.name.clone()).unwrap_or_default();
+                match r.handle.join() {
+                    Ok(Ok(())) => info!("[{name}] stopped"),
+                    Ok(Err(e)) => warn!("[{name}] {e:#}; will retry if the gun is still there"),
+                    Err(_) => warn!("[{name}] tracker panicked"),
+                }
+                retry_after.insert(key, Instant::now() + retry);
+            }
+        }
+
+        // Start a tracker for every gun that has none.
+        let guns = discovery::find_guns().unwrap_or_default();
+        let cams = discovery::find_cameras().unwrap_or_default();
+        for g in &guns {
+            let key = g.usb_path.clone();
+            if running.contains_key(&key)
+                || retry_after.get(&key).is_some_and(|t| *t > Instant::now())
+            {
+                continue;
+            }
+            let port = g.port.to_string_lossy().into_owned();
+            let Some(cam) = g.sibling_camera(&cams) else {
+                if !retry_after.contains_key(&key) {
+                    warn!("{port}: no camera paired on the same hub; waiting for one");
+                }
+                retry_after.insert(key, Instant::now() + retry);
+                continue;
+            };
+            let mut gun = match connect(&port, ctx.cfg.global.auto_recover) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
+                    retry_after.insert(key, Instant::now() + retry);
+                    continue;
+                }
+            };
+            let id = gun.unique_id().ok();
+            let gc = gun_config_for(&ctx.cfg, id.as_deref());
+            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
+                warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
+                retry_after.insert(key, Instant::now() + retry);
+                continue;
+            }
+            info!(
+                "[{}] {port} + {} (id {})",
+                gc.name,
+                cam.node.display(),
+                id.as_deref().unwrap_or("?")
+            );
+            let opts = TrackerOptions {
+                display: ctx.display.clone(),
+                threshold: None,
+                min_size: None,
+                flip: None,
+                orientation: None,
+                cal_x: None,
+                cal_y: None,
+                lens_k1: ctx.cfg.global.lens_k1,
+                jump_limit: ctx.display.jump_limit,
+                hover_smoothing: ctx.display.hover_smoothing,
+                buffers: 4,
+                frames: 0,
+                record: None,
+                per_frame: false,
+                report_every: None,
+            };
+            let status = Arc::new(Mutex::new(Status {
+                name: gc.name.clone(),
+                ..Default::default()
+            }));
+            let name = gc.name.clone();
+            let camera = cam.node.clone();
+            let (stop2, status2) = (stop.clone(), status.clone());
+            let handle = std::thread::Builder::new()
+                .name(name.clone())
+                .spawn(move || {
+                    run_tracker(&name, &camera, Some((gun, gc)), &opts, &stop2, &status2)
+                })?;
+            retry_after.remove(&key);
+            running.insert(key, Running { handle, status });
+        }
+
+        if running.is_empty() {
+            if !announced_empty {
+                info!("no gun attached; waiting (Ctrl-C to stop)");
+                announced_empty = true;
+            }
+        } else {
+            announced_empty = false;
+            let mut line = format!("{:>6.0}s", started.elapsed().as_secs_f64());
+            let mut names: Vec<&String> = running.keys().collect();
+            names.sort();
+            for key in names {
+                let s = running[key]
+                    .status
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                let aim = s.last_aim.map_or("   --  ,   --  ".into(), |a| {
+                    format!("{:6.2}%,{:6.2}%", a[0], a[1])
+                });
+                line.push_str(&format!(
+                    " | {}: {:.0}fps found {:.0}% aim {} proc {:.2}ms{}",
+                    s.name,
+                    s.fps,
+                    if s.frames > 0 {
+                        s.found as f64 * 100.0 / s.frames as f64
+                    } else {
+                        0.0
+                    },
+                    aim,
+                    s.proc_mean.as_secs_f64() * 1000.0,
+                    if s.clipped { " clipped" } else { "" },
+                ));
+            }
+            println!("{line}");
+        }
+        // Sleep in short steps so Ctrl-C is prompt.
+        for _ in 0..10 {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        match h.join() {
+    for (_, r) in running {
+        match r.handle.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!("tracker failed: {e:#}"),
             Err(_) => warn!("tracker panicked"),

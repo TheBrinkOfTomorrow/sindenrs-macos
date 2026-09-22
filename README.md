@@ -21,6 +21,7 @@ compiles for it, but the camera and window backends do not exist yet.
 | Border as MAME artwork, for setups where MAME draws it | done |
 | Button map and recoil from a small TOML file, per gun | done |
 | Firmware backup and flash, joystick device | done |
+| Hotplug: `run` picks up guns as they come and go | done |
 | Rumble from games (virtual gamepad), Windows backends, CRT-specific correction | not started |
 
 ## Install
@@ -67,7 +68,8 @@ Configuration).
    Shoot each target. At the end the tool prints the aim error and asks whether to save
    the result into the gun. With two guns, run it once per gun: `sindenrs calibrate --gun player2`.
 4. Run `sindenrs run`. It draws the border, tracks every attached gun, and stops on Ctrl-C.
-   This is what the service runs.
+   It keeps looking for guns: a gun plugged in later is picked up, and an unplugged gun is
+   picked up again when it returns. This is what the service runs.
 
 The commands:
 

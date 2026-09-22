@@ -385,8 +385,9 @@
               after = [ "graphical-session.target" ];
               serviceConfig = {
                 ExecStart = runCommand;
-                # `run` exits when no gun is attached; keep trying in case one is plugged in.
-                Restart = "always";
+                # `run` waits for guns and picks them up as they come and go, so this only
+                # covers a crash.
+                Restart = "on-failure";
                 RestartSec = 5;
               };
             };
