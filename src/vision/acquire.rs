@@ -874,6 +874,9 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
     out
 }
 
+/// Constant by which thresholding fattens a measured tab width, in full-resolution pixels.
+pub const WIDTH_BIAS_PX: f64 = 1.6;
+
 /// What decoding one side's tabs produced.
 #[derive(Clone, Debug, Default)]
 pub struct Decoded {
@@ -912,25 +915,68 @@ pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab]) -> Decoded {
         }
         runs.push(vec![k]);
     }
+    // Thresholding fattens every tab by about the same number of pixels whatever its size,
+    // so widths carry a constant bias (measured +1.6 px on the recordings) while the unit,
+    // from centre spacing, does not. Estimate the bias for this edge from its own tabs:
+    // the value that makes their widths closest to whole units.
+    let mut reads: Vec<(f64, f64)> = Vec::new(); // (width px, unit px)
+    let unit_at = |run: &[usize], pos: usize| -> Option<f64> {
+        let k = run[pos];
+        let mut pitches = Vec::new();
+        if pos > 0 && !seen[run[pos - 1]].partial {
+            pitches.push(seen[k].along - seen[run[pos - 1]].along);
+        }
+        if pos + 1 < run.len() && !seen[run[pos + 1]].partial {
+            pitches.push(seen[run[pos + 1]].along - seen[k].along);
+        }
+        if pitches.is_empty() {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        Some(pitches.iter().sum::<f64>() / pitches.len() as f64 / code::PITCH_UNITS)
+    };
+    for run in &runs {
+        for pos in 0..run.len() {
+            if seen[run[pos]].partial {
+                continue;
+            }
+            if let Some(u) = unit_at(run, pos) {
+                reads.push((seen[run[pos]].width, u));
+            }
+        }
+    }
+    let mut bias = WIDTH_BIAS_PX;
+    if reads.len() >= 4 {
+        let cost = |b: f64| {
+            reads
+                .iter()
+                .map(|&(w, u)| {
+                    let x = (w - b) / u;
+                    (x - x.round()).abs()
+                })
+                .sum::<f64>()
+        };
+        let mut best = (cost(bias), bias);
+        let mut b = WIDTH_BIAS_PX - 2.0;
+        while b <= WIDTH_BIAS_PX + 2.0 {
+            let c = cost(b);
+            if c < best.0 {
+                best = (c, b);
+            }
+            b += 0.25;
+        }
+        bias = best.1;
+    }
     for run in runs {
         let mut syms: Vec<(usize, u8)> = Vec::new();
         for (pos, &k) in run.iter().enumerate() {
             if seen[k].partial {
                 continue;
             }
-            let mut pitches = Vec::new();
-            if pos > 0 && !seen[run[pos - 1]].partial {
-                pitches.push(seen[k].along - seen[run[pos - 1]].along);
-            }
-            if pos + 1 < run.len() && !seen[run[pos + 1]].partial {
-                pitches.push(seen[run[pos + 1]].along - seen[k].along);
-            }
-            if pitches.is_empty() {
+            let Some(unit) = unit_at(&run, pos) else {
                 continue;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            let unit = pitches.iter().sum::<f64>() / pitches.len() as f64 / code::PITCH_UNITS;
-            let w = seen[k].width / unit;
+            };
+            let w = (seen[k].width - bias) / unit;
             // A width near a decision boundary is a coin toss, and one misread symbol can
             // match the code somewhere else, so an uncertain tab ends the run.
             let max = f64::from(code::SYMBOLS);
@@ -1030,18 +1076,50 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     let guessed = sides;
     let mut sides: [Option<SideLines>; 4] = [None; 4];
     let mut decoded: [Vec<(P2, P2)>; 4] = Default::default();
+    let mut results: Vec<(Side, SideLines, Vec<SeenTab>, Decoded)> = Vec::new();
     for guess in Side::ALL {
         let Some(sl) = &guessed[guess as usize] else {
             continue;
         };
         let seen = find_tabs(edges, &guessed, sl);
         let dec = decode_tabs(sl, &seen);
-        let side = dec.side.unwrap_or(guess);
+        results.push((guess, *sl, seen, dec));
+    }
+    // The decoded sides reveal the roll: how far each observed outward normal is turned
+    // from where that side's normal points on an unrolled screen. Edges without a decode
+    // are then labelled by their normal turned back by that roll, so a gun held sideways
+    // or upside down gets all four sides right, not just the ones with readable tabs.
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for (_, sl, _, dec) in &results {
+        if let Some(side) = dec.side {
+            let nom = side.outer_line();
+            // Angle from nominal (nx, ny) to observed (a, b): rotate nominal by theta.
+            let (nx, ny) = (nom[0], nom[1]);
+            let (a, b) = (sl.outer.a, sl.outer.b);
+            sx += nx * a + ny * b;
+            sy += nx * b - ny * a;
+        }
+    }
+    let roll = (sx != 0.0 || sy != 0.0).then(|| sy.atan2(sx));
+    for (guess, sl, seen, dec) in results {
+        let side = dec.side.unwrap_or_else(|| match roll {
+            Some(th) => {
+                let (c, s) = (th.cos(), th.sin());
+                // Undo the roll on the observed normal, then classify as if unrolled.
+                let (a, b) = (sl.outer.a, sl.outer.b);
+                side_of(&Line {
+                    a: c * a + s * b,
+                    b: -s * a + c * b,
+                    c: 0.0,
+                })
+            }
+            None => guess,
+        });
         // Two edges claiming one side: keep the one with tab evidence, else the first.
         if sides[side as usize].is_some_and(|_| dec.points.len() <= decoded[side as usize].len()) {
             continue;
         }
-        sides[side as usize] = Some(*sl);
+        sides[side as usize] = Some(sl);
         decoded[side as usize] = dec.points;
         report.seen[side as usize] = seen;
     }
