@@ -75,15 +75,16 @@ impl Tab {
 }
 
 /// Each side's symbol sequence. Every window of three consecutive symbols, read in either
-/// direction, occurs exactly once across all four sides and is not its own reverse
-/// (checked by test), so three adjacent tabs identify the side, the position and the
-/// reading direction. That is what makes the solve independent of how the gun is rolled:
+/// direction, occurs exactly once across all four sides and is not its own reverse, and
+/// every window of two occurs once within its side (checked by test). Three adjacent tabs
+/// identify the side, the position and the reading direction; once those are known from
+/// another edge, two adjacent tabs place themselves on their side. That is what makes the solve independent of how the gun is rolled:
 /// an edge's normal only guesses which side it is; the tabs settle it.
 pub const SEQUENCES: [&[u8]; 4] = [
-    &[0, 0, 1, 1, 2, 0, 0, 3, 1], // top
-    &[1, 1, 3, 2, 1, 3],          // right
-    &[2, 2, 3, 3, 0, 2, 2, 1, 0], // bottom
-    &[3, 3, 1, 0, 3, 2],          // left
+    &[0, 0, 1, 1, 2, 0, 3, 1, 0], // top
+    &[1, 1, 3, 2, 1, 0],          // right
+    &[2, 2, 1, 3, 3, 2, 0, 0, 3], // bottom
+    &[0, 3, 2, 2, 0, 1],          // left
 ];
 
 /// Number of symbols; symbol `s` is a tab `s + 1` units wide.
@@ -173,9 +174,43 @@ pub fn identify(run: &[u8]) -> Option<Placement> {
     found
 }
 
+/// Where a run of at least two symbols sits on a side whose identity and reading
+/// direction are already known. `None` if it occurs nowhere or more than once.
+#[must_use]
+pub fn locate(side: Side, run: &[u8], reversed: bool) -> Option<usize> {
+    if run.len() < 2 {
+        return None;
+    }
+    let syms: Vec<u8> = tabs(side).iter().map(|t| t.symbol).collect();
+    let r: Vec<u8> = if reversed {
+        run.iter().rev().copied().collect()
+    } else {
+        run.to_vec()
+    };
+    if r.len() > syms.len() {
+        return None;
+    }
+    let hits: Vec<usize> = (0..=syms.len() - r.len())
+        .filter(|&i| syms[i..i + r.len()] == r[..])
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_symbol_windows_are_unique_within_a_side() {
+        for side in Side::ALL {
+            let t = tabs(side);
+            for i in 0..t.len() - 1 {
+                let run = [t[i].symbol, t[i + 1].symbol];
+                assert_eq!(locate(side, &run, false), Some(i), "{side:?} at {i}");
+                assert_eq!(locate(side, &[run[1], run[0]], true), Some(i));
+            }
+        }
+    }
 
     #[test]
     fn every_window_is_unique_across_sides_and_directions() {

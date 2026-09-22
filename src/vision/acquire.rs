@@ -892,8 +892,11 @@ pub struct Decoded {
 /// of three or more confident symbols are looked up in the code, which names the side,
 /// the position and the reading direction. `lines` is the edge as classified from its
 /// normal; the code overrides that guess, which is what makes the solve roll-invariant.
+///
+/// With `known` (the side and whether this edge reads against that side's direction,
+/// settled by the roll another edge revealed) runs of two symbols are placed as well.
 #[must_use]
-pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab]) -> Decoded {
+pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab], known: Option<(Side, bool)>) -> Decoded {
     let mut out = Decoded::default();
     let Some(t) = lines.thickness else {
         return out;
@@ -989,24 +992,42 @@ pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab]) -> Decoded {
             syms.push((k, sym));
         }
         // Split at uncertain tabs; each confident stretch needs three symbols, the window
-        // size the code makes unique.
+        // size the code makes unique, or two once the side and direction are known.
+        let min_len = if known.is_some() { 2 } else { 3 };
         let stretches: Vec<Vec<(usize, u8)>> = syms
             .split(|s| s.1 == u8::MAX)
-            .filter(|st| st.len() >= 3)
+            .filter(|st| st.len() >= min_len)
             .map(<[(usize, u8)]>::to_vec)
             .collect();
         for syms in stretches {
-            // A stray cluster at either end (a reflection, the far side's corner) would
-            // spoil the whole run, so try trimming one symbol off each end before giving up.
             let symbols: Vec<u8> = syms.iter().map(|s| s.1).collect();
-            let mut found: Option<(usize, usize, code::Placement)> = None;
-            for (lo, hi) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                if symbols.len() < lo + hi + 3 {
-                    continue;
+            let place = |r: &[u8]| -> Option<code::Placement> {
+                match known {
+                    Some((side, reversed)) => {
+                        code::locate(side, r, reversed).map(|index| code::Placement {
+                            side,
+                            index,
+                            reversed,
+                        })
+                    }
+                    None => code::identify(r),
                 }
-                if let Some(pl) = code::identify(&symbols[lo..symbols.len() - hi]) {
-                    found = Some((lo, symbols.len() - hi, pl));
+            };
+            // One misread symbol (a target ring touching a tab, a reflection) spoils the
+            // whole stretch, so fall back to the longest sub-run that places itself. Short
+            // sub-runs of a long stretch are held to four symbols: a misread three-window
+            // has a fair chance of matching somewhere by accident.
+            let mut found: Option<(usize, usize, code::Placement)> = None;
+            let n = symbols.len();
+            'search: for len in (min_len..=n).rev() {
+                if len < n && len < 4 && n > 4 {
                     break;
+                }
+                for lo in 0..=n - len {
+                    if let Some(pl) = place(&symbols[lo..lo + len]) {
+                        found = Some((lo, lo + len, pl));
+                        break 'search;
+                    }
                 }
             }
             let Some((lo, hi, pl)) = found else {
@@ -1082,7 +1103,7 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
             continue;
         };
         let seen = find_tabs(edges, &guessed, sl);
-        let dec = decode_tabs(sl, &seen);
+        let dec = decode_tabs(sl, &seen, None);
         results.push((guess, *sl, seen, dec));
     }
     // The decoded sides reveal the roll: how far each observed outward normal is turned
@@ -1101,20 +1122,28 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
         }
     }
     let roll = (sx != 0.0 || sy != 0.0).then(|| sy.atan2(sx));
-    for (guess, sl, seen, dec) in results {
-        let side = dec.side.unwrap_or_else(|| match roll {
-            Some(th) => {
+    for (guess, sl, seen, mut dec) in results {
+        let mut side = dec.side.unwrap_or(guess);
+        if dec.side.is_none() {
+            if let Some(th) = roll {
                 let (c, s) = (th.cos(), th.sin());
+                let unroll = |v: P2| [c * v[0] + s * v[1], -s * v[0] + c * v[1]];
                 // Undo the roll on the observed normal, then classify as if unrolled.
-                let (a, b) = (sl.outer.a, sl.outer.b);
-                side_of(&Line {
-                    a: c * a + s * b,
-                    b: -s * a + c * b,
+                let n = unroll([sl.outer.a, sl.outer.b]);
+                side = side_of(&Line {
+                    a: n[0],
+                    b: n[1],
                     c: 0.0,
-                })
+                });
+                // The reading direction, likewise unrolled: forward is rightwards on a
+                // horizontal side and downwards on a vertical one.
+                let d = sl.outer.direction();
+                let d = unroll([sl.dir * d[0], sl.dir * d[1]]);
+                let forward = if side.is_horizontal() { d[0] } else { d[1] };
+                // With side and direction settled, two tabs are enough to place.
+                dec = decode_tabs(&sl, &seen, Some((side, forward < 0.0)));
             }
-            None => guess,
-        });
+        }
         // Two edges claiming one side: keep the one with tab evidence, else the first.
         if sides[side as usize].is_some_and(|_| dec.points.len() <= decoded[side as usize].len()) {
             continue;
@@ -1263,6 +1292,18 @@ fn sane_quad(q: [P2; 4], mask_w: usize, mask_h: usize) -> Option<[P2; 4]> {
         }
     }
     Some(q)
+}
+
+/// The solve report for a frame, for diagnostics (what `acquire` saw, without the hull
+/// fallback).
+#[must_use]
+pub fn report(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Report {
+    let mask = decimate_threshold(luma, w, h, p.threshold);
+    let (labels, blobs) = label(&mask);
+    let lens = Lens::centred(p.lens_k1, w, h);
+    let (pooled, _) = pooled_boundary(&labels, mask.w, mask.h, &blobs, p.min_size as usize);
+    let edges = edge_segments(&pooled, &mask, &lens, p);
+    solve(&edges, mask.w, mask.h).1
 }
 
 /// Run the whole acquisition on a full-resolution luma frame.
@@ -1603,6 +1644,50 @@ pub(crate) mod tests {
             let got = m.apply(cam).expect("finite");
             assert!(
                 (got[0] - s[0]).abs() < 1.0 && (got[1] - s[1]).abs() < 1.0,
+                "{s:?} -> {got:?}"
+            );
+        }
+    }
+
+    /// A corner with only two tabs of the vertical side in view: the top's tabs settle
+    /// the side and roll, after which two tabs place themselves and the solve closes.
+    #[test]
+    fn coded_border_corner_with_two_vertical_tabs() {
+        let (w, h) = (640, 480);
+        // Top-left corner in view; the left side shows about a third of its height.
+        let truth = [
+            [100.0, 60.0],
+            [1200.0, 40.0],
+            [1240.0, 900.0],
+            [80.0, 930.0],
+        ];
+        let h_si = quad_to_quad(&truth, &SCREEN_PERCENT);
+        let img = synth_coded(w, h, &h_si, 0.0);
+        let r = report(&img, w, h, &AcquireParams::default());
+        let q = acquire(&img, w, h, &AcquireParams::default()).expect("border found");
+        assert!(
+            q.from_lines && q.sides & 0b1001 == 0b1001,
+            "{q:?}\nrefused {:?} seen {:?} decoded {:?} sides {:?}",
+            r.refused,
+            r.seen
+                .iter()
+                .map(|v| v
+                    .iter()
+                    .map(|t| (t.along.round(), t.width.round(), t.partial))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            r.decoded,
+            r.sides
+                .iter()
+                .map(|s| s.map(|s| s.thickness))
+                .collect::<Vec<_>>()
+        );
+        let m = q.to_screen();
+        for s in [[10.0, 10.0], [30.0, 5.0], [5.0, 20.0]] {
+            let cam = h_si.adjugate().apply(s).expect("finite");
+            let got = m.apply(cam).expect("finite");
+            assert!(
+                (got[0] - s[0]).abs() < 1.5 && (got[1] - s[1]).abs() < 1.5,
                 "{s:?} -> {got:?}"
             );
         }
