@@ -358,7 +358,10 @@ impl App {
         }
 
         // Where the camera is looking: its frame projected onto the screen.
-        if let Some(v) = scene.solve.view {
+        // A one-side solve knows nothing about the foreshortening across that side, so its
+        // far corners are a guess and the outline would mislead; it is drawn only when at
+        // least two edges pinned the solve.
+        if let (Some(v), true) = (scene.solve.view, scene.solve.sides.count_ones() >= 2) {
             let p: Vec<(i64, i64)> = v.iter().map(|q| to_px(*q)).collect();
             let colour = if scene.solve.from_lines { GREY } else { RED };
             for i in 0..4 {
@@ -368,7 +371,9 @@ impl App {
         }
 
         // Tracking quality, inside the border so it never interferes with detection.
+        // Amber also for a one-side solve: usable near that edge, approximate elsewhere.
         let q = match scene.quality {
+            Quality::Good if scene.solve.sides.count_ones() <= 1 => AMBER,
             Quality::Good => GREEN,
             Quality::Clipped => AMBER,
             Quality::Lost => RED,

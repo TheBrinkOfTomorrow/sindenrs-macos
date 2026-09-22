@@ -354,7 +354,7 @@ pub fn run_tracker_with(
         let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("frames.csv"))?);
         writeln!(
             f,
-            "seq,ts_us,age_us,proc_us,found,clipped,tabs,tlx,tly,trx,try,brx,bry,blx,bly,aimx,aimy"
+            "seq,ts_us,age_us,proc_us,found,clipped,tabs,sides,tlx,tly,trx,try,brx,bry,blx,bly,aimx,aimy,rawx,rawy"
         )?;
         csv = Some(f);
     }
@@ -437,6 +437,8 @@ pub fn run_tracker_with(
         let quad = acquire(&l, w, h, &params);
         let mut aim = None;
         let mut view = None;
+        // The solve's own aim before the guard and tracker touch it, for the recording.
+        let mut raw_aim: Option<[f64; 2]> = None;
         if let Some(q) = &quad {
             found += 1;
             let m = q.to_screen();
@@ -459,6 +461,7 @@ pub fn run_tracker_with(
                 sides: q.sides.count_ones(),
                 tabs: q.tabs,
             };
+            raw_aim = candidate;
             aim = candidate
                 .and_then(|a| guard.filter(a, support))
                 .map(|a| smoother.filter(a, support));
@@ -501,9 +504,10 @@ pub fn run_tracker_with(
                 (q.corners, q.clipped, q.tabs)
             });
             let am = aim.unwrap_or([f64::NAN; 2]);
+            let rw = raw_aim.unwrap_or([f64::NAN; 2]);
             writeln!(
                 f,
-                "{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
+                "{},{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{:.2}",
                 frame.sequence,
                 frame.timestamp.map_or(0, |t| t.as_micros()),
                 frame.age().map_or(0, |t| t.as_micros()),
@@ -511,6 +515,7 @@ pub fn run_tracker_with(
                 u8::from(quad.is_some()),
                 u8::from(clipped),
                 tabs,
+                quad.map_or(0, |q| q.sides.count_ones()),
                 c[0][0],
                 c[0][1],
                 c[1][0],
@@ -520,7 +525,9 @@ pub fn run_tracker_with(
                 c[3][0],
                 c[3][1],
                 am[0],
-                am[1]
+                am[1],
+                rw[0],
+                rw[1]
             )?;
             if let Some(dir) = &opts.record {
                 std::fs::write(
