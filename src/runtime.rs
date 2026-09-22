@@ -305,6 +305,8 @@ pub fn run_tracker_with(
         threshold,
         min_size,
         lens_k1: opts.lens_k1,
+        screen_aspect: d.aspect,
+        border_frac: d.border_thickness / 100.0,
         ..Default::default()
     };
     // Corners come out in undistorted pixels, so the aim pixel has to be undistorted too.

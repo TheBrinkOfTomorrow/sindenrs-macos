@@ -235,9 +235,10 @@ struct AimTestArgs {
     /// Grid size: 3, 4 or 5 targets per side.
     #[arg(long, default_value_t = 3)]
     grid: u32,
-    /// Border thickness as a percentage of the shorter screen dimension.
-    #[arg(long, default_value_t = 3.0)]
-    thickness: f64,
+    /// Border thickness as a percentage of the shorter screen dimension (config:
+    /// display.border_thickness).
+    #[arg(long)]
+    thickness: Option<f64>,
     /// Aim points to average per target.
     #[arg(long, default_value_t = 24)]
     samples: u32,
@@ -2238,9 +2239,11 @@ fn grid_targets(n: u32) -> Vec<[f64; 2]> {
     let d = f64::from(n - 1);
     for r in 0..n {
         for c in 0..n {
+            // 15% in from the edges: the target ring and its number must stay clear of
+            // the border's tab band (the outer 6% of the screen), or they read as tabs.
             out.push([
-                10.0 + 80.0 * f64::from(c) / d,
-                10.0 + 80.0 * f64::from(r) / d,
+                15.0 + 70.0 * f64::from(c) / d,
+                15.0 + 70.0 * f64::from(r) / d,
             ]);
         }
     }
@@ -2262,6 +2265,8 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
         subpixel_lines: !a.no_subpixel_lines,
         subpixel_tabs: !a.no_subpixel_tabs,
+        screen_aspect: ctx.display.aspect,
+        border_frac: ctx.display.border_thickness / 100.0,
         ..Default::default()
     };
     let mut files: Vec<PathBuf> = Vec::new();
@@ -2541,7 +2546,7 @@ fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
     };
 
     let scene = Arc::new(Mutex::new(Scene {
-        border_frac: a.thickness / 100.0,
+        border_frac: a.thickness.unwrap_or(ctx.display.border_thickness) / 100.0,
         targets: targets.clone(),
         current: Some(0),
         measured: vec![None; targets.len()],

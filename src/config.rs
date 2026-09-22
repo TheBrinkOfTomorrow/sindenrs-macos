@@ -181,6 +181,11 @@ pub struct Display {
     /// While the aim moves less than 1% per frame, only this fraction of each move is
     /// applied, which averages away pixel jitter when hovering; 1 turns it off.
     pub hover_smoothing: f64,
+    /// Screen width over height, and the tracked border's thickness as a percentage of the
+    /// shorter screen dimension (what the overlay draws): where the border's inner edge and
+    /// tab tips lie on screen, which lets a single visible side solve near that side.
+    pub aspect: f64,
+    pub border_thickness: f64,
 }
 
 impl Default for Display {
@@ -204,6 +209,8 @@ impl Default for Display {
             fps: None,
             jump_limit: 5.0,
             hover_smoothing: 0.3,
+            aspect: 16.0 / 9.0,
+            border_thickness: 3.0,
         }
     }
 }
@@ -230,6 +237,8 @@ pub struct DisplayOverrides {
     pub fps: Option<u32>,
     pub jump_limit: Option<f64>,
     pub hover_smoothing: Option<f64>,
+    pub aspect: Option<f64>,
+    pub border_thickness: Option<f64>,
 }
 
 impl Display {
@@ -253,6 +262,8 @@ impl Display {
             fps: o.fps.or(self.fps),
             jump_limit: o.jump_limit.unwrap_or(self.jump_limit),
             hover_smoothing: o.hover_smoothing.unwrap_or(self.hover_smoothing),
+            aspect: o.aspect.unwrap_or(self.aspect),
+            border_thickness: o.border_thickness.unwrap_or(self.border_thickness),
         }
     }
 

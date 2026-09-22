@@ -32,6 +32,11 @@ pub struct AcquireParams {
     pub subpixel_lines: bool,
     /// Re-measure each tab's width from the luma profile through the tab bodies.
     pub subpixel_tabs: bool,
+    /// Screen width over height, and the border thickness as a fraction of the shorter
+    /// screen dimension: where the drawn inner edge and tab tips lie in screen percent,
+    /// which lets a single visible side solve near that side.
+    pub screen_aspect: f64,
+    pub border_frac: f64,
 }
 
 impl Default for AcquireParams {
@@ -45,6 +50,8 @@ impl Default for AcquireParams {
             line_min_points: 20,
             subpixel_lines: false,
             subpixel_tabs: true,
+            screen_aspect: 16.0 / 9.0,
+            border_frac: 0.03,
         }
     }
 }
@@ -456,6 +463,8 @@ pub struct Edges<'a> {
     pub h: usize,
     pub subpixel_lines: bool,
     pub subpixel_tabs: bool,
+    pub screen_aspect: f64,
+    pub border_frac: f64,
 }
 
 impl Edges<'_> {
@@ -657,6 +666,8 @@ pub fn edge_segments<'a>(
         h: mask.h * 2,
         subpixel_lines: p.subpixel_lines,
         subpixel_tabs: p.subpixel_tabs,
+        screen_aspect: p.screen_aspect,
+        border_frac: p.border_frac,
     }
 }
 
@@ -676,6 +687,11 @@ pub struct SideLines {
     /// Extent of the side along the outer line (screen-ordered coordinates), from the
     /// outer and inner segments and any leftover segment collinear with the outer.
     pub span: (f64, f64),
+    /// The inner edge and the line the tab tips form, at their true positions and with
+    /// the outer's orientation, when fitted. Drawn lines at known screen offsets, so each
+    /// is a line correspondence of its own.
+    pub inner: Option<Line>,
+    pub tips: Option<Line>,
 }
 
 impl SideLines {
@@ -909,6 +925,32 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 _ => thickness = Some(walked),
             }
         }
+        // The inner edge as a line, and the tab tips' line: parallel, on the bright side,
+        // at about one and two thicknesses. Boundary pixel centres sit one pixel short of
+        // the true edge; flip to the outer's orientation.
+        let to_outer_orientation = |l: Line| Line {
+            a: -l.a,
+            b: -l.b,
+            c: -(l.c + 1.0),
+        };
+        let inner_line = inner.map(|(m, _)| to_outer_orientation(outward[m]));
+        let tips_line = thickness.and_then(|t| {
+            order
+                .iter()
+                .copied()
+                .filter(|&m| !used[m] && m != outer_k && inner.is_none_or(|i| i.0 != m))
+                .filter_map(|m| {
+                    let o = &outward[m];
+                    if outer.cos_angle(o) < 0.985 || outer.a * o.a + outer.b * o.b > -0.9 {
+                        return None;
+                    }
+                    let mid = segs[m].inliers[segs[m].inliers.len() / 2];
+                    let d = -outer_line.signed_dist(mid) + 1.0;
+                    (d > 1.5 * t && d < 2.7 * t).then_some((m, (d - 2.0 * t).abs()))
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(m, _)| to_outer_orientation(outward[m]))
+        });
         out[side as usize] = Some(SideLines {
             outer: outer_line,
             outer_seg: outer_k,
@@ -916,6 +958,8 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
             thickness,
             dir,
             span,
+            inner: inner_line,
+            tips: tips_line,
         });
     }
     out
@@ -1433,7 +1477,8 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     let n_tabs = u8::try_from(points.len()).unwrap_or(u8::MAX);
     report.points.clone_from(&points);
     let per_side = report.decoded;
-    let mut corners = solve_corners(&sides, &points, &per_side, mask_w, mask_h);
+    let geometry = (edges.screen_aspect, edges.border_frac);
+    let mut corners = solve_corners(&sides, &points, &per_side, geometry, mask_w, mask_h);
     if corners.is_none() {
         let n_sides = sides.iter().filter(|s| s.is_some()).count();
         let starved = n_sides == 2
@@ -1461,7 +1506,8 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     };
     if let Some(q) = &corners {
         if !fits(q) {
-            corners = solve_corners_dlt(&sides, &points, &per_side, mask_w, mask_h).filter(fits);
+            corners = solve_corners_dlt(&sides, &points, &per_side, geometry, mask_w, mask_h)
+                .filter(fits);
             if corners.is_none() {
                 report.refused = Some("solve disagrees with its own tabs");
             }
@@ -1486,12 +1532,13 @@ fn solve_corners(
     sides: &[Option<SideLines>; 4],
     points: &[(P2, P2)],
     per_side: &[usize; 4],
+    geometry: (f64, f64),
     mask_w: usize,
     mask_h: usize,
 ) -> Option<[P2; 4]> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
     if n_sides < 4 {
-        return solve_corners_dlt(sides, points, per_side, mask_w, mask_h);
+        return solve_corners_dlt(sides, points, per_side, geometry, mask_w, mask_h);
     }
     let [top, right, bottom, left] = sides.map(|s| s.map(|s| s.outer));
     let (top, right, bottom, left) = (top?, right?, bottom?, left?);
@@ -1504,6 +1551,17 @@ fn solve_corners(
     sane_quad(q, mask_w, mask_h)
 }
 
+/// Border thickness in screen percent along x and along y, for a screen of the given
+/// aspect (width over height) and a border of `frac` of the shorter dimension.
+#[must_use]
+pub fn screen_thickness(aspect: f64, frac: f64) -> (f64, f64) {
+    if aspect >= 1.0 {
+        (frac * 100.0 / aspect, frac * 100.0)
+    } else {
+        (frac * 100.0, frac * 100.0 * aspect)
+    }
+}
+
 /// Least-squares solve over every line and tab point.
 ///
 /// Points on one line only fix the one-dimensional projectivity along it (three degrees of
@@ -1514,21 +1572,12 @@ fn solve_corners_dlt(
     sides: &[Option<SideLines>; 4],
     points: &[(P2, P2)],
     per_side: &[usize; 4],
+    geometry: (f64, f64),
     mask_w: usize,
     mask_h: usize,
 ) -> Option<[P2; 4]> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
-    if 2 * n_sides + points.len() < 9 {
-        return None;
-    }
-    if n_sides == 2
-        && Side::ALL
-            .iter()
-            .any(|&sd| sides[sd as usize].is_some() && per_side[sd as usize] < 2)
-    {
-        return None;
-    }
-    let lines: Vec<(L3, L3)> = Side::ALL
+    let mut lines: Vec<(L3, L3)> = Side::ALL
         .iter()
         .filter_map(|&side| {
             sides[side as usize].map(|s| {
@@ -1537,6 +1586,62 @@ fn solve_corners_dlt(
             })
         })
         .collect();
+    // A single side, or two sides with a starved one, is short of constraints. The border
+    // carries two more drawn lines per side, the inner edge and the tab tips, at one and
+    // two thicknesses inward on screen; with a decoded side's tabs fixing the position
+    // along it, they supply the direction across it. Precision falls off with distance
+    // from the side, but that is where the aim is when only that side is in view.
+    let starved = n_sides == 2
+        && Side::ALL
+            .iter()
+            .any(|&sd| sides[sd as usize].is_some() && per_side[sd as usize] < 2);
+    // A side far thinner than the thickest one, carrying no tabs, is a false edge (the lit
+    // part of a panel mid-refresh ends in a straight line); it must not pin a partial
+    // solve. Sides with decoded tabs have proven themselves.
+    let thickest = sides
+        .iter()
+        .flatten()
+        .filter_map(|s| s.thickness)
+        .fold(0.0_f64, f64::max);
+    let false_edge = |sd: Side| {
+        per_side[sd as usize] == 0
+            && sides[sd as usize].is_some_and(|s| s.thickness.is_some_and(|t| t < 0.5 * thickest))
+    };
+    if Side::ALL.iter().any(|&sd| false_edge(sd)) {
+        let mut kept = *sides;
+        for sd in Side::ALL {
+            if false_edge(sd) {
+                kept[sd as usize] = None;
+            }
+        }
+        return solve_corners_dlt(&kept, points, per_side, geometry, mask_w, mask_h);
+    }
+    if 2 * n_sides + points.len() < 9 || starved {
+        if points.len() < 3 {
+            return None;
+        }
+        let (tx, ty) = screen_thickness(geometry.0, geometry.1);
+        for side in Side::ALL {
+            let Some(s) = &sides[side as usize] else {
+                continue;
+            };
+            if per_side[side as usize] < 3 {
+                continue;
+            }
+            let sl = side.outer_line();
+            let step = if side.is_horizontal() { ty } else { tx };
+            for (img, k) in [(s.inner, 1.0), (s.tips, 2.0)] {
+                if let Some(l) = img {
+                    // Inward on screen is against the outward normal: c shrinks by k*step.
+                    let c = sl[2] - k * step;
+                    lines.push((line3(&l), [sl[0], sl[1], -c]));
+                }
+            }
+        }
+        if 2 * lines.len() + points.len() < 9 {
+            return None;
+        }
+    }
     let h = fit_dlt(points, &lines)?;
     let inv = h.adjugate();
     let mut q = [[0.0; 2]; 4];

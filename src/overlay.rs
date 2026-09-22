@@ -319,7 +319,7 @@ impl App {
                 c.ring(
                     x,
                     y,
-                    unit * 3,
+                    unit * 2,
                     (unit / 3).max(2),
                     if flashing { RED } else { AMBER },
                 );
@@ -376,7 +376,7 @@ impl App {
         // The status panel sits along the bottom edge a quarter of the way across, between
         // the bottom-left and bottom-centre targets of a grid.
         let x0 = i64::from(w) / 4;
-        let y0 = i64::from(h) - t * 2 - unit * 3;
+        let y0 = i64::from(h) - t * 2 - unit * 4;
         c.rect(x0, y0, unit * 3, unit, q);
         // Which sides the solve had: a small frame with one bar per fitted side.
         let (fx, fy, fw, fh, bar) = (
