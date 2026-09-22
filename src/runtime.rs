@@ -338,9 +338,12 @@ pub fn run_tracker_with(
             if vs.iter().all(Option::is_some) {
                 view = Some(vs.map(|v| v.unwrap_or([0.0, 0.0])));
             }
-            let candidate = q
-                .to_screen()
-                .apply(aim_undist)
+            // A hull quad is for showing roughly where the border is; its corners are
+            // synthesised and aiming from them threw the cursor about at the corners of
+            // the screen, where hull and tab solves alternate frame by frame.
+            let candidate = Some(q)
+                .filter(|q| q.from_lines)
+                .and_then(|q| q.to_screen().apply(aim_undist))
                 .filter(|p| (-25.0..=125.0).contains(&p[0]) && (-25.0..=125.0).contains(&p[1]))
                 .map(|p| {
                     let (x, y) = d.finish_aim(p[0], p[1]);
