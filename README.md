@@ -1,9 +1,10 @@
 # sindenrs
 
 A driver for the [Sinden Lightgun](https://sindenlightgun.com) on Linux, written in Rust
-from scratch. It replaces the vendor's Linux software (a Mono binary that is no longer
-maintained). It reads the gun's camera, finds the border it draws around the screen, and
-tells the gun where it points. The gun then reports the aim through its own USB mouse, so
+from scratch. It is an open-source alternative to the vendor's Linux software, which is a
+closed .NET binary that runs under Mono and needs one process and one XML file per gun.
+It reads the gun's camera, finds the border it draws around the screen, and tells the gun
+where it points. The gun then reports the aim through its own USB mouse, so
 games see a normal absolute mouse. Windows is planned; the serial and vision code already
 compiles for it, but the camera and window backends do not exist yet.
 
