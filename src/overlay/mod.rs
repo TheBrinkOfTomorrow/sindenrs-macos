@@ -73,12 +73,20 @@ pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
     bail!("the overlay is not implemented on this platform yet")
 }
 
-/// Show `scene` until `stop` is set or the window goes away. Redraws only when the scene
-/// changes (or the window asks), so a static border costs nothing while a game runs.
+/// Show `scene` until `stop` is set or the window goes away, and set `stop` when the
+/// window goes away, so a calibration whose overlay vanished ends instead of measuring
+/// blind. Redraws only when the scene changes (or the window asks), so a static border
+/// costs nothing while a game runs.
 pub fn run(scene: Arc<Mutex<Scene>>, stop: Arc<AtomicBool>) -> Result<()> {
     let r = run_inner(&scene, &stop);
     stop.store(true, Ordering::Relaxed);
     r
+}
+
+/// Like [`run`], but losing the window does not stop anything else: the guns keep
+/// tracking whether or not the border is on screen.
+pub fn run_until(scene: Arc<Mutex<Scene>>, stop: &AtomicBool) -> Result<()> {
+    run_inner(&scene, stop)
 }
 
 fn run_inner(scene: &Mutex<Scene>, stop: &AtomicBool) -> Result<()> {

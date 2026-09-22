@@ -55,7 +55,7 @@ enum Cmd {
     },
     /// Measure and save the gun's aim calibration: shoot each target the overlay lights up.
     Calibrate(Box<CalibrateArgs>),
-    /// Draw the tracking border fullscreen and nothing else.
+    /// Draw the tracking border on screen (Ctrl-C stops), or export it as MAME artwork.
     Border(BorderArgs),
     /// Configuration file management.
     Config {
@@ -80,6 +80,26 @@ struct BorderArgs {
     /// display.border_thickness).
     #[arg(long)]
     thickness: Option<f64>,
+    #[command(subcommand)]
+    cmd: Option<BorderCmd>,
+}
+
+#[derive(Subcommand)]
+enum BorderCmd {
+    /// Write the border as MAME artwork (<dir>/<name>/default.lay + border.png). Point
+    /// MAME's artpath at <dir> and launch gun games with `-override_artwork <name>`;
+    /// keep artwork_crop off. Then set display.overlay = false so `run` draws nothing.
+    Export {
+        /// Directory to write the artwork folder into.
+        #[arg(long, default_value = "artwork")]
+        dir: PathBuf,
+        /// Artwork folder name.
+        #[arg(long, default_value = "sinden-border")]
+        name: String,
+        /// Image size; use the screen's resolution.
+        #[arg(long, default_value = "1280x960")]
+        resolution: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -581,12 +601,31 @@ fn main() -> Result<()> {
             run_all(&ctx, overlay)
         }
         Cmd::Border(a) => {
-            use std::sync::atomic::AtomicBool;
+            use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::{Arc, Mutex};
-            let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(
-                a.thickness.unwrap_or(ctx.display.border_thickness) / 100.0,
-            )));
-            sindenrs::overlay::run(scene, Arc::new(AtomicBool::new(false)))
+            let frac = a.thickness.unwrap_or(ctx.display.border_thickness) / 100.0;
+            if let Some(BorderCmd::Export {
+                dir,
+                name,
+                resolution,
+            }) = a.cmd
+            {
+                let (w, h) = resolution
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .ok_or_else(|| anyhow!("--resolution wants WIDTHxHEIGHT, e.g. 1280x960"))?;
+                sindenrs::overlay::artwork::export(&dir, &name, w, h, frac)?;
+                println!("wrote {}", dir.join(&name).display());
+                return Ok(());
+            }
+            let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(frac)));
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let stop = stop.clone();
+                ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
+                    .context("installing Ctrl-C handler")?;
+            }
+            sindenrs::overlay::run(scene, stop)
         }
         Cmd::Calibrate(a) => calibrate(&ctx, *a),
         Cmd::Gun { cmd } => gun(&ctx, AnyGunCmd::User(cmd)),
@@ -1777,7 +1816,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
 
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(target_os = "linux")]
-fn run_all(ctx: &Ctx, _overlay: bool) -> Result<()> {
+fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1859,6 +1898,22 @@ fn run_all(ctx: &Ctx, _overlay: bool) -> Result<()> {
     if handles.is_empty() {
         bail!("no gun could be started");
     }
+    // The border the guns track. Its window is shaped to the border and takes no input, so
+    // it can sit above a running game; if there is no display, tracking still runs (the
+    // border may be coming from MAME artwork).
+    let overlay_thread = overlay.then(|| {
+        let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(
+            ctx.display.border_thickness / 100.0,
+        )));
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("overlay".into())
+            .spawn(move || {
+                if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
+                    warn!("overlay: {e:#}; tracking continues without it");
+                }
+            })
+    });
     info!("running {} gun(s); Ctrl-C to stop", handles.len());
     let started = Instant::now();
     while !stop.load(Ordering::Relaxed) && handles.iter().any(|h| !h.is_finished()) {
@@ -1895,6 +1950,9 @@ fn run_all(ctx: &Ctx, _overlay: bool) -> Result<()> {
             Ok(Err(e)) => warn!("tracker failed: {e:#}"),
             Err(_) => warn!("tracker panicked"),
         }
+    }
+    if let Some(Ok(t)) = overlay_thread {
+        let _ = t.join();
     }
     Ok(())
 }
