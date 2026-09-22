@@ -24,7 +24,7 @@ the border tracker is next. See [Roadmap](#roadmap).
 | Aim accuracy harness (`aim-test`) | done, not yet measured |
 | TOML config (display profiles, per-gun buttons/recoil by unique id) | done |
 | Firmware backup/flash, bootloader reset, joystick device switch | done, both guns on 2.1 |
-| Sub-pixel edge tracker | not started |
+| Sub-pixel measurement: tab widths from the luma profile (on), edge refit (off, A/B-tested worse) | done |
 | Self-locating border: coded tabs, line-plus-point solve for two or three visible sides | done, synthetic tests; not yet shot on hardware |
 | Calibration overlay (Wayland / X11 / Windows) | not started |
 | Windows capture and discovery backends | stubs |
@@ -303,6 +303,25 @@ the half-resolution mask's pixel quantisation. Two-symbol windows are now unique
 so once another edge has fixed the side and the roll, two tabs place themselves; the decoder
 falls back to the longest sub-run that places itself when one tab misreads; and the tracker
 blends moves under 1% per frame (`display.hover_smoothing`), which leaves real motion untouched.
+
+**Fourth recording (`corpus/mollywop`): what the full-resolution luma buys.** Two extractions
+were built switchable and A/B-tested (`replay --no-subpixel-tabs`, `--no-subpixel-lines`).
+Re-measuring each cluster-found tab from a brightness profile through the tab bodies, with
+both crossings interpolated, keeps the solve rate at 96% and cuts aim spikes over 1% of screen
+from 20 to 13, and its widths are unbiased. Refitting the edge lines to sub-pixel luma crossings
+solved slightly fewer frames and spiked more, so it stays off. Neither moved the still-hover
+jitter at all (0.24% of screen median, 0.7% at the 90th percentile), which settles that the
+jitter is the hand, not the fit; the smoother is the answer. A first version that replaced
+cluster detection with the profile outright lost 150 frames to spurious short runs near
+corners, so detection stays with the clusters and the profile only refines. Two solver fixes
+came out of the same recording: a placed sub-run must leave room on its side for the rest of
+its contiguous stretch (a misread had put four bottom tabs on the right side's code), and the
+border thickness is checked against the median bright run walked inward from the outer edge,
+which catches the tab-tip line passing for the inner edge and gives lone edges a thickness.
+Unusable frames at the bottom centre fell from 15% to 8%. Two rules that looked right and
+measured wrong: dropping tab-less sides from partial solves lost the bottom-left corner, where
+a real side shows no tabs, and a tighter extrapolation limit did the same, because at close
+range a screen's far corners really are several frame widths away.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
