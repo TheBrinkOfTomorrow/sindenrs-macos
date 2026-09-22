@@ -178,6 +178,9 @@ pub struct Display {
     /// Aim jump, in percent of screen between consecutive frames, above which a frame whose
     /// solve rests on fewer edges or tabs than the previous one is held for a frame.
     pub jump_limit: f64,
+    /// While the aim moves less than 1% per frame, only this fraction of each move is
+    /// applied, which averages away pixel jitter when hovering; 1 turns it off.
+    pub hover_smoothing: f64,
 }
 
 impl Default for Display {
@@ -200,6 +203,7 @@ impl Default for Display {
             orientation: -1.0,
             fps: None,
             jump_limit: 5.0,
+            hover_smoothing: 0.3,
         }
     }
 }
@@ -225,6 +229,7 @@ pub struct DisplayOverrides {
     pub orientation: Option<f64>,
     pub fps: Option<u32>,
     pub jump_limit: Option<f64>,
+    pub hover_smoothing: Option<f64>,
 }
 
 impl Display {
@@ -247,6 +252,7 @@ impl Display {
             orientation: o.orientation.unwrap_or(self.orientation),
             fps: o.fps.or(self.fps),
             jump_limit: o.jump_limit.unwrap_or(self.jump_limit),
+            hover_smoothing: o.hover_smoothing.unwrap_or(self.hover_smoothing),
         }
     }
 

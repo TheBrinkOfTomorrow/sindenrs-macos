@@ -39,6 +39,9 @@ pub struct TrackerOptions {
     /// Aim jump, in screen percent, above which a frame whose solve rests on less than the
     /// previous one is held for a frame (config: display.jump_limit).
     pub jump_limit: f64,
+    /// Fraction of a sub-1% move applied per frame while hovering (config:
+    /// display.hover_smoothing; 1 = off).
+    pub hover_smoothing: f64,
     /// Requested mmap buffer count.
     pub buffers: u32,
     /// Stop after this many frames; 0 = until `stop` is set.
@@ -127,6 +130,46 @@ impl JumpGuard {
     /// No aim this frame: forget any pending jump.
     pub fn lost(&mut self) {
         self.pending = None;
+    }
+}
+
+/// Averages away the pixel-quantisation jitter of a still aim without slowing real motion:
+/// a move smaller than `gate` per frame is blended in by `factor`, anything larger passes
+/// straight through, so tracking latency is unchanged whenever the gun is actually moving.
+#[derive(Clone, Copy, Debug)]
+pub struct HoverSmoother {
+    /// Motion per frame, in screen percent, below which smoothing applies.
+    pub gate: f64,
+    /// Fraction of the residual applied per frame while still (1 = off).
+    pub factor: f64,
+    out: Option<[f64; 2]>,
+}
+
+impl HoverSmoother {
+    #[must_use]
+    pub fn new(gate: f64, factor: f64) -> Self {
+        Self {
+            gate,
+            factor: factor.clamp(0.05, 1.0),
+            out: None,
+        }
+    }
+
+    pub fn filter(&mut self, aim: [f64; 2]) -> [f64; 2] {
+        let out = match self.out {
+            Some(prev) if (aim[0] - prev[0]).hypot(aim[1] - prev[1]) < self.gate => [
+                prev[0] + self.factor * (aim[0] - prev[0]),
+                prev[1] + self.factor * (aim[1] - prev[1]),
+            ],
+            _ => aim,
+        };
+        self.out = Some(out);
+        out
+    }
+
+    /// Tracking was lost: start afresh on the next aim.
+    pub fn reset(&mut self) {
+        self.out = None;
     }
 }
 
@@ -302,6 +345,7 @@ pub fn run_tracker_with(
     let mut last_aim: Option<[f64; 2]> = None;
     let mut last_quad: Option<Quad> = None;
     let mut guard = JumpGuard::new(opts.jump_limit);
+    let mut smoother = HoverSmoother::new(1.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
     let mut window_start = Instant::now();
@@ -353,12 +397,15 @@ pub fn run_tracker_with(
                 sides: q.sides.count_ones(),
                 tabs: q.tabs,
             };
-            aim = candidate.and_then(|a| guard.filter(a, support));
+            aim = candidate
+                .and_then(|a| guard.filter(a, support))
+                .map(|a| smoother.filter(a));
             if candidate.is_some() && aim.is_none() {
                 held += 1;
             }
             if candidate.is_none() {
                 guard.lost();
+                smoother.reset();
             }
             if let Some((g, _)) = gun.as_mut() {
                 if let Some([x, y]) = aim.or(last_aim) {
@@ -368,6 +415,7 @@ pub fn run_tracker_with(
             last_quad = Some(*q);
         } else {
             guard.lost();
+            smoother.reset();
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
             }
@@ -524,6 +572,19 @@ mod tests {
         assert_eq!(g.filter([80.0, 60.0], WEAK), None);
         // Back near where we were: the glitch is gone, nothing was sent for it.
         assert_eq!(g.filter([11.0, 10.0], STRONG), Some([11.0, 10.0]));
+    }
+
+    #[test]
+    fn smoother_damps_jitter_but_not_motion() {
+        let mut s = HoverSmoother::new(1.0, 0.25);
+        assert_eq!(s.filter([10.0, 10.0]), [10.0, 10.0]);
+        // A 0.4% wobble is damped to a tenth of a percent.
+        let o = s.filter([10.4, 10.0]);
+        assert!((o[0] - 10.1).abs() < 1e-9 && o[1] == 10.0, "{o:?}");
+        // A real move passes straight through and resets the base.
+        assert_eq!(s.filter([30.0, 12.0]), [30.0, 12.0]);
+        let o = s.filter([30.4, 12.0]);
+        assert!((o[0] - 30.1).abs() < 1e-9, "{o:?}");
     }
 
     #[test]
