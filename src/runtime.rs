@@ -145,7 +145,22 @@ pub fn run_tracker_with(
     hook: &mut dyn FnMut(&Sample) -> Flow,
 ) -> Result<()> {
     let dev = Device::open(camera).with_context(|| format!("opening {}", camera.display()))?;
-    let fmt = dev.set_format(640, 480, PixelFormat::Mjpeg)?;
+    let busy = |e: anyhow::Error| {
+        if e.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(16))
+        {
+            e.context(format!(
+                "{} is busy: another process is streaming it (a `track`, `run` or \
+                 `aim-test` still going?); only one can use a camera at a time",
+                camera.display()
+            ))
+        } else {
+            e
+        }
+    };
+    let fmt = dev
+        .set_format(640, 480, PixelFormat::Mjpeg)
+        .map_err(|e| busy(e.into()))?;
     apply_display_to_camera(&dev, &opts.display)?;
     let (w, h) = (fmt.width as usize, fmt.height as usize);
     let d = &opts.display;
@@ -206,7 +221,7 @@ pub fn run_tracker_with(
         csv = Some(f);
     }
 
-    let mut stream = dev.start_stream(opts.buffers)?;
+    let mut stream = dev.start_stream(opts.buffers).map_err(|e| busy(e.into()))?;
     let start = Instant::now();
     let mut n = 0u32;
     let mut found = 0u64;
