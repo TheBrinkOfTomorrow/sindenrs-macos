@@ -951,6 +951,22 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(m, _)| to_outer_orientation(outward[m]))
         });
+        // Everything parallel within three thicknesses inside this edge is this side's own
+        // structure (inner edge, tab tips, a split segment of either) and must not go on to
+        // be classified as another side: with one border in view edge-on, the tab-tip line
+        // became a bogus opposite side whose corner exclusion erased every real tab.
+        if let Some(t) = thickness {
+            for m in 0..segs.len() {
+                if used[m] || outward[m].cos_angle(&outer) < 0.985 {
+                    continue;
+                }
+                let mid = segs[m].inliers[segs[m].inliers.len() / 2];
+                let d = -outer_line.signed_dist(mid);
+                if d > 0.0 && d < 3.2 * t {
+                    used[m] = true;
+                }
+            }
+        }
         out[side as usize] = Some(SideLines {
             outer: outer_line,
             outer_seg: outer_k,
@@ -1478,21 +1494,13 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     report.points.clone_from(&points);
     let per_side = report.decoded;
     let geometry = (edges.screen_aspect, edges.border_frac);
-    let mut corners = solve_corners(&sides, &points, &per_side, geometry, mask_w, mask_h);
-    if corners.is_none() {
-        let n_sides = sides.iter().filter(|s| s.is_some()).count();
-        let starved = n_sides == 2
-            && Side::ALL
-                .iter()
-                .any(|&sd| sides[sd as usize].is_some() && per_side[sd as usize] < 2);
-        report.refused = Some(if n_sides == 0 {
-            "no sides"
-        } else if 2 * n_sides + points.len() < 9 || starved {
-            "too few constraints"
-        } else {
-            "degenerate quad (not convex, too small, or far off frame)"
-        });
-    }
+    let mut corners = match solve_corners(&sides, &points, &per_side, geometry, mask_w, mask_h) {
+        Ok(q) => Some(q),
+        Err(why) => {
+            report.refused = Some(why);
+            None
+        }
+    };
     // A solve must agree with the tabs it decoded. A four-line solve built on a
     // misassigned edge, or a run matched at the wrong place, lands them far from their
     // screen positions; first retry as a least-squares fit over lines and tabs, then give
@@ -1507,6 +1515,7 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     if let Some(q) = &corners {
         if !fits(q) {
             corners = solve_corners_dlt(&sides, &points, &per_side, geometry, mask_w, mask_h)
+                .ok()
                 .filter(fits);
             if corners.is_none() {
                 report.refused = Some("solve disagrees with its own tabs");
@@ -1535,20 +1544,22 @@ fn solve_corners(
     geometry: (f64, f64),
     mask_w: usize,
     mask_h: usize,
-) -> Option<[P2; 4]> {
+) -> Result<[P2; 4], &'static str> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
     if n_sides < 4 {
         return solve_corners_dlt(sides, points, per_side, geometry, mask_w, mask_h);
     }
     let [top, right, bottom, left] = sides.map(|s| s.map(|s| s.outer));
-    let (top, right, bottom, left) = (top?, right?, bottom?, left?);
+    let (Some(top), Some(right), Some(bottom), Some(left)) = (top, right, bottom, left) else {
+        return Err("no sides");
+    };
     let q = [
-        top.intersect(&left)?,
-        top.intersect(&right)?,
-        bottom.intersect(&right)?,
-        bottom.intersect(&left)?,
+        top.intersect(&left).ok_or("parallel edges")?,
+        top.intersect(&right).ok_or("parallel edges")?,
+        bottom.intersect(&right).ok_or("parallel edges")?,
+        bottom.intersect(&left).ok_or("parallel edges")?,
     ];
-    sane_quad(q, mask_w, mask_h)
+    sane_quad(q, mask_w, mask_h, false)
 }
 
 /// Border thickness in screen percent along x and along y, for a screen of the given
@@ -1575,7 +1586,7 @@ fn solve_corners_dlt(
     geometry: (f64, f64),
     mask_w: usize,
     mask_h: usize,
-) -> Option<[P2; 4]> {
+) -> Result<[P2; 4], &'static str> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
     let mut lines: Vec<(L3, L3)> = Side::ALL
         .iter()
@@ -1616,9 +1627,12 @@ fn solve_corners_dlt(
         }
         return solve_corners_dlt(&kept, points, per_side, geometry, mask_w, mask_h);
     }
+    if n_sides == 1 {
+        return solve_one_side(sides, points, per_side, geometry, mask_w, mask_h);
+    }
     if 2 * n_sides + points.len() < 9 || starved {
         if points.len() < 3 {
-            return None;
+            return Err("too few constraints");
         }
         let (tx, ty) = screen_thickness(geometry.0, geometry.1);
         for side in Side::ALL {
@@ -1639,37 +1653,117 @@ fn solve_corners_dlt(
             }
         }
         if 2 * lines.len() + points.len() < 9 {
-            return None;
+            return Err("too few constraints");
         }
     }
-    let h = fit_dlt(points, &lines)?;
+    let h = fit_dlt(points, &lines).ok_or("solve failed")?;
     let inv = h.adjugate();
     let mut q = [[0.0; 2]; 4];
     for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
-        *c = inv.apply(*s)?;
+        *c = inv.apply(*s).ok_or("corner at infinity")?;
     }
-    sane_quad(q, mask_w, mask_h)
+    // A partial view of a large screen puts the far corners many frame spans away, so
+    // the far limit is loosened for partial solves; convexity and the tab consistency
+    // check still stand.
+    let loose = sides.iter().filter(|s| s.is_some()).count() < 4;
+    sane_quad(q, mask_w, mask_h, loose)
 }
 
-fn sane_quad(q: [P2; 4], mask_w: usize, mask_h: usize) -> Option<[P2; 4]> {
+/// A single visible side. Its tabs fix the map along the edge (including the vanishing
+/// point of that direction, since the pitch is constant on screen), and the outer edge
+/// fixes the line, which leaves the foreshortening across the side unknown: three parallel
+/// lines ten pixels apart cannot tell it. The inner edge's distance in the image against
+/// its known screen offset gives the scale across the side, taken as constant over the
+/// visible stretch. That is an approximation, exact only without tilt, and it is what
+/// makes aiming near a lone edge possible at all; the runtime treats one-side solves as
+/// the weakest support.
+fn solve_one_side(
+    sides: &[Option<SideLines>; 4],
+    points: &[(P2, P2)],
+    per_side: &[usize; 4],
+    geometry: (f64, f64),
+    mask_w: usize,
+    mask_h: usize,
+) -> Result<[P2; 4], &'static str> {
+    let side = Side::ALL
+        .iter()
+        .copied()
+        .find(|&sd| sides[sd as usize].is_some())
+        .ok_or("no sides")?;
+    let sl = sides[side as usize].ok_or("no sides")?;
+    if per_side[side as usize] < 3 || points.len() < 3 {
+        return Err("too few constraints");
+    }
+    let (tx, ty) = screen_thickness(geometry.0, geometry.1);
+    let t_scr = if side.is_horizontal() { ty } else { tx };
+    // Where the inner edge lies in the image: the fitted inner line, else the outer
+    // pushed in by the measured thickness.
+    let inner = match (sl.inner, sl.thickness) {
+        (Some(l), _) => l,
+        (None, Some(t)) => sl.outer.offset(-t),
+        _ => return Err("no inner edge"),
+    };
+    // The two tabs farthest apart along the edge, and their feet on the inner edge along
+    // the outer normal.
+    let (a, b) = points
+        .iter()
+        .flat_map(|p| points.iter().map(move |q| (p, q)))
+        .max_by(|(p, q), (r, s)| {
+            let d1 = (p.0[0] - q.0[0]).hypot(p.0[1] - q.0[1]);
+            let d2 = (r.0[0] - s.0[0]).hypot(r.0[1] - s.0[1]);
+            d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or("too few constraints")?;
+    let n = [sl.outer.a, sl.outer.b];
+    let foot = |p: P2| -> Option<P2> {
+        let through = Line::through(p, [p[0] - n[0] * 10.0, p[1] - n[1] * 10.0])?;
+        inner.intersect(&through)
+    };
+    let (qa, qb) = (
+        foot(a.0).ok_or("parallel edges")?,
+        foot(b.0).ok_or("parallel edges")?,
+    );
+    // Screen positions: the tabs' points on the outer edge and one thickness inward.
+    let inward = |p: P2| -> P2 {
+        let l = side.outer_line();
+        [p[0] - l[0] * t_scr, p[1] - l[1] * t_scr]
+    };
+    let src = [a.0, b.0, qb, qa];
+    let dst = [a.1, b.1, inward(b.1), inward(a.1)];
+    let h = quad_to_quad(&src, &dst);
+    let inv = h.adjugate();
+    let mut q = [[0.0; 2]; 4];
+    for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
+        *c = inv.apply(*s).ok_or("corner at infinity")?;
+    }
+    sane_quad(q, mask_w, mask_h, true)
+}
+
+fn sane_quad(
+    q: [P2; 4],
+    mask_w: usize,
+    mask_h: usize,
+    loose: bool,
+) -> Result<[P2; 4], &'static str> {
     // Sanity: a convex quad with the expected winding and no absurd extrapolation.
     #[allow(clippy::cast_precision_loss)]
-    let limit = 8.0 * (mask_w + mask_h) as f64;
-    if q.iter()
-        .any(|c| !c[0].is_finite() || !c[1].is_finite() || c[0].abs() > limit || c[1].abs() > limit)
-    {
-        return None;
+    let limit = if loose { 40.0 } else { 8.0 } * (mask_w + mask_h) as f64;
+    if q.iter().any(|c| !c[0].is_finite() || !c[1].is_finite()) {
+        return Err("corner not finite");
+    }
+    if q.iter().any(|c| c[0].abs() > limit || c[1].abs() > limit) {
+        return Err("corners too far off frame");
     }
     for i in 0..4 {
         if cross(q[i], q[(i + 1) % 4], q[(i + 2) % 4]) <= 0.0 {
-            return None;
+            return Err("quad not convex");
         }
         let (a, b) = (q[i], q[(i + 1) % 4]);
         if (a[0] - b[0]).hypot(a[1] - b[1]) < 20.0 {
-            return None;
+            return Err("quad too small");
         }
     }
-    Some(q)
+    Ok(q)
 }
 
 /// The solve report for a frame, for diagnostics (what `acquire` saw, without the hull

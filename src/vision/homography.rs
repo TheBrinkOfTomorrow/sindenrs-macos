@@ -263,7 +263,16 @@ pub fn fit_dlt(points: &[(P2, P2)], lines: &[(L3, L3)]) -> Option<Mat3> {
     let hn = Mat3([[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], h[8]]]);
     let full = td.adjugate().mul(&hn).mul(&ts);
     let m = &full.0;
-    let scale = m[2][2];
+    // Fix the projective scale on the source centroid, which is always a finite,
+    // on-screen point. The origin's weight (m[2][2]) is the usual choice but it is zero
+    // whenever the frame's corner lies beyond the screen's horizon, which a rolled view
+    // of one side at close range reaches with a perfectly good solution.
+    #[allow(clippy::cast_precision_loss)]
+    let n = src_pts.len().max(1) as f64;
+    let (cx, cy) = src_pts
+        .iter()
+        .fold((0.0, 0.0), |(x, y), p| (x + p[0] / n, y + p[1] / n));
+    let scale = m[2][0] * cx + m[2][1] * cy + m[2][2];
     if !scale.is_finite() || scale.abs() < 1e-12 {
         return None;
     }
