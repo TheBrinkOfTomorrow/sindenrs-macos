@@ -311,8 +311,8 @@ pub fn run_tracker_with(
     });
     let (mut cal_x, mut cal_y) = (opts.cal_x, opts.cal_y);
     if let Some((g, gc)) = gun.as_mut() {
-        cal_x = cal_x.or(gc.calibration_x);
-        cal_y = cal_y.or(gc.calibration_y);
+        cal_x = cal_x.or(gc.calibration.map(|c| c[0]));
+        cal_y = cal_y.or(gc.calibration.map(|c| c[1]));
         if cal_x.is_none() {
             cal_x = Some(g.calibration_x()?.0);
         }

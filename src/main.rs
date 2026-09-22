@@ -115,7 +115,11 @@ enum ConfigCmd {
         force: bool,
     },
     /// Print the effective configuration (defaults merged with the file and --profile).
-    Show,
+    Show {
+        /// Print every key with its built-in default instead.
+        #[arg(long)]
+        defaults: bool,
+    },
     /// Print the config file path in use.
     Path,
 }
@@ -612,42 +616,25 @@ fn config_cmd(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             if let Some(dir) = ctx.path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let mut text = sindenrs::config::example_toml();
-            // One [[gun]] entry per attached gun, keyed by unique id, so the file is legible
-            // and survives port renumbering.
+            // One [guns.<id>] table per attached gun, keyed by unique id, so the file
+            // survives port renumbering and two guns of the same colour.
             let guns = discovery::find_guns()?;
-            let mut entries = Vec::new();
+            let mut cfg = sindenrs::config::Config::default();
             for (i, g) in guns.iter().enumerate() {
                 let port = g.port.to_string_lossy().into_owned();
                 if let Ok(mut gun) = connect(&port, ctx.cfg.global.auto_recover) {
                     if let Ok(id) = gun.unique_id() {
-                        let mut gc = sindenrs::config::GunConfig {
-                            name: format!("player{}", i + 1),
-                            ..Default::default()
-                        };
-                        gc.matcher.id = Some(id);
-                        entries.push(gc);
+                        let mut t = toml::Table::new();
+                        t.insert(
+                            "name".into(),
+                            toml::Value::String(format!("player{}", i + 1)),
+                        );
+                        cfg.guns.insert(id, t);
                     }
                 }
             }
-            let n_guns = entries.len();
-            if !entries.is_empty() {
-                let c = sindenrs::config::Config {
-                    gun: entries,
-                    ..Default::default()
-                };
-                // Replace the default [[gun]] block with the detected ones.
-                // Match a table header at line start, not the "[[gun]]" mentioned in the comments.
-                if let Some(i) = text.find("\n[[gun]]\n") {
-                    text.truncate(i + 1);
-                }
-                let guns_toml = c.to_toml();
-                if let Some(i) = guns_toml.find("\n[[gun]]\n") {
-                    text.push_str(&guns_toml[i + 1..]);
-                } else if let Some(i) = guns_toml.find("[[gun]]\n") {
-                    text.push_str(&guns_toml[i..]);
-                }
-            }
+            let n_guns = cfg.guns.len();
+            let text = format!("{}{}", sindenrs::config::example_header(), cfg.to_toml());
             std::fs::write(&ctx.path, text)?;
             println!(
                 "wrote {} ({} gun{} detected)",
@@ -657,10 +644,16 @@ fn config_cmd(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
             );
             Ok(())
         }
-        ConfigCmd::Show => {
-            let mut c = ctx.cfg.clone();
-            c.display = ctx.display.clone();
-            print!("{}", c.to_toml());
+        ConfigCmd::Show { defaults } => {
+            let mut c = if defaults {
+                sindenrs::config::Config::default()
+            } else {
+                ctx.cfg.clone()
+            };
+            if !defaults {
+                c.display = ctx.display.clone();
+            }
+            print!("{}", c.to_toml_full());
             Ok(())
         }
         ConfigCmd::Path => {
@@ -678,25 +671,12 @@ fn config_cmd(ctx: &Ctx, cmd: ConfigCmd) -> Result<()> {
     }
 }
 
-/// The config entry for an attached gun, or the built-in default. `id` is the gun's unique
-/// id when the caller has already talked to it.
-fn gun_config_for(
-    cfg: &sindenrs::config::Config,
-    port: &str,
-    id: Option<&str>,
-) -> sindenrs::config::GunConfig {
-    let guns = discovery::find_guns().unwrap_or_default();
-    let dev = guns.iter().find(|g| g.port.to_string_lossy() == port);
-    let variant = dev.and_then(|g| g.variant).map(|v| match v {
-        sindenrs::ids::GunVariant::Blue => "blue",
-        sindenrs::ids::GunVariant::Red => "red",
-        sindenrs::ids::GunVariant::Black => "black",
-        sindenrs::ids::GunVariant::Player2 => "player2",
-    });
-    let usb_path = dev.map_or("", |g| g.usb_path.as_str());
-    cfg.gun_for(id, variant, usb_path, port)
-        .cloned()
-        .unwrap_or_default()
+/// The settings for an attached gun: `[gun]` plus its `[guns.<id>]` overrides.
+fn gun_config_for(cfg: &sindenrs::config::Config, id: Option<&str>) -> sindenrs::config::GunConfig {
+    cfg.gun_for(id).unwrap_or_else(|e| {
+        warn!("{e}; using the [gun] defaults");
+        cfg.gun_for(None).unwrap_or_default()
+    })
 }
 
 fn probe(ctx: &Ctx, quick: bool) -> Result<()> {
@@ -737,15 +717,13 @@ fn probe(ctx: &Ctx, quick: bool) -> Result<()> {
                         .firmware_version()
                         .map(|((a, b), _)| format!("v{a}.{b}"))
                         .unwrap_or_default();
-                    let gc = gun_config_for(&ctx.cfg, &port, Some(&id));
-                    let matched = gc.matcher.id.as_deref() == Some(id.as_str());
+                    let gc = gun_config_for(&ctx.cfg, Some(&id));
                     println!(
-                        "        id: {id}  firmware {fw}  config: [[gun]] \"{}\"{}",
-                        gc.name,
-                        if matched {
-                            ""
+                        "        id: {id}  firmware {fw}  config: {}",
+                        if ctx.cfg.guns.contains_key(&id) {
+                            format!("[guns.\"{id}\"] \"{}\"", gc.name)
                         } else {
-                            "  (not matched by id; `config init --force` or add [gun.match] id)"
+                            "[gun] defaults (no [guns] table for this id)".to_owned()
                         }
                     );
                 }
@@ -1412,7 +1390,7 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
             let port = default_port(port)?;
             let mut gun = connect(&port, recover)?;
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+            let gc = gun_config_for(&ctx.cfg, id.as_deref());
             let gap = recoil_gap_ms.map_or(ctx.cfg.recoil_gap(), Duration::from_millis);
             let t0 = Instant::now();
             gun.apply_config(&gc, gap)?;
@@ -1432,7 +1410,7 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
             let port = default_port(port)?;
             let mut gun = connect(&port, recover)?;
             let id = gun.unique_id().ok();
-            let mut gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+            let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
             if let Some(st) = strength {
                 gc.recoil.strength = st;
             }
@@ -1589,7 +1567,7 @@ fn gun(ctx: &Ctx, cmd: GunCmd) -> Result<()> {
             let port = default_port(port)?;
             let mut gun = connect(&port, recover)?;
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+            let gc = gun_config_for(&ctx.cfg, id.as_deref());
             gun.apply_config(&gc, ctx.cfg.recoil_gap())?;
             gun.start_streaming(Duration::from_millis(150))?;
             // Each phase changes one mode, then asks for input, so a phase that produces
@@ -1801,7 +1779,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         let port = default_port(a.port.clone())?;
         let mut g = connect(&port, ctx.cfg.global.auto_recover)?;
         let id = g.unique_id().ok();
-        let mut gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+        let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
         if a.joystick {
             gc.joystick = true;
         }
@@ -1908,7 +1886,7 @@ fn run_all(ctx: &Ctx) -> Result<()> {
             }
         };
         let id = gun.unique_id().ok();
-        let gc = gun_config_for(&ctx.cfg, &port, id.as_deref());
+        let gc = gun_config_for(&ctx.cfg, id.as_deref());
         sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap())?;
         info!(
             "[{}] {port} + {} (id {})",
@@ -2599,7 +2577,7 @@ fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
                 }
             };
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&cfg, &port, id.as_deref());
+            let gc = gun_config_for(&cfg, id.as_deref());
             if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
                 finish(&stop);
                 return Err(e);

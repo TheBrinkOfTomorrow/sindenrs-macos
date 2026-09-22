@@ -5,6 +5,7 @@
 //! the gun at every start: button map, recoil, modes. Everything has a default so the file is
 //! optional; `sindenrs config init` writes a commented starting point.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -76,25 +77,18 @@ pub fn default_cache_dir() -> PathBuf {
     base.unwrap_or_else(|| PathBuf::from(".")).join("sindenrs")
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub global: Global,
     pub display: Display,
-    /// Named partial overrides of `display`, selected with `--profile`.
-    pub profiles: std::collections::BTreeMap<String, DisplayOverrides>,
-    pub gun: Vec<GunConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            global: Global::default(),
-            display: Display::default(),
-            profiles: Default::default(),
-            gun: vec![GunConfig::default()],
-        }
-    }
+    /// Named partial overrides of `display`, selected with `--profile` or `global.profile`.
+    pub profiles: BTreeMap<String, DisplayOverrides>,
+    /// Settings every gun starts from.
+    pub gun: GunConfig,
+    /// Per-gun overrides keyed by the gun's unique id (as `sindenrs list` prints it). Any
+    /// subset of the `[gun]` keys; merged over `[gun]` when that gun is attached.
+    pub guns: BTreeMap<String, toml::Table>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -102,10 +96,13 @@ impl Default for Config {
 pub struct Global {
     /// Log filter, e.g. "info" or "sindenrs=debug".
     pub log: String,
+    /// Display profile to use unless `--profile` says otherwise.
+    pub profile: Option<String>,
     /// Reset a gun that does not answer the handshake (bootloader touch, then hub power).
     pub auto_recover: bool,
     /// Pause between the frames of the recoil configuration burst, in ms. The vendor uses
     /// 100; measured: three of the frames answer within 2 ms and are drained, so 5 suffices.
+    /// Raise it if a gun answers the startup query with a garbled version.
     pub recoil_gap_ms: u64,
     /// Camera lens radial distortion (division model, radius in half-frame-widths; negative
     /// is barrel). A property of the camera module, so it lives here rather than per display.
@@ -118,8 +115,9 @@ impl Default for Global {
     fn default() -> Self {
         Self {
             log: "info".into(),
+            profile: None,
             auto_recover: true,
-            recoil_gap_ms: 100,
+            recoil_gap_ms: 5,
             lens_k1: -0.178,
         }
     }
@@ -188,6 +186,9 @@ pub struct Display {
     /// tab tips lie on screen, which lets a single visible side solve near that side.
     pub aspect: f64,
     pub border_thickness: f64,
+    /// Draw the border on screen while `run` is tracking. Turn it off when something else
+    /// draws the border (MAME artwork exported with `sindenrs border export`).
+    pub overlay: bool,
 }
 
 impl Default for Display {
@@ -213,6 +214,7 @@ impl Default for Display {
             hover_smoothing: 0.5,
             aspect: 16.0 / 9.0,
             border_thickness: 3.0,
+            overlay: true,
         }
     }
 }
@@ -241,6 +243,7 @@ pub struct DisplayOverrides {
     pub hover_smoothing: Option<f64>,
     pub aspect: Option<f64>,
     pub border_thickness: Option<f64>,
+    pub overlay: Option<bool>,
 }
 
 impl Display {
@@ -266,6 +269,7 @@ impl Display {
             hover_smoothing: o.hover_smoothing.unwrap_or(self.hover_smoothing),
             aspect: o.aspect.unwrap_or(self.aspect),
             border_thickness: o.border_thickness.unwrap_or(self.border_thickness),
+            overlay: o.overlay.unwrap_or(self.overlay),
         }
     }
 
@@ -282,46 +286,23 @@ impl Display {
     }
 }
 
-/// How a config entry is matched to an attached gun. Empty matches any gun.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct GunMatch {
-    /// The gun's unique id (command 111), as `sindenrs probe` prints it. The robust choice.
-    pub id: Option<String>,
-    /// Firmware variant: "blue", "red", "black", "player2".
-    pub variant: Option<String>,
-    /// USB bus path, e.g. "1-3.2" (stable per physical port).
-    pub usb_path: Option<String>,
-    /// Serial port path, e.g. "/dev/ttyACM0".
-    pub port: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GunConfig {
+    /// Label used in logs and status lines. Defaults to the gun's unique id.
     pub name: String,
-    #[serde(rename = "match")]
-    pub matcher: GunMatch,
-    /// Bore offset overrides in percent of frame; None reads the gun's EEPROM.
-    pub calibration_x: Option<f64>,
-    pub calibration_y: Option<f64>,
+    /// Bore offset `[x, y]` in percent of the camera frame. Unset reads the value stored in
+    /// the gun's EEPROM, which is where `sindenrs calibrate` saves it.
+    pub calibration: Option<[f64; 2]>,
     /// Report positions as joystick axes (firmware 1.9+ with the joystick device enabled).
     pub joystick: bool,
     /// Pointing off-screen acts as reload.
     pub offscreen_reload: bool,
-    /// Allow the gun's own button combo to enter calibration mode.
+    /// Let the gun's own button combo enter the vendor's calibration mode. Off by default:
+    /// it overwrites the EEPROM offsets that `sindenrs calibrate` measured.
     pub calibration_mode: bool,
     /// Whether D-pad up toggles recoil on the gun.
     pub recoil_toggle: bool,
-    /// Ask the gun to report button presses to the host (command 50).
-    ///
-    /// The vendor calls this "secondary serial output" and only enables it when a PS2/PSX
-    /// adapter is configured, but measured on firmware 2.1 it is also what gates the gun's
-    /// button reports over USB: with it off the gun sends nothing at all, with it on it sends
-    /// `FE <state1> <state2> 96` on every press and release. The driver needs those for the
-    /// trigger and for offscreen reload, so it defaults to on; the mirrored position simply
-    /// goes to a UART nothing is listening to.
-    pub buttons_over_serial: bool,
     pub buttons: Buttons,
     pub recoil: Recoil,
 }
@@ -329,15 +310,12 @@ pub struct GunConfig {
 impl Default for GunConfig {
     fn default() -> Self {
         Self {
-            name: "player1".into(),
-            matcher: GunMatch::default(),
-            calibration_x: None,
-            calibration_y: None,
+            name: String::new(),
+            calibration: None,
             joystick: false,
             offscreen_reload: false,
-            calibration_mode: true,
+            calibration_mode: false,
             recoil_toggle: true,
-            buttons_over_serial: true,
             buttons: Buttons::default(),
             recoil: Recoil::default(),
         }
@@ -657,10 +635,18 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let cfg: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        // Per-gun tables are raw TOML until merged, so check them now rather than when the
+        // gun is plugged in.
+        for id in cfg.guns.keys() {
+            cfg.gun_for(Some(id)).map_err(|e| {
+                ConfigError::Invalid(format!("{}: [guns.\"{id}\"]: {e}", path.display()))
+            })?;
+        }
+        Ok(cfg)
     }
 
     /// Load `path` if it exists, otherwise defaults.
@@ -672,13 +658,31 @@ impl Config {
         }
     }
 
-    pub fn to_toml(&self) -> String {
+    /// The whole configuration, every key spelled out.
+    pub fn to_toml_full(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// The effective display settings for an optional profile name.
+    /// Only what differs from the defaults, which is what a config file should contain.
+    pub fn to_toml(&self) -> String {
+        let Ok(mut me) = toml::Table::try_from(self) else {
+            return String::new();
+        };
+        let def = toml::Table::try_from(Self::default()).unwrap_or_default();
+        prune_defaults(&mut me, &def);
+        // Per-gun tables are deltas already; keep them whole so an explicit default (say
+        // `recoil.enabled = false` on one gun) survives a rewrite.
+        if let Ok(guns) = toml::Value::try_from(&self.guns) {
+            if !self.guns.is_empty() {
+                me.insert("guns".into(), guns);
+            }
+        }
+        toml::to_string_pretty(&me).unwrap_or_default()
+    }
+
+    /// The effective display settings: the profile named, else `global.profile`, else `[display]`.
     pub fn display_for(&self, profile: Option<&str>) -> Result<Display> {
-        match profile {
+        match profile.or(self.global.profile.as_deref()) {
             None => Ok(self.display.clone()),
             Some(name) => self
                 .profiles
@@ -688,38 +692,21 @@ impl Config {
         }
     }
 
-    /// The gun entry that matches an attached gun, if any: first entry whose every set
-    /// matcher field agrees. An entry with no matcher fields matches anything.
-    /// The gun entry that matches an attached gun, if any: first entry whose every set
-    /// matcher field agrees. An entry with no matcher fields matches anything. Entries with
-    /// an `id` are considered before entries without, so a catch-all can come first in the file.
-    pub fn gun_for(
-        &self,
-        id: Option<&str>,
-        variant: Option<&str>,
-        usb_path: &str,
-        port: &str,
-    ) -> Option<&GunConfig> {
-        let matches = |g: &&GunConfig| {
-            let m = &g.matcher;
-            m.id.as_deref().is_none_or(|i| Some(i) == id)
-                && m.variant.as_deref().is_none_or(|v| {
-                    Some(v.to_ascii_lowercase().as_str())
-                        == variant.map(str::to_ascii_lowercase).as_deref()
-                })
-                && m.usb_path.as_deref().is_none_or(|p| p == usb_path)
-                && m.port.as_deref().is_none_or(|p| p == port)
-        };
-        self.gun
-            .iter()
-            .filter(|g| g.matcher.id.is_some())
-            .find(matches)
-            .or_else(|| {
-                self.gun
-                    .iter()
-                    .filter(|g| g.matcher.id.is_none())
-                    .find(matches)
-            })
+    /// The settings for one gun: `[gun]` with that gun's `[guns.<id>]` table merged over it.
+    /// A gun with no id, or no table, gets `[gun]`; the name defaults to the id.
+    pub fn gun_for(&self, id: Option<&str>) -> Result<GunConfig> {
+        let mut base =
+            toml::Table::try_from(&self.gun).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        if let Some(over) = id.and_then(|i| self.guns.get(i)) {
+            merge_tables(&mut base, over);
+        }
+        let mut gc: GunConfig = base
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Invalid(e.message().to_owned()))?;
+        if gc.name.is_empty() {
+            gc.name = id.unwrap_or("gun").to_owned();
+        }
+        Ok(gc)
     }
 
     /// Recoil configuration frames are sent with this pause between them.
@@ -728,17 +715,45 @@ impl Config {
     }
 }
 
-/// A commented starting config.
-pub fn example_toml() -> String {
-    let body = Config::default().to_toml();
-    format!(
-        "# sindenrs configuration. Every key is optional; these are the defaults.\n\
-         # Display tuning is per display (threshold 48 / contrast 50 suit an OLED at exposure 7.8 ms).\n\
-         # Add [profiles.<name>] tables with any subset of [display] keys and pick one with --profile.\n\
-         # Add more [[gun]] entries with a [gun.match] table (variant / usb_path / port) for player 2.\n\
-         # Button actions: none, mouse_left|middle|right, pause, turbo, turbo_reload, border_toggle,\n\
-         #   key:<char>, key:return|escape|tab|space|up|down|left|right|f1..f12, joy:<1-20>.\n\n{body}"
-    )
+/// Copy `over` into `base`, recursing into tables so `recoil.strength = 60` leaves the rest
+/// of `[recoil]` alone.
+fn merge_tables(base: &mut toml::Table, over: &toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
+            _ => {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// Remove every key of `t` whose value equals the default's; drop tables left empty.
+fn prune_defaults(t: &mut toml::Table, def: &toml::Table) {
+    t.retain(|k, v| match (v, def.get(k)) {
+        (toml::Value::Table(sub), Some(toml::Value::Table(d))) => {
+            prune_defaults(sub, d);
+            !sub.is_empty()
+        }
+        (v, Some(d)) => v != d,
+        (_, None) => true,
+    });
+}
+
+/// The header `config init` writes above the detected guns.
+pub fn example_header() -> &'static str {
+    "# sindenrs configuration. Every key is optional; `sindenrs config show --defaults` lists\n\
+     # them all with their defaults, and `sindenrs config show` prints what is in effect.\n\
+     #\n\
+     # [global]    log, profile, auto_recover, recoil_gap_ms, lens_k1\n\
+     # [display]   camera and tracking tuning for the screen in front of you: threshold,\n\
+     #             exposure, contrast, border_thickness, aspect, overlay, offset/ratio trims\n\
+     # [profiles.<name>]  any subset of [display]; pick one with --profile or global.profile\n\
+     # [gun]       what every gun gets: buttons, recoil, joystick, offscreen_reload\n\
+     # [guns.\"<id>\"]  per-gun overrides (any [gun] key), keyed by the id `sindenrs list` prints\n\
+     #\n\
+     # Button actions: none, mouse_left|middle|right, pause, turbo, turbo_reload, border_toggle,\n\
+     #   key:<char>, key:return|escape|tab|space|up|down|left|right|f1..f12, joy:<1-20>.\n\n"
 }
 
 #[cfg(test)]
@@ -748,11 +763,48 @@ mod tests {
     #[test]
     fn defaults_round_trip() {
         let c = Config::default();
-        let text = c.to_toml();
-        let back: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(c.to_toml(), "", "defaults write an empty file");
+        let back: Config = toml::from_str(&c.to_toml_full()).expect("parse");
         assert_eq!(back, c);
-        let ex: Config = toml::from_str(&example_toml()).expect("example parses");
+        let ex: Config = toml::from_str(example_header()).expect("header parses");
         assert_eq!(ex, c);
+    }
+
+    #[test]
+    fn minimal_file_keeps_only_changes() {
+        let text = r#"
+[global]
+recoil_gap_ms = 20
+[gun]
+recoil.enabled = true
+[guns."123"]
+name = "player1"
+calibration = [-1.9, 0.1]
+recoil.strength = 60
+"#;
+        let c: Config = toml::from_str(text).expect("parse");
+        let out = c.to_toml();
+        assert!(out.contains("recoil_gap_ms = 20"), "{out}");
+        assert!(!out.contains("threshold"), "{out}");
+        assert!(!out.contains("[display]"), "{out}");
+        let back: Config = toml::from_str(&out).expect("reparse");
+        assert_eq!(back, c);
+        let g = c.gun_for(Some("123")).expect("merge");
+        assert_eq!(g.name, "player1");
+        assert_eq!(g.calibration, Some([-1.9, 0.1]));
+        assert!(g.recoil.enabled, "baseline survives the merge");
+        assert_eq!(g.recoil.strength, 60);
+        let other = c.gun_for(Some("999")).expect("baseline");
+        assert_eq!(other.name, "999");
+        assert!(other.recoil.enabled);
+        assert_eq!(other.recoil.strength, 100);
+        assert_eq!(c.gun_for(None).expect("no id").name, "gun");
+    }
+
+    #[test]
+    fn unknown_per_gun_key_is_rejected_at_load() {
+        let c: Config = toml::from_str("[guns.\"1\"]\nrecoil.strenght = 3\n").expect("parse");
+        assert!(c.gun_for(Some("1")).is_err());
     }
 
     #[test]
@@ -836,18 +888,15 @@ mod tests {
     }
 
     #[test]
-    fn profiles_and_gun_matching() {
+    fn profiles_and_global_profile() {
         let text = r#"
+[global]
+profile = "crt"
 [display]
 threshold = 40
 [profiles.crt]
 exposure = 120
 gunsight_y = 3.0
-[[gun]]
-name = "p2"
-match = { variant = "player2" }
-[[gun]]
-name = "any"
 "#;
         let c: Config = toml::from_str(text).expect("parse");
         let crt = c.display_for(Some("crt")).expect("profile");
@@ -855,31 +904,10 @@ name = "any"
         assert_eq!(crt.exposure, Exposure::Manual(120));
         assert!((crt.gunsight_y - 3.0).abs() < 1e-9);
         assert!(c.display_for(Some("nope")).is_err());
+        // global.profile applies when the command line names none.
         assert_eq!(
-            c.gun_for(None, Some("Blue"), "1-3.2", "/dev/ttyACM0")
-                .map(|g| g.name.as_str()),
-            Some("any")
-        );
-        assert_eq!(
-            c.gun_for(None, Some("player2"), "x", "y")
-                .map(|g| g.name.as_str()),
-            Some("p2")
-        );
-        let by_id: Config = toml::from_str(
-            "[[gun]]\nname = \"catchall\"\n[[gun]]\nname = \"mine\"\n[gun.match]\nid = \"42\"\n",
-        )
-        .expect("parse");
-        assert_eq!(
-            by_id
-                .gun_for(Some("42"), None, "", "")
-                .map(|g| g.name.as_str()),
-            Some("mine")
-        );
-        assert_eq!(
-            by_id
-                .gun_for(Some("7"), None, "", "")
-                .map(|g| g.name.as_str()),
-            Some("catchall")
+            c.display_for(None).expect("global profile").exposure,
+            Exposure::Manual(120)
         );
         let (x, y) = Display {
             offset_x: 1.0,

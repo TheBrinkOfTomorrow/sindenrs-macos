@@ -413,7 +413,11 @@ impl Gun {
         debug!(n = frames.len(), "button map sent");
         self.send_recoil_burst(&cfg.recoil, recoil_gap)?;
         self.set_calibration_mode_enabled(cfg.calibration_mode)?;
-        self.set_secondary_serial(cfg.buttons_over_serial)?;
+        // "Secondary serial output" is what gates the gun's button reports over USB: with it
+        // off the gun sends nothing at all, with it on it sends `FE <state1> <state2> 96` on
+        // every press and release. The trigger and offscreen reload depend on those, so it is
+        // always on; the mirrored position goes to a UART nothing listens to.
+        self.set_secondary_serial(true)?;
         self.set_recoil_toggle_enabled(cfg.recoil_toggle)?;
         self.set_joystick_mode(cfg.joystick)?;
         self.set_low_resource_mode(false)?;
