@@ -178,8 +178,10 @@ pub struct Display {
     /// Aim jump, in percent of screen between consecutive frames, above which a frame whose
     /// solve rests on fewer edges or tabs than the previous one is held for a frame.
     pub jump_limit: f64,
-    /// While the aim moves less than 1% per frame, only this fraction of each move is
-    /// applied, which averages away pixel jitter when hovering; 1 turns it off.
+    /// Aim tracker blend weight for a four-edge solve: each frame the aim is predicted
+    /// from its velocity and this fraction of the residual is applied (solves from fewer
+    /// edges use less), which averages down solve noise and hand tremor without lagging
+    /// steady motion; 1 turns it off.
     pub hover_smoothing: f64,
     /// Screen width over height, and the tracked border's thickness as a percentage of the
     /// shorter screen dimension (what the overlay draws): where the border's inner edge and
@@ -208,7 +210,7 @@ impl Default for Display {
             orientation: -1.0,
             fps: None,
             jump_limit: 5.0,
-            hover_smoothing: 0.3,
+            hover_smoothing: 0.5,
             aspect: 16.0 / 9.0,
             border_thickness: 3.0,
         }

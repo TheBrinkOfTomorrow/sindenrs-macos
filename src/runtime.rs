@@ -39,8 +39,8 @@ pub struct TrackerOptions {
     /// Aim jump, in screen percent, above which a frame whose solve rests on less than the
     /// previous one is held for a frame (config: display.jump_limit).
     pub jump_limit: f64,
-    /// Fraction of a sub-1% move applied per frame while hovering (config:
-    /// display.hover_smoothing; 1 = off).
+    /// Aim tracker blend weight for a four-edge solve (config: display.hover_smoothing;
+    /// 1 = off); weaker solves are smoothed harder.
     pub hover_smoothing: f64,
     /// Requested mmap buffer count.
     pub buffers: u32,
@@ -133,43 +133,64 @@ impl JumpGuard {
     }
 }
 
-/// Averages away the pixel-quantisation jitter of a still aim without slowing real motion:
-/// a move smaller than `gate` per frame is blended in by `factor`, anything larger passes
-/// straight through, so tracking latency is unchanged whenever the gun is actually moving.
+/// Smooths the aim with a constant-velocity (alpha-beta) tracker: each frame predicts
+/// the aim from the last position and velocity and blends in the measurement, so steady
+/// motion is followed without lag while frame-to-frame solve noise is averaged down. The
+/// blend weight follows the solve's support: four edges are precise and get followed
+/// closely, two edges are noisier and get smoothed harder. A residual beyond `reset` is
+/// taken as real (a flick, or the guard letting a confirmed jump through) and the tracker
+/// restarts on the measurement.
 #[derive(Clone, Copy, Debug)]
 pub struct HoverSmoother {
-    /// Motion per frame, in screen percent, below which smoothing applies.
-    pub gate: f64,
-    /// Fraction of the residual applied per frame while still (1 = off).
+    /// Residual, in screen percent, beyond which the tracker restarts on the measurement.
+    pub reset: f64,
+    /// Position blend weight for a four-edge solve (1 = no smoothing); weaker solves use
+    /// a fraction of it.
     pub factor: f64,
-    out: Option<[f64; 2]>,
+    pos: Option<[f64; 2]>,
+    vel: [f64; 2],
 }
 
 impl HoverSmoother {
     #[must_use]
-    pub fn new(gate: f64, factor: f64) -> Self {
+    pub fn new(reset: f64, factor: f64) -> Self {
         Self {
-            gate,
+            reset,
             factor: factor.clamp(0.05, 1.0),
-            out: None,
+            pos: None,
+            vel: [0.0, 0.0],
         }
     }
 
-    pub fn filter(&mut self, aim: [f64; 2]) -> [f64; 2] {
-        let out = match self.out {
-            Some(prev) if (aim[0] - prev[0]).hypot(aim[1] - prev[1]) < self.gate => [
-                prev[0] + self.factor * (aim[0] - prev[0]),
-                prev[1] + self.factor * (aim[1] - prev[1]),
-            ],
-            _ => aim,
+    pub fn filter(&mut self, aim: [f64; 2], support: Support) -> [f64; 2] {
+        let Some(p) = self.pos else {
+            self.pos = Some(aim);
+            return aim;
         };
-        self.out = Some(out);
+        let pred = [p[0] + self.vel[0], p[1] + self.vel[1]];
+        let r = [aim[0] - pred[0], aim[1] - pred[1]];
+        if r[0].hypot(r[1]) > self.reset {
+            self.pos = Some(aim);
+            self.vel = [0.0, 0.0];
+            return aim;
+        }
+        let alpha = self.factor
+            * match support.sides {
+                4 => 1.0,
+                3 => 0.6,
+                _ => 0.4,
+            };
+        let beta = alpha * alpha / 4.0;
+        let out = [pred[0] + alpha * r[0], pred[1] + alpha * r[1]];
+        self.vel = [self.vel[0] + beta * r[0], self.vel[1] + beta * r[1]];
+        self.pos = Some(out);
         out
     }
 
     /// Tracking was lost: start afresh on the next aim.
     pub fn reset(&mut self) {
-        self.out = None;
+        self.pos = None;
+        self.vel = [0.0, 0.0];
     }
 }
 
@@ -353,7 +374,7 @@ pub fn run_tracker_with(
     let mut corrupt = 0u64;
     let mut corrupt_window = 0u64;
     let mut last_corrupt_report = Instant::now();
-    let mut smoother = HoverSmoother::new(1.0, opts.hover_smoothing);
+    let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
     let mut window_start = Instant::now();
@@ -440,7 +461,7 @@ pub fn run_tracker_with(
             };
             aim = candidate
                 .and_then(|a| guard.filter(a, support))
-                .map(|a| smoother.filter(a));
+                .map(|a| smoother.filter(a, support));
             if candidate.is_some() && aim.is_none() {
                 held += 1;
             }
@@ -617,16 +638,25 @@ mod tests {
     }
 
     #[test]
-    fn smoother_damps_jitter_but_not_motion() {
-        let mut s = HoverSmoother::new(1.0, 0.25);
-        assert_eq!(s.filter([10.0, 10.0]), [10.0, 10.0]);
-        // A 0.4% wobble is damped to a tenth of a percent.
-        let o = s.filter([10.4, 10.0]);
-        assert!((o[0] - 10.1).abs() < 1e-9 && o[1] == 10.0, "{o:?}");
-        // A real move passes straight through and resets the base.
-        assert_eq!(s.filter([30.0, 12.0]), [30.0, 12.0]);
-        let o = s.filter([30.4, 12.0]);
-        assert!((o[0] - 30.1).abs() < 1e-9, "{o:?}");
+    fn smoother_damps_jitter_and_follows_motion_without_lag() {
+        let mut s = HoverSmoother::new(4.0, 0.5);
+        assert_eq!(s.filter([10.0, 10.0], STRONG), [10.0, 10.0]);
+        // A 0.4% wobble is halved.
+        let o = s.filter([10.4, 10.0], STRONG);
+        assert!((o[0] - 10.2).abs() < 1e-9, "{o:?}");
+        // Steady motion of 1% per frame: after a few frames the tracker rides along with
+        // little lag, and the lag keeps shrinking.
+        let mut s = HoverSmoother::new(4.0, 0.5);
+        let mut lag = Vec::new();
+        for k in 0..40 {
+            let x = 10.0 + f64::from(k);
+            let o = s.filter([x, 20.0], STRONG);
+            lag.push(x - o[0]);
+        }
+        assert!(lag[39].abs() < 0.2, "lag {lag:?}");
+        assert!(lag[39].abs() < lag[5].abs());
+        // A flick restarts on the measurement.
+        assert_eq!(s.filter([80.0, 60.0], STRONG), [80.0, 60.0]);
     }
 
     #[test]
