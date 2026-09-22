@@ -260,6 +260,7 @@ a border that encodes position (thickness is not a usable cue on a CRT).
 border-thickness deep, at a constant pitch; a tab's width (one to four units) is a symbol,
 and each side has its own sequence, chosen so that every window of three consecutive
 symbols, read in either direction, occurs exactly once across all four sides
+and every window of two occurs once within its side
 (`src/vision/code.rs`, shared by the overlay that draws it and the detector that reads it).
 Three adjacent tabs therefore name the side, the position and the reading direction, and the
 solve does not depend on how the gun is rolled: an edge's normal only guesses which side it
@@ -292,8 +293,16 @@ tracker holds back a frame that leaps on a weaker solve until the next frame con
 is left is physical: the OLED caught mid-refresh draws one side a third as thick, and at the
 far end of the range a six-pixel border can have both edges fitted as one line; both show up
 as small spikes or a missed frame, not as a wrong cursor. Recordings made before the per-side
-code (`2026-09-22-coded`, `wow`, `wow2`) still exercise the four-line path but their tabs no
-longer decode.
+code (`2026-09-22-coded`, `wow`, `wow2`, `2026-09-22-sidecode`, `consoom`) still exercise
+the four-line path but their tabs no longer decode.
+
+**Third recording (`corpus/consoom`, per-side code).** Roll works. Two things were left: 465
+two-side frames refused because the vertical side showed three tabs with one uncertain read,
+and a still hover jittered by 0.25% of screen (median; 0.7% at the 90th percentile), which is
+the half-resolution mask's pixel quantisation. Two-symbol windows are now unique within a side,
+so once another edge has fixed the side and the roll, two tabs place themselves; the decoder
+falls back to the longest sub-run that places itself when one tab misreads; and the tracker
+blends moves under 1% per frame (`display.hover_smoothing`), which leaves real motion untouched.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
