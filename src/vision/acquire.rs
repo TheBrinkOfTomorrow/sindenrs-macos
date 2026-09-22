@@ -434,21 +434,41 @@ pub struct Edges {
     /// may be cut off there.
     pub near_edge: Vec<bool>,
     pub segments: Vec<Segment>,
+    /// Each segment's line with its normal pointing from the bright side to the dark side,
+    /// decided by sampling the mask on both sides of its inliers.
+    pub outward: Vec<Line>,
+    /// The mask and lens, so later stages can ask whether an undistorted full-resolution
+    /// point is bright.
+    pub mask: Mask,
+    pub lens: Lens,
+}
+
+impl Edges {
+    /// Is the undistorted full-resolution point `p` on a bright mask pixel?
+    #[must_use]
+    pub fn bright_at(&self, p: P2) -> bool {
+        let d = self.lens.distort(p);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, y) = (
+            ((d[0] - 0.5) / 2.0).round() as i64,
+            ((d[1] - 0.5) / 2.0).round() as i64,
+        );
+        match (usize::try_from(x), usize::try_from(y)) {
+            (Ok(x), Ok(y)) => {
+                x < self.mask.w && y < self.mask.h && self.mask.bits[y * self.mask.w + x] != 0
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Fit straight lines to pooled half-resolution boundary points. Points on the frame edge
 /// are discarded (they are where the border leaves the frame, not an edge of it); the rest
 /// are pushed to full resolution, undistorted, and handed to the line extractor.
 #[must_use]
-pub fn edge_segments(
-    pts: &[P2],
-    mask_w: usize,
-    mask_h: usize,
-    lens: &Lens,
-    p: &AcquireParams,
-) -> Edges {
+pub fn edge_segments(pts: &[P2], mask: &Mask, lens: &Lens, p: &AcquireParams) -> Edges {
     #[allow(clippy::cast_precision_loss)]
-    let (xe, ye) = ((mask_w - 1) as f64, (mask_h - 1) as f64);
+    let (xe, ye) = ((mask.w - 1) as f64, (mask.h - 1) as f64);
     let kept: Vec<P2> = pts
         .iter()
         .copied()
@@ -468,10 +488,53 @@ pub fn edge_segments(
         // Room for four outer and four inner edges plus the lines the tab tips form.
         extract_lines(&points, p.line_tol, p.line_min_points, 12)
     };
+    let bright = |q: P2| -> bool {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, y) = (q[0].round() as i64, q[1].round() as i64);
+        match (usize::try_from(x), usize::try_from(y)) {
+            (Ok(x), Ok(y)) => x < mask.w && y < mask.h && mask.bits[y * mask.w + x] != 0,
+            _ => false,
+        }
+    };
+    let outward = segments
+        .iter()
+        .map(|seg| {
+            // Lens distortion barely rotates a normal over a few pixels, so the undistorted
+            // normal serves for sampling the distorted mask.
+            let (a, b) = (seg.line.a, seg.line.b);
+            let (mut plus, mut minus) = (0i32, 0i32);
+            for &k in seg.idx.iter().step_by(3) {
+                let q = kept[k];
+                if bright([q[0] + 1.5 * a, q[1] + 1.5 * b]) {
+                    plus += 1;
+                }
+                if bright([q[0] - 1.5 * a, q[1] - 1.5 * b]) {
+                    minus += 1;
+                }
+            }
+            // Normal towards the dark side.
+            if plus > minus {
+                Line {
+                    a: -a,
+                    b: -b,
+                    c: -seg.line.c,
+                }
+            } else {
+                seg.line
+            }
+        })
+        .collect();
     Edges {
         points,
         near_edge,
         segments,
+        outward,
+        mask: Mask {
+            w: mask.w,
+            h: mask.h,
+            bits: mask.bits.clone(),
+        },
+        lens: *lens,
     }
 }
 
@@ -488,6 +551,9 @@ pub struct SideLines {
     /// Sign that makes the along-line coordinate increase with the screen coordinate
     /// (rightwards on horizontal sides, downwards on vertical ones).
     pub dir: f64,
+    /// Extent of the side along the outer line (screen-ordered coordinates), from the
+    /// outer and inner segments and any leftover segment collinear with the outer.
+    pub span: (f64, f64),
 }
 
 impl SideLines {
@@ -504,11 +570,20 @@ impl SideLines {
     }
 }
 
-/// Assign fitted lines to sides. The outermost line per side is its outer edge: the
-/// largest distance from the boundary centroid along its outward normal. The nearest
-/// roughly parallel line inside it is the inner edge.
+/// Assign fitted lines to sides.
+///
+/// Every edge of the border comes as a bright-to-dark line, so the outer and inner edge of
+/// one side are a close, parallel pair with opposite normals, and locally nothing tells them
+/// apart: both look out onto darkness. What breaks the symmetry is the tabs, which sit only
+/// on the inner edge, so the member of a pair with tab-like boundary points just beyond its
+/// partner is the outer edge. Without tab evidence (far away, tabs unresolved) the member
+/// farther from the boundary centroid is taken as outer, which holds whenever the ring
+/// encloses the centroid, i.e. when all four sides are in view. The centroid alone was the
+/// old rule, and with three sides in view it turned the left border's inner edge into a
+/// confident, wrong right edge.
 #[must_use]
-pub fn classify_sides(segs: &[Segment]) -> [Option<SideLines>; 4] {
+pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
+    let segs = &edges.segments;
     let all: usize = segs.iter().map(|s| s.inliers.len()).sum();
     if all == 0 {
         return [None; 4];
@@ -519,52 +594,195 @@ pub fn classify_sides(segs: &[Segment]) -> [Option<SideLines>; 4] {
         .iter()
         .flat_map(|s| s.inliers.iter())
         .fold([0.0, 0.0], |a, q| [a[0] + q[0] / n, a[1] + q[1] / n]);
-    let oriented: Vec<(Side, f64, Line)> = segs
-        .iter()
-        .map(|s| {
-            let l = s.line.oriented_away_from(centroid);
-            (side_of(&l), -l.signed_dist(centroid), l)
-        })
-        .collect();
+    let outward = &edges.outward;
+    let mut member = vec![false; edges.points.len()];
+    for s in segs {
+        for &k in &s.idx {
+            member[k] = true;
+        }
+    }
+    let span = |k: usize| -> (f64, f64) {
+        let l = &outward[k];
+        segs[k]
+            .inliers
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                let a = l.along(*p);
+                (lo.min(a), hi.max(a))
+            })
+    };
+    // Tab-like evidence for `k` being an outer edge of thickness `t`: boundary points on no
+    // line, in the band the tabs occupy beyond the inner edge, within the line's span.
+    let evidence = |k: usize, t: f64| -> usize {
+        let l = &outward[k];
+        let (lo, hi) = span(k);
+        edges
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                if member[*i] {
+                    return false;
+                }
+                let inward = -l.signed_dist(**p);
+                let a = l.along(**p);
+                let (blo, bhi) = tab_band(t);
+                inward >= blo && inward <= bhi && a >= lo && a <= hi
+            })
+            .count()
+    };
+    let mut order: Vec<usize> = (0..segs.len()).collect();
+    order.sort_by_key(|&k| std::cmp::Reverse(segs[k].inliers.len()));
+    let mut used = vec![false; segs.len()];
     let mut out: [Option<SideLines>; 4] = [None; 4];
-    for side in Side::ALL {
-        let Some((k, &(_, d, l))) = oriented
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| o.0 == side)
-            .max_by(|a, b| {
-                a.1 .1
-                    .partial_cmp(&b.1 .1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        else {
+    for &k in &order {
+        if used[k] {
             continue;
-        };
-        // The outer edge of a boundary pixel is one full-resolution pixel beyond its centre.
-        let outer = l.offset(1.0);
-        // Nearest roughly parallel line inside the outer edge. The tab tips form a line
-        // too, one thickness further in, which is why the nearest wins.
-        let inner = oriented
+        }
+        let l = outward[k];
+        // Nearest parallel line with the opposite normal on this line's bright side.
+        let partner = order
             .iter()
-            .enumerate()
-            .filter(|(_, o)| o.0 == side && o.2.cos_angle(&l) > 0.985 && o.1 < d - 3.0)
-            .max_by(|a, b| {
-                a.1 .1
-                    .partial_cmp(&b.1 .1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .copied()
+            .filter(|&m| m != k && !used[m])
+            .filter_map(|m| {
+                let o = &outward[m];
+                if l.cos_angle(o) < 0.985 || l.a * o.a + l.b * o.b > -0.9 {
+                    return None;
+                }
+                let mid = segs[m].inliers[segs[m].inliers.len() / 2];
+                let d = -l.signed_dist(mid);
+                (d > 3.0 && d < 80.0).then_some((m, d))
             })
-            .map(|(j, o)| (j, d + 2.0 - o.1));
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Every boundary point lies inside the outer quad, so a real outer edge always has
+        // the centroid on its bright side; an inner edge, or the line the tab tips form,
+        // has it on the dark side.
+        let faces_in = |k: usize| outward[k].signed_dist(centroid) < 0.0;
+        // Nearest parallel line with the opposite normal on `from`'s bright side.
+        let nearest_partner = |from: usize, used: &[bool]| -> Option<(usize, f64)> {
+            let l = &outward[from];
+            order
+                .iter()
+                .copied()
+                .filter(|&m| m != from && !used[m])
+                .filter_map(|m| {
+                    let o = &outward[m];
+                    if l.cos_angle(o) < 0.985 || l.a * o.a + l.b * o.b > -0.9 {
+                        return None;
+                    }
+                    let mid = segs[m].inliers[segs[m].inliers.len() / 2];
+                    let d = -l.signed_dist(mid);
+                    if !(d > 3.0 && d < 80.0) {
+                        return None;
+                    }
+                    // The border between an outer edge and its inner edge is solid; between
+                    // an outer edge and the line the tab tips form it is bright only at the
+                    // tabs. Sample a few pixels on the outer side of the candidate along
+                    // its span (the midline sits inside the solid border either way).
+                    // Sampled uniformly along the span, not at the inliers: the tip line's
+                    // inliers are the tabs themselves and would always read bright.
+                    let lm = &outward[m];
+                    let (lo, hi) =
+                        segs[m]
+                            .inliers
+                            .iter()
+                            .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                                let a = lm.along(*p);
+                                (lo.min(a), hi.max(a))
+                            });
+                    let step = (d / 2.0).min(4.0);
+                    let (mut lit, mut n) = (0usize, 0usize);
+                    let mut t = lo;
+                    while t <= hi {
+                        let p = lm.point_at(t);
+                        n += 1;
+                        if edges.bright_at([p[0] + l.a * step, p[1] + l.b * step]) {
+                            lit += 1;
+                        }
+                        t += 4.0;
+                    }
+                    (n > 0 && lit * 10 >= n * 8).then_some((m, d))
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        };
+        let outer_k = match partner {
+            Some((m, d)) => {
+                let (ek, em) = (evidence(k, d), evidence(m, d));
+                let k_outer = if ek.max(em) >= 6 {
+                    ek >= em
+                } else {
+                    -l.signed_dist(centroid) >= -outward[m].signed_dist(centroid)
+                };
+                let (o, i) = if k_outer { (k, m) } else { (m, k) };
+                if faces_in(o) {
+                    o
+                } else if faces_in(i) && ek.max(em) < 6 {
+                    i
+                } else {
+                    used[k] = true;
+                    continue;
+                }
+            }
+            None => {
+                if !faces_in(k) {
+                    continue;
+                }
+                k
+            }
+        };
+        // The line the tab tips form is parallel too and, being long, may have been the
+        // partner found first; the inner edge is whatever lies nearest inside the outer.
+        let inner = nearest_partner(outer_k, &used);
+        let outer = outward[outer_k];
+        let side = side_of(&outer);
+        if out[side as usize].is_some() {
+            continue;
+        }
+        used[outer_k] = true;
+        if let Some((m, _)) = inner {
+            used[m] = true;
+        }
         let d = outer.direction();
         let forward = if side.is_horizontal() { d[0] } else { d[1] };
+        let dir = if forward >= 0.0 { 1.0 } else { -1.0 };
+        let mut span = (f64::MAX, f64::MIN);
+        for (m, seg) in segs.iter().enumerate() {
+            let structural = m == outer_k || inner.is_some_and(|i| i.0 == m);
+            let collinear = !used[m]
+                && outward[m].cos_angle(&outer) > 0.995
+                && seg
+                    .inliers
+                    .iter()
+                    .all(|p| outer.signed_dist(*p).abs() < 4.0);
+            if !(structural || collinear) {
+                continue;
+            }
+            for p in &seg.inliers {
+                let a = dir * outer.along(*p);
+                span = (span.0.min(a), span.1.max(a));
+            }
+        }
         out[side as usize] = Some(SideLines {
-            outer,
-            outer_seg: k,
+            // The outer edge of a boundary pixel is one full-resolution pixel beyond its
+            // centre.
+            outer: outer.offset(1.0),
+            outer_seg: outer_k,
             inner_seg: inner.map(|i| i.0),
-            thickness: inner.map(|i| i.1),
-            dir: if forward >= 0.0 { 1.0 } else { -1.0 },
+            thickness: inner.map(|i| i.1 + 2.0),
+            dir,
+            span,
         });
     }
     out
+}
+
+/// The band of inward distances from a side's outer edge that its tab walls and tips
+/// occupy, given the pixel distance `d` between the outer and inner boundary lines. Tabs
+/// run from the inner edge one thickness inward; the band starts just past the inner
+/// boundary pixels and reaches past the tips with room for a thickness mis-estimate.
+fn tab_band(d: f64) -> (f64, f64) {
+    (1.1 * d + 2.0, 2.7 * d + 4.0)
 }
 
 /// A tab seen on one side: its centre and width along the outer line, in pixels.
@@ -593,15 +811,18 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
             }
         }
     }
+    // Points on any line crossing this side (another side's edges, whether or not that
+    // side was classified) are structure, not tabs. Lines parallel to this side stay
+    // available: the tab tips form one.
+    for (i, seg) in edges.segments.iter().enumerate() {
+        if edges.outward[i].cos_angle(&side.outer) < 0.87 {
+            for &k in &seg.idx {
+                member[k] = true;
+            }
+        }
+    }
     let outer = &side.outer;
-    let (span_lo, span_hi) =
-        edges.segments[side.outer_seg]
-            .inliers
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
-                let a = side.along(*p);
-                (lo.min(a), hi.max(a))
-            });
+    let (span_lo, span_hi) = side.span;
     // The other sides' own tabs sit in this band near the corners; keep clear of them.
     let others: Vec<(Line, f64)> = sides
         .iter()
@@ -619,8 +840,9 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
             }
             let inward = -outer.signed_dist(**p);
             let a = side.along(**p);
-            inward >= 1.35 * t
-                && inward <= 2.7 * t
+            let (blo, bhi) = tab_band(t - 2.0);
+            inward >= blo
+                && inward <= bhi
                 && a >= span_lo - t
                 && a <= span_hi + t
                 && others.iter().all(|(l, t2)| -l.signed_dist(**p) > 2.7 * t2)
@@ -699,38 +921,52 @@ pub fn decode_tabs(side: Side, lines: &SideLines, seen: &[SeenTab]) -> Vec<(P2, 
             }
             #[allow(clippy::cast_precision_loss)]
             let unit = pitches.iter().sum::<f64>() / pitches.len() as f64 / code::PITCH_UNITS;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let sym = ((seen[k].width / unit).round() as i64 - 1).clamp(0, 2) as u8;
-            syms.push((k, sym));
-        }
-        if syms.len() < 2 {
-            continue;
-        }
-        // A stray cluster at either end (a reflection, the far side's corner) would spoil
-        // the whole run, so try trimming one symbol off each end before giving up.
-        let symbols: Vec<u8> = syms.iter().map(|s| s.1).collect();
-        let mut found: Option<(usize, usize)> = None;
-        for (lo, hi) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-            if symbols.len() < lo + hi + 2 {
+            let w = seen[k].width / unit;
+            // A width near a decision boundary (1.5 or 2.5 units) is a coin toss, and one
+            // misread symbol matches the code somewhere else with a plausible position, so
+            // an uncertain tab ends the run instead of joining it.
+            if (w - w.round()).abs() > 0.3 || !(0.6..=3.4).contains(&w) {
+                syms.push((k, u8::MAX));
                 continue;
             }
-            let m = code::matches(side, &symbols[lo..symbols.len() - hi]);
-            if m.len() == 1 {
-                found = Some((lo, m[0]));
-                break;
-            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let sym = (w.round() as i64 - 1).clamp(0, 2) as u8;
+            syms.push((k, sym));
         }
-        let Some((lo, at)) = found else {
-            continue;
-        };
-        for (i, &(k, _)) in syms.iter().enumerate().skip(lo) {
-            let Some(tab) = table.get(at + i - lo) else {
-                break;
+        // Split at uncertain tabs; each confident stretch needs three symbols, the window
+        // size the code guarantees unique.
+        let stretches: Vec<Vec<(usize, u8)>> = syms
+            .split(|s| s.1 == u8::MAX)
+            .filter(|st| st.len() >= 3)
+            .map(<[(usize, u8)]>::to_vec)
+            .collect();
+        for syms in stretches {
+            // A stray cluster at either end (a reflection, the far side's corner) would spoil
+            // the whole run, so try trimming one symbol off each end before giving up.
+            let symbols: Vec<u8> = syms.iter().map(|s| s.1).collect();
+            let mut found: Option<(usize, usize)> = None;
+            for (lo, hi) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                if symbols.len() < lo + hi + 3 {
+                    continue;
+                }
+                let m = code::matches(side, &symbols[lo..symbols.len() - hi]);
+                if m.len() == 1 {
+                    found = Some((lo, m[0]));
+                    break;
+                }
+            }
+            let Some((lo, at)) = found else {
+                continue;
             };
-            out.push((
-                lines.point_at(seen[k].along),
-                side.outer_point(tab.centre()),
-            ));
+            for (i, &(k, _)) in syms.iter().enumerate().skip(lo) {
+                let Some(tab) = table.get(at + i - lo) else {
+                    break;
+                };
+                out.push((
+                    lines.point_at(seen[k].along),
+                    side.outer_point(tab.centre()),
+                ));
+            }
         }
     }
     out
@@ -748,6 +984,8 @@ pub struct Report {
     pub seen: [Vec<SeenTab>; 4],
     /// Tab correspondences decoded on each side.
     pub decoded: [usize; 4],
+    /// Every (image point, screen point) correspondence used.
+    pub points: Vec<(P2, P2)>,
 }
 
 /// Solve the border from whatever sides and tabs are visible. With all four outer lines
@@ -757,7 +995,7 @@ pub struct Report {
 /// Returns the corners and the number of tab correspondences used, plus the report.
 #[must_use]
 pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u8)>, Report) {
-    let sides = classify_sides(&edges.segments);
+    let sides = classify_sides(edges);
     let mut report = Report {
         sides,
         ..Default::default()
@@ -773,7 +1011,25 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
         }
     }
     let n_tabs = u8::try_from(points.len()).unwrap_or(u8::MAX);
-    let corners = solve_corners(&sides, &points, mask_w, mask_h);
+    report.points.clone_from(&points);
+    let per_side = report.decoded;
+    let mut corners = solve_corners(&sides, &points, &per_side, mask_w, mask_h);
+    // A solve must agree with the tabs it decoded. A four-line solve built on a
+    // misassigned edge, or a run matched at the wrong place, lands them far from their
+    // screen positions; first retry as a least-squares fit over lines and tabs, then give
+    // up rather than pass a wrong answer on.
+    let fits = |q: &[P2; 4]| {
+        let m = quad_to_quad(q, &SCREEN_PERCENT);
+        points.iter().all(|(img, scr)| {
+            m.apply(*img)
+                .is_some_and(|p| (p[0] - scr[0]).abs() < 2.0 && (p[1] - scr[1]).abs() < 2.0)
+        })
+    };
+    if let Some(q) = &corners {
+        if !fits(q) {
+            corners = solve_corners_dlt(&sides, &points, &per_side, mask_w, mask_h).filter(fits);
+        }
+    }
     (corners.map(|q| (q, n_tabs)), report)
 }
 
@@ -792,40 +1048,68 @@ impl Report {
 fn solve_corners(
     sides: &[Option<SideLines>; 4],
     points: &[(P2, P2)],
+    per_side: &[usize; 4],
     mask_w: usize,
     mask_h: usize,
 ) -> Option<[P2; 4]> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
-    let q = if n_sides == 4 {
-        let [top, right, bottom, left] = sides.map(|s| s.map(|s| s.outer));
-        let (top, right, bottom, left) = (top?, right?, bottom?, left?);
-        [
-            top.intersect(&left)?,
-            top.intersect(&right)?,
-            bottom.intersect(&right)?,
-            bottom.intersect(&left)?,
-        ]
-    } else {
-        if 2 * n_sides + points.len() < 8 {
-            return None;
-        }
-        let lines: Vec<(L3, L3)> = Side::ALL
+    if n_sides < 4 {
+        return solve_corners_dlt(sides, points, per_side, mask_w, mask_h);
+    }
+    let [top, right, bottom, left] = sides.map(|s| s.map(|s| s.outer));
+    let (top, right, bottom, left) = (top?, right?, bottom?, left?);
+    let q = [
+        top.intersect(&left)?,
+        top.intersect(&right)?,
+        bottom.intersect(&right)?,
+        bottom.intersect(&left)?,
+    ];
+    sane_quad(q, mask_w, mask_h)
+}
+
+/// Least-squares solve over every line and tab point.
+///
+/// Points on one line only fix the one-dimensional projectivity along it (three degrees of
+/// freedom), so with two sides each needs at least two tabs or the system is rank
+/// deficient and the answer is noise. One constraint beyond the minimum is also required,
+/// so that the consistency check in [`solve`] has something to check.
+fn solve_corners_dlt(
+    sides: &[Option<SideLines>; 4],
+    points: &[(P2, P2)],
+    per_side: &[usize; 4],
+    mask_w: usize,
+    mask_h: usize,
+) -> Option<[P2; 4]> {
+    let n_sides = sides.iter().filter(|s| s.is_some()).count();
+    if 2 * n_sides + points.len() < 9 {
+        return None;
+    }
+    if n_sides == 2
+        && Side::ALL
             .iter()
-            .filter_map(|&side| {
-                sides[side as usize].map(|s| {
-                    let sl = side.outer_line();
-                    (line3(&s.outer), [sl[0], sl[1], -sl[2]])
-                })
+            .any(|&sd| sides[sd as usize].is_some() && per_side[sd as usize] < 2)
+    {
+        return None;
+    }
+    let lines: Vec<(L3, L3)> = Side::ALL
+        .iter()
+        .filter_map(|&side| {
+            sides[side as usize].map(|s| {
+                let sl = side.outer_line();
+                (line3(&s.outer), [sl[0], sl[1], -sl[2]])
             })
-            .collect();
-        let h = fit_dlt(points, &lines)?;
-        let inv = h.adjugate();
-        let mut q = [[0.0; 2]; 4];
-        for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
-            *c = inv.apply(*s)?;
-        }
-        q
-    };
+        })
+        .collect();
+    let h = fit_dlt(points, &lines)?;
+    let inv = h.adjugate();
+    let mut q = [[0.0; 2]; 4];
+    for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
+        *c = inv.apply(*s)?;
+    }
+    sane_quad(q, mask_w, mask_h)
+}
+
+fn sane_quad(q: [P2; 4], mask_w: usize, mask_h: usize) -> Option<[P2; 4]> {
     // Sanity: a convex quad with the expected winding and no absurd extrapolation.
     #[allow(clippy::cast_precision_loss)]
     let limit = 8.0 * (mask_w + mask_h) as f64;
@@ -836,6 +1120,10 @@ fn solve_corners(
     }
     for i in 0..4 {
         if cross(q[i], q[(i + 1) % 4], q[(i + 2) % 4]) <= 0.0 {
+            return None;
+        }
+        let (a, b) = (q[i], q[(i + 1) % 4]);
+        if (a[0] - b[0]).hypot(a[1] - b[1]) < 20.0 {
             return None;
         }
     }
@@ -850,7 +1138,7 @@ pub fn acquire(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Option<Qua
     let min = p.min_size as usize;
     let (pooled, first) = pooled_boundary(&labels, mask.w, mask.h, &blobs, min);
     if let Some(blob) = first {
-        let edges = edge_segments(&pooled, mask.w, mask.h, &lens, p);
+        let edges = edge_segments(&pooled, &mask, &lens, p);
         if let (Some((corners, tabs)), report) = solve(&edges, mask.w, mask.h) {
             return Some(Quad {
                 corners,
@@ -1152,12 +1440,13 @@ pub(crate) mod tests {
     fn coded_border_two_sides_solves_from_tabs() {
         let (w, h) = (640, 480);
         let k1 = -0.1;
-        // The screen is about three frames wide; its top-left corner sits inside the frame.
+        // The screen is about twice the frame; its top-left corner sits inside the frame
+        // with roughly half of the top and left sides in view.
         let truth = [
             [120.0, 90.0],
-            [1700.0, 60.0],
-            [1750.0, 1100.0],
-            [80.0, 1150.0],
+            [1100.0, 70.0],
+            [1140.0, 760.0],
+            [90.0, 800.0],
         ];
         let h_si = quad_to_quad(&truth, &SCREEN_PERCENT);
         let img = synth_coded(w, h, &h_si, k1);

@@ -2330,14 +2330,17 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         if a.per_frame && a.lines {
             if let Some(f) = FitFrame::prepare(l, *w, *h, &params) {
                 let lens = Lens::centred(params.lens_k1, *w, *h);
-                let edges = edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, &params);
-                let (_, report) = solve(&edges, f.mask_w, f.mask_h);
+                let edges = edge_segments(&f.pts, &f.mask, &lens, &params);
+                let (_, report) = solve(&edges, f.mask.w, f.mask.h);
                 for side in Side::ALL {
                     let Some(sl) = &report.sides[side as usize] else {
                         continue;
                     };
                     println!(
-                        "    {side:?}: thickness {} tabs seen {} decoded {}",
+                        "    {side:?}: outer ({:.4},{:.4},{:.2}) thickness {} tabs seen {} decoded {}",
+                        sl.outer.a,
+                        sl.outer.b,
+                        sl.outer.c,
                         sl.thickness.map_or("?".into(), |t| format!("{t:.1}px")),
                         report.seen[side as usize].len(),
                         report.decoded[side as usize]
@@ -2351,13 +2354,37 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
                         );
                     }
                 }
-                for s in &edges.segments {
+                for (img, scr) in &report.points {
+                    println!(
+                        "    point ({:.2},{:.2}) -> ({:.2},{:.2})",
+                        img[0], img[1], scr[0], scr[1]
+                    );
+                }
+                for (i, s) in edges.segments.iter().enumerate() {
+                    let role = Side::ALL
+                        .iter()
+                        .find_map(|&sd| {
+                            let sl = report.sides[sd as usize]?;
+                            if sl.outer_seg == i {
+                                Some(format!("{sd:?} outer"))
+                            } else if sl.inner_seg == Some(i) {
+                                Some(format!("{sd:?} inner"))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let o = edges.outward[i];
+                    print!(
+                        "    [{i:>2}] dark side ({:+.2},{:+.2}) {role:<13}",
+                        o.a, o.b
+                    );
                     let (lo, hi) = s.inliers.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
                         let t = -s.line.b * p[0] + s.line.a * p[1];
                         (lo.min(t), hi.max(t))
                     });
                     println!(
-                        "    line n={:<4} rms={:.2} normal=({:+.3},{:+.3}) c={:8.2} span={:.0}px",
+                        " n={:<4} rms={:.2} normal=({:+.3},{:+.3}) c={:8.2} span={:.0}px",
                         s.inliers.len(),
                         s.rms,
                         s.line.a,

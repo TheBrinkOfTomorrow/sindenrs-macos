@@ -7,15 +7,16 @@
 //! outside the inlier band), then a golden-section search on the residual of those inliers
 //! refines the coefficient.
 
-use super::acquire::{decimate_threshold, edge_segments, label, pooled_boundary, AcquireParams};
+use super::acquire::{
+    decimate_threshold, edge_segments, label, pooled_boundary, AcquireParams, Mask,
+};
 use super::homography::P2;
 use super::lens::Lens;
 
 /// One frame reduced to what the fit needs: pooled boundary points at half resolution.
 pub struct FitFrame {
     pub pts: Vec<P2>,
-    pub mask_w: usize,
-    pub mask_h: usize,
+    pub mask: Mask,
     pub w: usize,
     pub h: usize,
 }
@@ -27,13 +28,7 @@ impl FitFrame {
         let mask = decimate_threshold(luma, w, h, p.threshold);
         let (labels, blobs) = label(&mask);
         let (pts, first) = pooled_boundary(&labels, mask.w, mask.h, &blobs, p.min_size as usize);
-        first.map(|_| Self {
-            pts,
-            mask_w: mask.w,
-            mask_h: mask.h,
-            w,
-            h,
-        })
+        first.map(|_| Self { pts, mask, w, h })
     }
 }
 
@@ -52,7 +47,7 @@ pub fn score(frames: &[FitFrame], k1: f64, p: &AcquireParams) -> Score {
     let mut sum_sq = 0.0;
     for f in frames {
         let lens = Lens::centred(k1, f.w, f.h);
-        for s in edge_segments(&f.pts, f.mask_w, f.mask_h, &lens, p).segments {
+        for s in edge_segments(&f.pts, &f.mask, &lens, p).segments {
             inliers += s.inliers.len();
             #[allow(clippy::cast_precision_loss)]
             {
