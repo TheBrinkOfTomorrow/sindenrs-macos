@@ -26,6 +26,12 @@ pub struct AcquireParams {
     pub line_tol: f64,
     /// Minimum boundary points supporting a line, in half-resolution pixels.
     pub line_min_points: usize,
+    /// Refit edge lines to sub-pixel luma crossings. Off by default: on the recordings it
+    /// solved slightly fewer frames and spiked more often than the mask lines, and made
+    /// no difference to hover jitter (which is the hand, not the fit).
+    pub subpixel_lines: bool,
+    /// Re-measure each tab's width from the luma profile through the tab bodies.
+    pub subpixel_tabs: bool,
 }
 
 impl Default for AcquireParams {
@@ -37,6 +43,8 @@ impl Default for AcquireParams {
             lens_k1: 0.0,
             line_tol: 3.0,
             line_min_points: 20,
+            subpixel_lines: false,
+            subpixel_tabs: true,
         }
     }
 }
@@ -428,7 +436,7 @@ pub fn pooled_boundary(
 }
 
 /// Undistorted full-resolution boundary points and the lines fitted through them.
-pub struct Edges {
+pub struct Edges<'a> {
     pub points: Vec<P2>,
     /// Per point: it was within a few pixels of the frame edge, so anything it belongs to
     /// may be cut off there.
@@ -441,9 +449,112 @@ pub struct Edges {
     /// point is bright.
     pub mask: Mask,
     pub lens: Lens,
+    /// The full-resolution luma frame, when the caller can lend it: sub-pixel edge and tab
+    /// measurements read it directly instead of the half-resolution mask.
+    pub luma: Option<&'a [u8]>,
+    pub w: usize,
+    pub h: usize,
+    pub subpixel_lines: bool,
+    pub subpixel_tabs: bool,
 }
 
-impl Edges {
+impl Edges<'_> {
+    /// Bilinear luma at an undistorted full-resolution point, or `None` outside the frame
+    /// or without a luma frame.
+    #[must_use]
+    pub fn sample(&self, p: P2) -> Option<f64> {
+        let luma = self.luma?;
+        let d = self.lens.distort(p);
+        if !(d[0] >= 0.0 && d[1] >= 0.0) {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x0, y0) = (d[0].floor() as usize, d[1].floor() as usize);
+        if x0 + 1 >= self.w || y0 + 1 >= self.h {
+            return None;
+        }
+        let (fx, fy) = (d[0] - d[0].floor(), d[1] - d[1].floor());
+        let at = |x: usize, y: usize| f64::from(luma[y * self.w + x]);
+        Some(
+            at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                + at(x0 + 1, y0) * fx * (1.0 - fy)
+                + at(x0, y0 + 1) * (1.0 - fx) * fy
+                + at(x0 + 1, y0 + 1) * fx * fy,
+        )
+    }
+
+    /// Is an undistorted point within a few pixels of the frame edge?
+    #[must_use]
+    pub fn near_frame_edge(&self, p: P2) -> bool {
+        let d = self.lens.distort(p);
+        #[allow(clippy::cast_precision_loss)]
+        let (w, h) = (self.w as f64, self.h as f64);
+        d[0] < 4.0 || d[1] < 4.0 || d[0] > w - 5.0 || d[1] > h - 5.0
+    }
+
+    /// Refit `line` (normal towards the dark side, through boundary pixel centres) to
+    /// sub-pixel edge positions: at points along `span` the luma profile across the edge
+    /// is read and the half-way crossing between the bright and dark levels located by
+    /// interpolation. `None` without luma or with too few clean crossings.
+    #[must_use]
+    pub fn refine_line(&self, line: &Line, span: (f64, f64), dir: f64) -> Option<Line> {
+        if !self.subpixel_lines {
+            return None;
+        }
+        self.luma?;
+        let mut pts: Vec<P2> = Vec::new();
+        let mut t = span.0;
+        while t <= span.1 {
+            let base = line.point_at(dir * t);
+            t += 3.0;
+            let prof: Option<Vec<f64>> = (-6..=6)
+                .map(|k| {
+                    let k = f64::from(k);
+                    self.sample([base[0] + line.a * k, base[1] + line.b * k])
+                })
+                .collect();
+            let Some(v) = prof else { continue };
+            let bright = v[..6].iter().copied().fold(f64::MIN, f64::max);
+            let dark = v[7..].iter().copied().fold(f64::MAX, f64::min);
+            if bright - dark < 30.0 {
+                continue;
+            }
+            let half = (bright + dark) / 2.0;
+            // First crossing below half, walking from the bright side out.
+            for k in 0..12 {
+                if v[k] >= half && v[k + 1] < half {
+                    let frac = (v[k] - half) / (v[k] - v[k + 1]);
+                    #[allow(clippy::cast_precision_loss)]
+                    let s = (k as f64 - 6.0) + frac;
+                    pts.push([base[0] + line.a * s, base[1] + line.b * s]);
+                    break;
+                }
+            }
+        }
+        if pts.len() < 8 {
+            return None;
+        }
+        let first = Line::fit(&pts)?;
+        let kept: Vec<P2> = pts
+            .iter()
+            .copied()
+            .filter(|p| first.signed_dist(*p).abs() <= 1.5)
+            .collect();
+        if kept.len() < 8 {
+            return None;
+        }
+        let fit = Line::fit(&kept)?;
+        // Keep the normal pointing the way the input's did.
+        Some(if fit.a * line.a + fit.b * line.b < 0.0 {
+            Line {
+                a: -fit.a,
+                b: -fit.b,
+                c: -fit.c,
+            }
+        } else {
+            fit
+        })
+    }
     /// Is the undistorted full-resolution point `p` on a bright mask pixel?
     #[must_use]
     pub fn bright_at(&self, p: P2) -> bool {
@@ -466,7 +577,13 @@ impl Edges {
 /// are discarded (they are where the border leaves the frame, not an edge of it); the rest
 /// are pushed to full resolution, undistorted, and handed to the line extractor.
 #[must_use]
-pub fn edge_segments(pts: &[P2], mask: &Mask, lens: &Lens, p: &AcquireParams) -> Edges {
+pub fn edge_segments<'a>(
+    pts: &[P2],
+    mask: &Mask,
+    lens: &Lens,
+    p: &AcquireParams,
+    luma: Option<&'a [u8]>,
+) -> Edges<'a> {
     #[allow(clippy::cast_precision_loss)]
     let (xe, ye) = ((mask.w - 1) as f64, (mask.h - 1) as f64);
     let kept: Vec<P2> = pts
@@ -535,6 +652,11 @@ pub fn edge_segments(pts: &[P2], mask: &Mask, lens: &Lens, p: &AcquireParams) ->
             bits: mask.bits.clone(),
         },
         lens: *lens,
+        luma,
+        w: mask.w * 2,
+        h: mask.h * 2,
+        subpixel_lines: p.subpixel_lines,
+        subpixel_tabs: p.subpixel_tabs,
     }
 }
 
@@ -763,13 +885,25 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 span = (span.0.min(a), span.1.max(a));
             }
         }
+        // Sub-pixel edges where the luma is available; otherwise the outer edge of a
+        // boundary pixel is one full-resolution pixel beyond its centre.
+        let refined_outer = edges.refine_line(&outer, span, dir);
+        let outer_line = refined_outer.unwrap_or_else(|| outer.offset(1.0));
+        let thickness = inner.map(|(m, d)| {
+            let inner_line = outward[m];
+            match (refined_outer, edges.refine_line(&inner_line, span, dir)) {
+                (Some(o), Some(i)) => {
+                    let mid = i.point_at(dir * (span.0 + span.1) / 2.0);
+                    (-o.signed_dist(mid)).max(2.0)
+                }
+                _ => d + 2.0,
+            }
+        });
         out[side as usize] = Some(SideLines {
-            // The outer edge of a boundary pixel is one full-resolution pixel beyond its
-            // centre.
-            outer: outer.offset(1.0),
+            outer: outer_line,
             outer_seg: outer_k,
             inner_seg: inner.map(|i| i.0),
-            thickness: inner.map(|i| i.1 + 2.0),
+            thickness,
             dir,
             span,
         });
@@ -871,7 +1005,80 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
         }
         i = j;
     }
+    if edges.subpixel_tabs && edges.luma.is_some() {
+        for tab in &mut out {
+            refine_tab(edges, side, t, tab);
+        }
+    }
     out
+}
+
+/// Re-measure a tab from the luma: a brightness profile along a line through the tab
+/// bodies, one and a half thicknesses inside the outer edge, thresholded half-way between
+/// the border's brightness and the interior, with both crossings interpolated. The
+/// cluster's centre and width stand if the profile is unusable.
+fn refine_tab(edges: &Edges, side: &SideLines, t: f64, tab: &mut SeenTab) {
+    let outer = &side.outer;
+    let step = 0.5;
+    let half_w = tab.width / 2.0 + 0.6 * t;
+    let (lo, hi) = (tab.along - half_w, tab.along + half_w);
+    let n = ((hi - lo) / step).floor().max(0.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let n = n as usize;
+    if n < 6 {
+        return;
+    }
+    let at = |i: usize, inward: f64| -> P2 {
+        #[allow(clippy::cast_precision_loss)]
+        let p = side.point_at(lo + i as f64 * step);
+        [p[0] - outer.a * inward, p[1] - outer.b * inward]
+    };
+    // Border brightness on the solid strip behind this tab; interior darkness beyond it.
+    let mid = n / 2;
+    let (Some(bright), Some(dark)) = (
+        edges.sample(at(mid, 0.5 * t)),
+        edges.sample(at(mid, 3.2 * t)),
+    ) else {
+        return;
+    };
+    if bright - dark < 30.0 {
+        return;
+    }
+    let half = (bright + dark) / 2.0;
+    let prof: Vec<Option<f64>> = (0..n).map(|i| edges.sample(at(i, 1.5 * t))).collect();
+    // The bright run containing the centre.
+    if !prof[mid].is_some_and(|v| v >= half) {
+        return;
+    }
+    let mut a = mid;
+    while a > 0 && prof[a - 1].is_some_and(|v| v >= half) {
+        a -= 1;
+    }
+    let mut b = mid;
+    while b + 1 < n && prof[b + 1].is_some_and(|v| v >= half) {
+        b += 1;
+    }
+    if a == 0 || b + 1 >= n {
+        // The run reaches the window's edge: not a clean tab here (or a cut-off one).
+        tab.partial = true;
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rise = match (prof[a - 1], prof[a]) {
+        (Some(p), Some(q)) if q > p => (a - 1) as f64 + (half - p) / (q - p),
+        _ => a as f64,
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let fall = match (prof[b], prof[b + 1]) {
+        (Some(p), Some(q)) if p > q => b as f64 + (p - half) / (p - q),
+        _ => (b + 1) as f64,
+    };
+    let width = (fall - rise) * step;
+    if width < 0.4 * t || width > 5.0 * t {
+        return;
+    }
+    tab.width = width;
+    tab.along = lo + (rise + fall) / 2.0 * step;
 }
 
 /// Constant by which thresholding fattens a measured tab width, in full-resolution pixels.
@@ -896,7 +1103,12 @@ pub struct Decoded {
 /// With `known` (the side and whether this edge reads against that side's direction,
 /// settled by the roll another edge revealed) runs of two symbols are placed as well.
 #[must_use]
-pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab], known: Option<(Side, bool)>) -> Decoded {
+pub fn decode_tabs(
+    lines: &SideLines,
+    seen: &[SeenTab],
+    known: Option<(Side, bool)>,
+    width_bias: f64,
+) -> Decoded {
     let mut out = Decoded::default();
     let Some(t) = lines.thickness else {
         return out;
@@ -948,7 +1160,7 @@ pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab], known: Option<(Side, boo
             }
         }
     }
-    let mut bias = WIDTH_BIAS_PX;
+    let mut bias = width_bias;
     if reads.len() >= 4 {
         let cost = |b: f64| {
             reads
@@ -960,8 +1172,8 @@ pub fn decode_tabs(lines: &SideLines, seen: &[SeenTab], known: Option<(Side, boo
                 .sum::<f64>()
         };
         let mut best = (cost(bias), bias);
-        let mut b = WIDTH_BIAS_PX - 2.0;
-        while b <= WIDTH_BIAS_PX + 2.0 {
+        let mut b = width_bias - 2.0;
+        while b <= width_bias + 2.0 {
             let c = cost(b);
             if c < best.0 {
                 best = (c, b);
@@ -1097,13 +1309,19 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     let guessed = sides;
     let mut sides: [Option<SideLines>; 4] = [None; 4];
     let mut decoded: [Vec<(P2, P2)>; 4] = Default::default();
+    // Widths from the luma profile are unbiased; mask clusters are fattened by thresholding.
+    let width_bias = if edges.luma.is_some() && edges.subpixel_tabs {
+        0.0
+    } else {
+        WIDTH_BIAS_PX
+    };
     let mut results: Vec<(Side, SideLines, Vec<SeenTab>, Decoded)> = Vec::new();
     for guess in Side::ALL {
         let Some(sl) = &guessed[guess as usize] else {
             continue;
         };
         let seen = find_tabs(edges, &guessed, sl);
-        let dec = decode_tabs(sl, &seen, None);
+        let dec = decode_tabs(sl, &seen, None, width_bias);
         results.push((guess, *sl, seen, dec));
     }
     // The decoded sides reveal the roll: how far each observed outward normal is turned
@@ -1141,7 +1359,7 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
                 let d = unroll([sl.dir * d[0], sl.dir * d[1]]);
                 let forward = if side.is_horizontal() { d[0] } else { d[1] };
                 // With side and direction settled, two tabs are enough to place.
-                dec = decode_tabs(&sl, &seen, Some((side, forward < 0.0)));
+                dec = decode_tabs(&sl, &seen, Some((side, forward < 0.0)), width_bias);
             }
         }
         // Two edges claiming one side: keep the one with tab evidence, else the first.
@@ -1302,7 +1520,7 @@ pub fn report(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Report {
     let (labels, blobs) = label(&mask);
     let lens = Lens::centred(p.lens_k1, w, h);
     let (pooled, _) = pooled_boundary(&labels, mask.w, mask.h, &blobs, p.min_size as usize);
-    let edges = edge_segments(&pooled, &mask, &lens, p);
+    let edges = edge_segments(&pooled, &mask, &lens, p, Some(luma));
     solve(&edges, mask.w, mask.h).1
 }
 
@@ -1314,7 +1532,7 @@ pub fn acquire(luma: &[u8], w: usize, h: usize, p: &AcquireParams) -> Option<Qua
     let min = p.min_size as usize;
     let (pooled, first) = pooled_boundary(&labels, mask.w, mask.h, &blobs, min);
     if let Some(blob) = first {
-        let edges = edge_segments(&pooled, &mask, &lens, p);
+        let edges = edge_segments(&pooled, &mask, &lens, p, Some(luma));
         if let (Some((corners, tabs)), report) = solve(&edges, mask.w, mask.h) {
             return Some(Quad {
                 corners,

@@ -99,6 +99,12 @@ struct ReplayArgs {
     /// With --per-frame: also print every fitted edge line (side, support, residual).
     #[arg(long)]
     lines: bool,
+    /// Skip the sub-pixel edge refit (A/B against the mask-only lines).
+    #[arg(long)]
+    no_subpixel_lines: bool,
+    /// Skip the luma re-measurement of tab widths.
+    #[arg(long)]
+    no_subpixel_tabs: bool,
 }
 
 #[derive(Subcommand)]
@@ -2254,6 +2260,8 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         threshold: a.threshold.unwrap_or(ctx.display.threshold),
         min_size: ctx.display.min_size,
         lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
+        subpixel_lines: !a.no_subpixel_lines,
+        subpixel_tabs: !a.no_subpixel_tabs,
         ..Default::default()
     };
     let mut files: Vec<PathBuf> = Vec::new();
@@ -2334,7 +2342,7 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
         if a.per_frame && a.lines {
             if let Some(f) = FitFrame::prepare(l, *w, *h, &params) {
                 let lens = Lens::centred(params.lens_k1, *w, *h);
-                let edges = edge_segments(&f.pts, &f.mask, &lens, &params);
+                let edges = edge_segments(&f.pts, &f.mask, &lens, &params, Some(l));
                 let (_, report) = solve(&edges, f.mask.w, f.mask.h);
                 if let Some(why) = report.refused {
                     println!("    refused: {why}");
