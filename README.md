@@ -351,6 +351,24 @@ support. Riguma2 solves 96% of frames, the bottom left 92%. The remaining jumpin
 0.5% to 2.5% frame-to-frame noise on two- and three-edge solves, which cleared the 1% gate
 of the hover smoother; a velocity-tracking filter replaces it and smooths weaker solves harder.
 
+**Seventh and eighth recordings (`corpus/riguma3`, `corpus/riguma4`).** The rolled hover at
+the bottom centre that looked wrong was the projected field of view: a one-side solve knows
+nothing about foreshortening across its side, so its far corners are a guess; the outline is
+now drawn only when two or more edges pinned the solve. Deliberate shots on riguma4 measured
+eight targets at 0.16% to 1.1% and the centre at 2.9%; the recording's raw aim (now saved
+beside the tracked one) cleared the tracker, which sits 0.1% from the raw aim when still and
+halves hover jitter. The centre shot saw only the bottom edge because the left border lay in
+a one-to-six-pixel strip at the frame's edge. Four solver changes came out of that recording:
+a lone inner edge (outer edge off the frame) is a side, with its correspondence on the inner
+line one thickness in; thickness comes from luma profiles across the edge at a low percentile,
+because the paired fits can converge along the span and the mask walk counts tabs; the
+two-side least-squares solve's degenerate answer (one edge mapped to nothing) is detected by a
+vanishing tab weight and replaced by the exact solve from two tabs per side; and partial solves
+are judged locally rather than by convexity, since a steep view puts part of the screen beyond
+the camera's horizon and the projected quad is legitimately a bow-tie. Riguma4 went from 83%
+to 98% solved, its top-centre region from 95% to 2% unusable and bottom-left from 69% to 0%;
+the earlier recordings sit at 98% too. Processing is 2 to 5 ms per frame.
+
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
 are no trigger or button events at all; with it on the gun sends `FE <state1> <state2> 96` on
