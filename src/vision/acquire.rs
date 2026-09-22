@@ -501,6 +501,49 @@ impl Edges<'_> {
         d[0] < 4.0 || d[1] < 4.0 || d[0] > w - 5.0 || d[1] > h - 5.0
     }
 
+    /// Border thickness from luma profiles across the edge at points along `span`: the
+    /// distance from the outer half-brightness crossing to the next crossing back below
+    /// half. Tabs lengthen the run where they sit, so the lower third of the samples is
+    /// taken. `None` without luma or with too few clean profiles.
+    #[must_use]
+    pub fn profile_thickness(&self, outer: &Line, dir: f64, span: (f64, f64)) -> Option<f64> {
+        self.luma?;
+        let mut runs = Vec::new();
+        let mut t = span.0;
+        while t <= span.1 {
+            let base = outer.point_at(dir * t);
+            t += 8.0;
+            // Inward is against the outward normal.
+            let prof: Option<Vec<f64>> = (0..90)
+                .map(|k| {
+                    let d = f64::from(k) * 0.5 - 3.0;
+                    self.sample([base[0] - outer.a * d, base[1] - outer.b * d])
+                })
+                .collect();
+            let Some(v) = prof else { continue };
+            let bright = v.iter().copied().fold(f64::MIN, f64::max);
+            let dark = v.iter().copied().fold(f64::MAX, f64::min);
+            if bright - dark < 30.0 {
+                continue;
+            }
+            let half = (bright + dark) / 2.0;
+            let up = v.iter().position(|&x| x >= half);
+            let Some(i0) = up else { continue };
+            let down = v[i0..].iter().position(|&x| x < half).map(|k| k + i0);
+            let Some(i1) = down else { continue };
+            #[allow(clippy::cast_precision_loss)]
+            let run = (i1 - i0) as f64 * 0.5;
+            if run >= 3.0 {
+                runs.push(run);
+            }
+        }
+        if runs.len() < 4 {
+            return None;
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(runs[runs.len() * 3 / 10])
+    }
+
     /// Refit `line` (normal towards the dark side, through boundary pixel centres) to
     /// sub-pixel edge positions: at points along `span` the luma profile across the edge
     /// is read and the half-way crossing between the bright and dark levels located by
@@ -692,6 +735,11 @@ pub struct SideLines {
     /// is a line correspondence of its own.
     pub inner: Option<Line>,
     pub tips: Option<Line>,
+    /// Only the inner edge was seen (the outer edge is off the frame): `outer` is that
+    /// edge pushed out by an estimated thickness and only approximate; `inner` is exact.
+    pub inner_only: bool,
+    /// The thickness walked from the mask, for diagnostics.
+    pub walked: Option<f64>,
 }
 
 impl SideLines {
@@ -706,6 +754,16 @@ impl SideLines {
     pub fn point_at(&self, t: f64) -> P2 {
         self.outer.point_at(self.dir * t)
     }
+}
+
+/// Median of `-l.signed_dist` over a segment's inliers: the distance of a roughly
+/// parallel segment from `l` on its bright side, robust to the two fits differing in
+/// tilt by a fraction of a degree, which over a long span moves any single sample by
+/// several pixels.
+fn median_inward(l: &Line, seg: &Segment) -> f64 {
+    let mut d: Vec<f64> = seg.inliers.iter().map(|p| -l.signed_dist(*p)).collect();
+    d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    d[d.len() / 2]
 }
 
 /// Assign fitted lines to sides.
@@ -788,8 +846,7 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 if l.cos_angle(o) < 0.985 || l.a * o.a + l.b * o.b > -0.9 {
                     return None;
                 }
-                let mid = segs[m].inliers[segs[m].inliers.len() / 2];
-                let d = -l.signed_dist(mid);
+                let d = median_inward(&l, &segs[m]);
                 (d > 3.0 && d < 80.0).then_some((m, d))
             })
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -809,8 +866,7 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                     if l.cos_angle(o) < 0.985 || l.a * o.a + l.b * o.b > -0.9 {
                         return None;
                     }
-                    let mid = segs[m].inliers[segs[m].inliers.len() / 2];
-                    let d = -l.signed_dist(mid);
+                    let d = median_inward(l, &segs[m]);
                     if !(d > 3.0 && d < 80.0) {
                         return None;
                     }
@@ -919,11 +975,20 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
         // from the outer edge. It overrides a partner that sits much further in (the line
         // the tab tips form, when the inner edge was not fitted or the strip test let it
         // through) and supplies a thickness when no inner line was found at all.
-        if let Some(walked) = walk_thickness(edges, &outer_line, dir, span) {
+        // The walk reads low where distortion is strong, so it only overrides a paired
+        // distance near twice its value: the tab-tip line taken for the inner edge.
+        let walked = walk_thickness(edges, &outer_line, dir, span);
+        if let Some(walked) = walked {
             match thickness {
-                Some(t) if t <= 1.6 * walked => {}
+                Some(t) if t <= 1.8 * walked => {}
                 _ => thickness = Some(walked),
             }
+        }
+        // The luma profile across the border is the direct measurement and beats both: the
+        // fitted lines can converge along the span (residual lens error near the frame's
+        // edges) and the mask walk is inflated by tabs.
+        if let Some(t) = edges.profile_thickness(&outer_line, dir, span) {
+            thickness = Some(t);
         }
         // The inner edge as a line, and the tab tips' line: parallel, on the bright side,
         // at about one and two thicknesses. Boundary pixel centres sit one pixel short of
@@ -944,8 +1009,7 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                     if outer.cos_angle(o) < 0.985 || outer.a * o.a + outer.b * o.b > -0.9 {
                         return None;
                     }
-                    let mid = segs[m].inliers[segs[m].inliers.len() / 2];
-                    let d = -outer_line.signed_dist(mid) + 1.0;
+                    let d = median_inward(&outer_line, &segs[m]) + 1.0;
                     (d > 1.5 * t && d < 2.7 * t).then_some((m, (d - 2.0 * t).abs()))
                 })
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -960,9 +1024,8 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
                 if used[m] || outward[m].cos_angle(&outer) < 0.985 {
                     continue;
                 }
-                let mid = segs[m].inliers[segs[m].inliers.len() / 2];
-                let d = -outer_line.signed_dist(mid);
-                if d > 0.0 && d < 3.2 * t {
+                let d = median_inward(&outer_line, &segs[m]);
+                if d > 0.0 && d < 4.0 * t {
                     used[m] = true;
                 }
             }
@@ -976,7 +1039,59 @@ pub fn classify_sides(edges: &Edges) -> [Option<SideLines>; 4] {
             span,
             inner: inner_line,
             tips: tips_line,
+            inner_only: false,
+            walked,
         });
+    }
+    // A lone edge whose dark side faces the centroid is an inner edge whose outer edge is
+    // off the frame: the border runs along the frame's edge, which the aim near the middle
+    // of the screen at close range makes common. It is a line at a known screen offset
+    // with tabs of its own; the outer edge is synthesised from the other sides' thickness
+    // for the tab band, while the inner edge itself carries the correspondence.
+    let mut ts: Vec<f64> = out.iter().flatten().filter_map(|s| s.thickness).collect();
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(&t) = ts.get(ts.len() / 2) {
+        for &k in &order {
+            if used[k] || outward[k].signed_dist(centroid) < 0.0 || segs[k].inliers.len() < 40 {
+                continue;
+            }
+            let l = outward[k];
+            let as_outer = Line {
+                a: -l.a,
+                b: -l.b,
+                c: -l.c,
+            };
+            let side = side_of(&as_outer);
+            if out[side as usize].is_some() {
+                continue;
+            }
+            // Boundary pixel centres sit a pixel on the bright side of the true edge.
+            let inner_true = as_outer.offset(-1.0);
+            let outer = inner_true.offset(t);
+            let d = outer.direction();
+            let forward = if side.is_horizontal() { d[0] } else { d[1] };
+            let dir = if forward >= 0.0 { 1.0 } else { -1.0 };
+            let span = segs[k]
+                .inliers
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                    let a = dir * outer.along(*p);
+                    (lo.min(a), hi.max(a))
+                });
+            used[k] = true;
+            out[side as usize] = Some(SideLines {
+                outer,
+                outer_seg: k,
+                inner_seg: Some(k),
+                thickness: Some(t),
+                dir,
+                span,
+                inner: Some(inner_true),
+                tips: None,
+                inner_only: true,
+                walked: None,
+            });
+        }
     }
     out
 }
@@ -1009,7 +1124,9 @@ fn walk_thickness(edges: &Edges, outer: &Line, dir: f64, span: (f64, f64)) -> Op
         return None;
     }
     runs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(runs[runs.len() / 2])
+    // Tabs cover more than half the length at their widest, so the median would land on a
+    // tab; the lower third does not.
+    Some(runs[runs.len() * 3 / 10])
 }
 
 /// The band of inward distances from a side's outer edge that its tab walls and tips
@@ -1097,7 +1214,7 @@ pub fn find_tabs(edges: &Edges, sides: &[Option<SideLines>; 4], side: &SideLines
         // are two mask pixels wide), hence the width correction.
         let width = cand[j - 1].0 - cand[i].0 + 2.0;
         let partial = cand[i..j].iter().any(|c| c.1);
-        if n >= 3 && width >= 0.5 * t && width <= 4.5 * t {
+        if n >= 3 && width >= 0.5 * t && width <= 6.0 * t {
             out.push(SeenTab {
                 along: (cand[i].0 + cand[j - 1].0) / 2.0,
                 width,
@@ -1175,7 +1292,7 @@ fn refine_tab(edges: &Edges, side: &SideLines, t: f64, tab: &mut SeenTab) {
         _ => (b + 1) as f64,
     };
     let width = (fall - rise) * step;
-    if width < 0.4 * t || width > 5.0 * t {
+    if width < 0.4 * t || width > 6.0 * t {
         return;
     }
     tab.width = width;
@@ -1485,7 +1602,22 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
         decoded[side as usize] = dec.points;
         report.seen[side as usize] = seen;
     }
+    let geometry = (edges.screen_aspect, edges.border_frac);
     for side in Side::ALL {
+        // An inner-only side's tab points belong on its exact inner edge, one thickness in
+        // on screen, not on the synthesised outer.
+        if let Some(sl) = sides[side as usize].filter(|s| s.inner_only) {
+            if let Some(inner) = sl.inner {
+                let (tx, ty) = screen_thickness(geometry.0, geometry.1);
+                let t_scr = if side.is_horizontal() { ty } else { tx };
+                let l = side.outer_line();
+                for (img, scr) in &mut decoded[side as usize] {
+                    let a = inner.along(*img);
+                    *img = inner.point_at(a);
+                    *scr = [scr[0] - l[0] * t_scr, scr[1] - l[1] * t_scr];
+                }
+            }
+        }
         report.decoded[side as usize] = decoded[side as usize].len();
         points.extend(decoded[side as usize].iter().copied());
     }
@@ -1493,7 +1625,6 @@ pub fn solve(edges: &Edges, mask_w: usize, mask_h: usize) -> (Option<([P2; 4], u
     let n_tabs = u8::try_from(points.len()).unwrap_or(u8::MAX);
     report.points.clone_from(&points);
     let per_side = report.decoded;
-    let geometry = (edges.screen_aspect, edges.border_frac);
     let mut corners = match solve_corners(&sides, &points, &per_side, geometry, mask_w, mask_h) {
         Ok(q) => Some(q),
         Err(why) => {
@@ -1546,7 +1677,8 @@ fn solve_corners(
     mask_h: usize,
 ) -> Result<[P2; 4], &'static str> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
-    if n_sides < 4 {
+    let any_inner_only = sides.iter().flatten().any(|s| s.inner_only);
+    if n_sides < 4 || any_inner_only {
         return solve_corners_dlt(sides, points, per_side, geometry, mask_w, mask_h);
     }
     let [top, right, bottom, left] = sides.map(|s| s.map(|s| s.outer));
@@ -1588,15 +1720,23 @@ fn solve_corners_dlt(
     mask_h: usize,
 ) -> Result<[P2; 4], &'static str> {
     let n_sides = sides.iter().filter(|s| s.is_some()).count();
+    let (tx, ty) = screen_thickness(geometry.0, geometry.1);
     let mut lines: Vec<(L3, L3)> = Side::ALL
         .iter()
         .filter_map(|&side| {
             sides[side as usize].map(|s| {
                 let sl = side.outer_line();
-                (line3(&s.outer), [sl[0], sl[1], -sl[2]])
+                match (s.inner_only, s.inner) {
+                    (true, Some(inner)) => {
+                        let t_scr = if side.is_horizontal() { ty } else { tx };
+                        (line3(&inner), [sl[0], sl[1], -(sl[2] - t_scr)])
+                    }
+                    _ => (line3(&s.outer), [sl[0], sl[1], -sl[2]]),
+                }
             })
         })
         .collect();
+    let minimum = if n_sides == 4 { 8 } else { 9 };
     // A single side, or two sides with a starved one, is short of constraints. The border
     // carries two more drawn lines per side, the inner edge and the tab tips, at one and
     // two thicknesses inward on screen; with a decoded side's tabs fixing the position
@@ -1630,16 +1770,16 @@ fn solve_corners_dlt(
     if n_sides == 1 {
         return solve_one_side(sides, points, per_side, geometry, mask_w, mask_h);
     }
-    if 2 * n_sides + points.len() < 9 || starved {
+
+    if 2 * n_sides + points.len() < minimum || starved {
         if points.len() < 3 {
             return Err("too few constraints");
         }
-        let (tx, ty) = screen_thickness(geometry.0, geometry.1);
         for side in Side::ALL {
             let Some(s) = &sides[side as usize] else {
                 continue;
             };
-            if per_side[side as usize] < 3 {
+            if per_side[side as usize] < 3 || s.inner_only {
                 continue;
             }
             let sl = side.outer_line();
@@ -1652,11 +1792,26 @@ fn solve_corners_dlt(
                 }
             }
         }
-        if 2 * lines.len() + points.len() < 9 {
+        if 2 * lines.len() + points.len() < minimum {
             return Err("too few constraints");
         }
     }
     let h = fit_dlt(points, &lines).ok_or("solve failed")?;
+    // The algebraic solve has a degenerate answer that maps one edge's points to nothing
+    // (zero projective weight), with zero residual on them; under noise it can win. It
+    // shows as a tab point whose weight is a small fraction of the centroid's. With two
+    // sides the exact solve from two tabs per side has no such answer.
+    // The centroid's weight is 1 by construction; the degenerate answer gives the killed
+    // edge's points weights of numerical-noise size, while a steep but valid perspective
+    // still leaves them well clear of zero.
+    let weight = |p: P2| h.0[2][0] * p[0] + h.0[2][1] * p[1] + h.0[2][2];
+    let degenerate = points.iter().any(|(img, _)| weight(*img).abs() < 1e-4);
+    if degenerate {
+        if n_sides == 2 && !starved && !sides.iter().flatten().any(|s| s.inner_only) {
+            return solve_two_sides(sides, points, per_side, mask_w, mask_h);
+        }
+        return Err("solve failed");
+    }
     let inv = h.adjugate();
     let mut q = [[0.0; 2]; 4];
     for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
@@ -1665,8 +1820,74 @@ fn solve_corners_dlt(
     // A partial view of a large screen puts the far corners many frame spans away, so
     // the far limit is loosened for partial solves; convexity and the tab consistency
     // check still stand.
-    let loose = sides.iter().filter(|s| s.is_some()).count() < 4;
-    sane_quad(q, mask_w, mask_h, loose)
+    let loose = sides.iter().filter(|s| s.is_some()).count() < 4
+        || sides.iter().flatten().any(|s| s.inner_only);
+    let checked = if loose {
+        sane_partial(&h, q, points, mask_w, mask_h)
+    } else {
+        sane_quad(q, mask_w, mask_h, false)
+    };
+    if checked.is_err() && n_sides == 2 && !starved && !sides.iter().flatten().any(|s| s.inner_only)
+    {
+        return solve_two_sides(sides, points, per_side, mask_w, mask_h);
+    }
+    checked
+}
+
+/// Two visible sides. The direct linear transform has a degenerate answer here that maps
+/// one edge to nothing, with zero residual on that edge's tabs, and under noise it can
+/// beat the true solution. The exact solve from two tabs on each side (the two farthest
+/// apart, for the longest baselines) has no such answer; the remaining tabs then check it.
+fn solve_two_sides(
+    sides: &[Option<SideLines>; 4],
+    points: &[(P2, P2)],
+    per_side: &[usize; 4],
+    mask_w: usize,
+    mask_h: usize,
+) -> Result<[P2; 4], &'static str> {
+    let mut src: Vec<P2> = Vec::new();
+    let mut dst: Vec<P2> = Vec::new();
+    for side in Side::ALL {
+        let Some(sl) = &sides[side as usize] else {
+            continue;
+        };
+        if per_side[side as usize] < 2 {
+            return Err("too few constraints");
+        }
+        // This side's correspondences: those whose image point lies on its outer line.
+        let mine: Vec<&(P2, P2)> = points
+            .iter()
+            .filter(|(img, _)| sl.outer.signed_dist(*img).abs() < 2.0)
+            .collect();
+        let (a, b) = mine
+            .iter()
+            .flat_map(|p| mine.iter().map(move |q| (p, q)))
+            .max_by(|(p, q), (r, s)| {
+                let d1 = (p.0[0] - q.0[0]).hypot(p.0[1] - q.0[1]);
+                let d2 = (r.0[0] - s.0[0]).hypot(r.0[1] - s.0[1]);
+                d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .ok_or("too few constraints")?;
+        src.push(a.0);
+        src.push(b.0);
+        dst.push(a.1);
+        dst.push(b.1);
+    }
+    if src.len() != 4 {
+        return Err("too few constraints");
+    }
+    // quad_to_quad wants a consistent winding; the two pairs are handed over as
+    // (first side a, b) then (second side a, b), which is a quad once the second pair is
+    // reversed.
+    let src_q = [src[0], src[1], src[3], src[2]];
+    let dst_q = [dst[0], dst[1], dst[3], dst[2]];
+    let h = quad_to_quad(&src_q, &dst_q);
+    let inv = h.adjugate();
+    let mut q = [[0.0; 2]; 4];
+    for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
+        *c = inv.apply(*s).ok_or("corner at infinity")?;
+    }
+    sane_partial(&h, q, points, mask_w, mask_h)
 }
 
 /// A single visible side. Its tabs fix the map along the edge (including the vanishing
@@ -1691,7 +1912,7 @@ fn solve_one_side(
         .find(|&sd| sides[sd as usize].is_some())
         .ok_or("no sides")?;
     let sl = sides[side as usize].ok_or("no sides")?;
-    if per_side[side as usize] < 3 || points.len() < 3 {
+    if per_side[side as usize] < 3 || points.len() < 3 || sl.inner_only {
         return Err("too few constraints");
     }
     let (tx, ty) = screen_thickness(geometry.0, geometry.1);
@@ -1736,7 +1957,52 @@ fn solve_one_side(
     for (c, s) in q.iter_mut().zip(SCREEN_PERCENT.iter()) {
         *c = inv.apply(*s).ok_or("corner at infinity")?;
     }
-    sane_quad(q, mask_w, mask_h, true)
+    sane_partial(&h, q, points, mask_w, mask_h)
+}
+
+/// Sanity for a partial solve, where the screen's far corners may lie beyond the camera's
+/// horizon and the projected quad is legitimately not convex: what must hold is local.
+/// Every tab point and the frame centre must be in front of the camera (positive
+/// projective weight), the map must not be mirrored at the frame centre, and the centre
+/// must land somewhere near the screen.
+fn sane_partial(
+    h: &Mat3,
+    q: [P2; 4],
+    points: &[(P2, P2)],
+    mask_w: usize,
+    mask_h: usize,
+) -> Result<[P2; 4], &'static str> {
+    let m = &h.0;
+    let weight = |p: P2| m[2][0] * p[0] + m[2][1] * p[1] + m[2][2];
+    #[allow(clippy::cast_precision_loss)]
+    let centre = [mask_w as f64, mask_h as f64];
+    // The homography's overall sign is arbitrary: what matters is that every point of
+    // interest has the same sign of weight as the frame centre.
+    let wc = weight(centre);
+    if wc == 0.0 || points.iter().any(|(img, _)| weight(*img) * wc <= 0.0) {
+        return Err("solve puts the view behind the camera");
+    }
+    // Orientation at the centre: the Jacobian's determinant must be positive, else the
+    // screen is mirrored, which no camera pose produces.
+    let f = |p: P2| h.apply(p);
+    let (Some(c0), Some(cx), Some(cy)) = (
+        f(centre),
+        f([centre[0] + 1.0, centre[1]]),
+        f([centre[0], centre[1] + 1.0]),
+    ) else {
+        return Err("corner at infinity");
+    };
+    let det = (cx[0] - c0[0]) * (cy[1] - c0[1]) - (cx[1] - c0[1]) * (cy[0] - c0[0]);
+    if det <= 0.0 {
+        return Err("solve is mirrored");
+    }
+    if !(-60.0..=160.0).contains(&c0[0]) || !(-60.0..=160.0).contains(&c0[1]) {
+        return Err("aim far off screen");
+    }
+    if q.iter().any(|c| !c[0].is_finite() || !c[1].is_finite()) {
+        return Err("corner not finite");
+    }
+    Ok(q)
 }
 
 fn sane_quad(
@@ -2160,7 +2426,23 @@ pub(crate) mod tests {
             let got = m.apply(cam).expect("finite");
             assert!(
                 (got[0] - s[0]).abs() < 1.5 && (got[1] - s[1]).abs() < 1.5,
-                "{s:?} -> {got:?}"
+                "{s:?} -> {got:?}; sides {:?} decoded {:?} seen {:?} points {:?}",
+                r.sides
+                    .iter()
+                    .map(|s| s.map(|s| (s.thickness, s.walked, s.inner_only)))
+                    .collect::<Vec<_>>(),
+                r.decoded,
+                r.seen
+                    .iter()
+                    .map(|v| v
+                        .iter()
+                        .map(|t| (t.along.round(), t.width.round(), t.partial))
+                        .collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                r.points
+                    .iter()
+                    .map(|(a, b)| ((a[0].round(), a[1].round()), (b[0], b[1])))
+                    .collect::<Vec<_>>()
             );
         }
     }

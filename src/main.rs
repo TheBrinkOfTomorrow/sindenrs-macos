@@ -2357,11 +2357,14 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
                         continue;
                     };
                     println!(
-                        "    {side:?}: outer ({:.4},{:.4},{:.2}) thickness {} tabs seen {} decoded {}",
+                        "    {side:?}: outer ({:.4},{:.4},{:.2}) thickness {} (walked {}, inner seg {:?}{}) tabs seen {} decoded {}",
                         sl.outer.a,
                         sl.outer.b,
                         sl.outer.c,
                         sl.thickness.map_or("?".into(), |t| format!("{t:.1}px")),
+                        sl.walked.map_or("?".into(), |t| format!("{t:.1}px")),
+                        sl.inner_seg,
+                        if sl.inner_only { ", inner only" } else { "" },
                         report.seen[side as usize].len(),
                         report.decoded[side as usize]
                     );
