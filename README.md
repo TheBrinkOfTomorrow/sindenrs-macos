@@ -333,7 +333,23 @@ line are drawn lines at known screen offsets (`display.aspect`, `display.border_
 and with the tabs fixing the position along the side they fix the direction across it. The
 last third of that session also shows the screen going bright for half-frames at a time, with
 one frame's whole background white behind the target: something other than the overlay was on
-the panel, and those frames are unsolvable by design.
+the panel, and those frames are unsolvable by design. That turned out to be the camera's USB
+link dropping data: the camera's sequence numbers show one frame in seven surviving by the
+end, and truncated frames decode with the missing part as flat grey. The tracker now treats a
+frame under 60% of the recent median size as corrupt and reports corrupt frames once a second.
+
+**Sixth recording (`corpus/riguma2`).** All nine targets measured, at 0.09% to 0.59% error,
+and no dropped frames. Half the bottom-left frames were lost to a gun rolled 90 degrees with
+one border in view edge-on: the border's own tab-tip line became a bogus opposite side and its
+corner exclusion erased the real tabs (anything parallel within three thicknesses inside an
+edge is now consumed as that side's own), and the one-side solve was underdetermined, since
+the constant tab pitch already fixes the vanishing point along the edge and the inner and tip
+lines then add one constraint each, not two. A lone side is now solved explicitly from its
+tabs and the inner edge's image distance against its known screen offset, which is the
+thickness cue after all, used only where nothing else exists and flagged as the weakest
+support. Riguma2 solves 96% of frames, the bottom left 92%. The remaining jumpiness was
+0.5% to 2.5% frame-to-frame noise on two- and three-edge solves, which cleared the 1% gate
+of the hover smoother; a velocity-tracking filter replaces it and smooths weaker solves harder.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
