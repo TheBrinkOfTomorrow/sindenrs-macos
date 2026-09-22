@@ -21,12 +21,15 @@ zune-jpeg = "0.5"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
 ctrlc = "3.5.2"
-winit = "0.30"
-softbuffer = "0.4"
 toml_edit = "0.25.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# The overlay window. x11rb's RustConnection and wayland-backend's Rust backend need no
+# libX11 / libwayland at all, so the binary loads no system libraries for the window.
+x11rb = { version = "0.13", features = ["shape", "randr"] }
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
 
 [dev-dependencies]
 
