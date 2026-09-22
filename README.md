@@ -171,7 +171,7 @@ sindenrs config init|show|path          # TOML config (see Configuration)
 sindenrs gun setup                      # apply the config's modes, button map and recoil to the gun
 sindenrs gun recoil test|auto|off       # on-demand recoil pulses (168), automatic recoil (169), or off
 sindenrs track [--send] [--threshold N] [--contrast N] [--record DIR]   # camera -> border -> aim -> gun
-sindenrs replay DIR... [--fit-lens] [--per-frame]                       # detection over recorded frames
+sindenrs replay DIR... [--fit-lens] [--per-frame [--lines]]             # detection over recorded frames
 sindenrs track --send --threshold 48 --contrast 50                     # what worked on the OLED
 sindenrs camera info                    # formats, frame rates, every control with its range
 sindenrs camera capture [--format mjpeg|yuyv] [--exposure N|auto] [--frames N] [--out DIR]
@@ -269,8 +269,23 @@ over line correspondences (two constraints each) and tab points (one each beyond
 two visible sides need four decoded tabs, three sides need two, four sides need none. Every
 result carries the decoded tab count, which also tells a Sinden border from any other bright
 rectangle; the calibration overlay shows the sides used, the tab count and the camera's field
-of view projected onto the screen. Tabs stay readable down to roughly nine pixels of border
-thickness in synthetic frames; how far that reaches on hardware is not yet measured.
+of view projected onto the screen.
+
+**First recording with the coded border (3694 frames, `aim-test --record`).** Tabs decode on
+92% of frames, at every distance the test covered. The first replay showed aim jumps of up to
+85% of the screen at regime changes, all from side classification: picking the outermost line
+from the boundary centroid fails whenever the ring does not enclose the centroid, so with
+three sides in view an inner edge became a confident, wrong fourth side. Edges are now
+oriented by which side of the line is bright, outer and inner edges are paired, the tabs (which
+sit only on the inner edge) say which is which, and an inner candidate must have a solid bright
+strip along its span so the line the tab tips form cannot pass for it. Decoding got stricter
+too: a width near a symbol boundary is uncertain and ends a run, a run needs the three symbols
+the code makes unique, two visible sides need two tabs each, and a solve that does not land
+its own tabs within 2% is refused. The worst remaining frame-to-frame spike is 2.9%, and the
+tracker holds back a frame that leaps on a weaker solve until the next frame confirms it. What
+is left is physical: the OLED caught mid-refresh draws one side a third as thick, and at the
+far end of the range a six-pixel border can have both edges fitted as one line; both show up
+as small spikes or a missed frame, not as a wrong cursor.
 
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
