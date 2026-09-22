@@ -323,6 +323,18 @@ measured wrong: dropping tab-less sides from partial solves lost the bottom-left
 a real side shows no tabs, and a tighter extrapolation limit did the same, because at close
 range a screen's far corners really are several frame widths away.
 
+**Fifth recording (`corpus/riguma`).** Targets 1 to 7 measured at 0.03% to 0.38% of screen
+error, and then target 8 could not be captured. Two causes, neither in the solver. The grid
+put the outer targets 10% from the edge, and the target ring, cross and number were drawn
+over the tab band (the outer 6% of the screen), so the bottom and top rows had their tabs
+corrupted by the overlay itself; the grid is now 15% in with a smaller ring. And at the bottom
+centre only the bottom edge is in view. A single side now solves: its inner edge and tab-tip
+line are drawn lines at known screen offsets (`display.aspect`, `display.border_thickness`),
+and with the tabs fixing the position along the side they fix the direction across it. The
+last third of that session also shows the screen going bright for half-frames at a time, with
+one frame's whole background white behind the target: something other than the overlay was on
+the panel, and those frames are unsolvable by design.
+
 **Button reports need command 50.** The gun sends nothing over serial until asked, and the
 command that asks is the one the vendor labels "secondary serial output". With it off there
 are no trigger or button events at all; with it on the gun sends `FE <state1> <state2> 96` on
