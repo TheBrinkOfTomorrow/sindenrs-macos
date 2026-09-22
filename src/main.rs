@@ -252,6 +252,9 @@ struct AimTestArgs {
     /// directory under the cache dir; pass `--debug-dir ""` to turn it off.
     #[arg(long)]
     debug_dir: Option<PathBuf>,
+    /// Save every frame (.jpg) and a frames.csv here while the test runs, for `replay`.
+    #[arg(long)]
+    record: Option<PathBuf>,
     /// Reject a capture whose samples disagree by more than this, in percent of screen.
     #[arg(long, default_value_t = 4.0)]
     steady_tolerance: f64,
@@ -2488,7 +2491,7 @@ fn aim_test(ctx: &Ctx, a: AimTestArgs) -> Result<()> {
         lens_k1: ctx.cfg.global.lens_k1,
         buffers: a.settings.buffers,
         frames: 0,
-        record: None,
+        record: a.record.clone(),
         per_frame: false,
         report_every: None,
     };
