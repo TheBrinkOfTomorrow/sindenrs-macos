@@ -261,7 +261,6 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     scene: Arc<Mutex<Scene>>,
     stop: Arc<AtomicBool>,
-    started: Instant,
 }
 
 impl App {
@@ -315,13 +314,12 @@ impl App {
             };
             c.cross(x, y, unit * 2, (unit / 4).max(2), colour);
             if is_current && !scene.done {
-                // A pulsing ring so the target you are meant to shoot is unmistakable.
-                let phase = (self.started.elapsed().as_secs_f64() * 2.5).sin().abs();
-                let r = unit * 3 + px(phase * unit as f64);
+                // A steady amber ring marks the target to shoot; red when a shot could not
+                // be measured. Colour, not motion, so it never fights the tracking light.
                 c.ring(
                     x,
                     y,
-                    r,
+                    unit * 3,
                     (unit / 3).max(2),
                     if flashing { RED } else { AMBER },
                 );
@@ -331,7 +329,14 @@ impl App {
                     thickness: (unit / 3).max(2),
                     colour: AMBER,
                 };
-                c.number(u32::try_from(i + 1).unwrap_or(0), x, y - unit * 8, g);
+                // The number sits to the right of the target, where every grid position
+                // has room; above it, the top row ran into the border.
+                c.number(
+                    u32::try_from(i + 1).unwrap_or(0),
+                    x + unit * 6,
+                    y - unit * 3 / 2,
+                    g,
+                );
             }
             if let Some(m) = measured {
                 // Draw the error as a vector from where you aimed to what the driver read,
@@ -368,11 +373,14 @@ impl App {
             Quality::Clipped => AMBER,
             Quality::Lost => RED,
         };
+        // The status panel sits along the bottom edge a quarter of the way across, between
+        // the bottom-left and bottom-centre targets of a grid.
+        let x0 = i64::from(w) / 4;
         let y0 = i64::from(h) - t * 2 - unit * 3;
-        c.rect(t * 2, y0, unit * 3, unit, q);
+        c.rect(x0, y0, unit * 3, unit, q);
         // Which sides the solve had: a small frame with one bar per fitted side.
         let (fx, fy, fw, fh, bar) = (
-            t * 2 + unit * 4,
+            x0 + unit * 4,
             y0 - unit,
             unit * 4,
             unit * 3,
@@ -491,7 +499,6 @@ pub fn run(scene: Arc<Mutex<Scene>>, stop: Arc<AtomicBool>) -> Result<()> {
         surface: None,
         scene,
         stop: stop.clone(),
-        started: Instant::now(),
     };
     let r = event_loop.run_app(&mut app).context("overlay event loop");
     stop.store(true, Ordering::Relaxed);
