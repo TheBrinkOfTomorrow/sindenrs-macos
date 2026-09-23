@@ -1,5 +1,7 @@
 // Phase 0 macOS check: capture 180 frames from the Sinden camera at 640x480 420v through
 // AVFoundation, report the frame rate, and save the last luma plane (default frame.pgm).
+// Args: [out.pgm] [seconds]; with seconds it streams that long, printing mean luma every
+// 30 frames (used to watch UVC control changes land mid-stream).
 // Build and launch it as an app bundle so it gets its own camera permission: ./probe-app.sh
 
 import AVFoundation
@@ -19,10 +21,22 @@ dev.activeVideoMaxFrameDuration = fmt.videoSupportedFrameRateRanges[0].minFrameD
 dev.unlockForConfiguration()
 final class D: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
   var n = 0; var t0 = Date(); let done = DispatchSemaphore(value: 0)
+  let total = CommandLine.arguments.count > 2 ? Int(Double(CommandLine.arguments[2])! * 60) : 180
   func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
     n += 1
     if n == 1 { t0 = Date() }
-    if n == 180 {
+    if n % 30 == 0 && n < total {
+      let pb = CMSampleBufferGetImageBuffer(sb)!
+      CVPixelBufferLockBaseAddress(pb, .readOnly)
+      let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0), bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+      let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!.assumingMemoryBound(to: UInt8.self)
+      var sum = 0
+      for y in stride(from: 0, to: h, by: 4) { for x in stride(from: 0, to: w, by: 4) { sum += Int(base[y*bpr+x]) } }
+      CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+      print(String(format: "%6.2fs luma %5.1f", Date().timeIntervalSince(t0), Double(sum) / Double((w/4)*(h/4))))
+      fflush(stdout)
+    }
+    if n == total {
       let pb = CMSampleBufferGetImageBuffer(sb)!
       CVPixelBufferLockBaseAddress(pb, .readOnly)
       let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0), bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
@@ -45,5 +59,5 @@ o.alwaysDiscardsLateVideoFrames = true
 let d = D(); o.setSampleBufferDelegate(d, queue: DispatchQueue(label: "cap"))
 s.addOutput(o)
 s.startRunning()
-if d.done.wait(timeout: .now() + 20) == .timedOut { print("timeout, frames:", d.n) }
+if d.done.wait(timeout: .now() + Double(d.total) / 60 + 15) == .timedOut { print("timeout, frames:", d.n) }
 s.stopRunning()

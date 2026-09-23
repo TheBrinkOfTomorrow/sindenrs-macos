@@ -64,3 +64,26 @@ Fix: wrap the binary in an app bundle that declares `NSCameraUsageDescription`, 
 and start it with `open` so LaunchServices makes it its own responsible process. It then gets its
 own entry and prompt. `tools/macos/probe-app.sh` does this for the capture probe; `sindenrs` will
 need the same treatment (a `.app` wrapper, or run from Terminal).
+
+## 2026-09-23 — Phase 1 spike: UVC exposure control (`tools/macos/uvcctl.c`)
+
+Plain UVC class requests (`DeviceRequest` on the default pipe via `IOUSBDeviceInterface`,
+without `USBDeviceOpen`, so nothing is seized) work alongside Apple's UVC driver while
+AVFoundation streams. **Risk #1 is retired.**
+
+- Descriptors: VideoControl interface 0, camera terminal id 1 (bmControls `0a 22 00`: AE mode,
+  exposure absolute, ...), processing unit id 3 (bmControls `7f 15`: brightness, contrast, hue,
+  saturation, sharpness, gamma, white balance; **no gain**). VideoStreaming interface 1, alts 0-8.
+- Ranges: AE mode default 8 (aperture priority), 1 = manual. Exposure absolute 19..5000
+  (100 µs units), default 39. Brightness 0..255 default 110. Contrast 0..127 default 32 (the
+  Linux default of 50 is in V4L2 units from the vendor's scale; check what it maps to).
+- Setting manual exposure before streaming survives AVFoundation starting the session.
+- Mid-stream, at 640x480 60 fps with the gun on a desk facing the screen, mean luma (1-in-16
+  sampled) settled within one 0.5 s report: 78 → 6.0, 1000 → 11.8, 19 → 0.2, auto → 15.6.
+  Frame rate stayed 58-60 fps. Exposure above one frame period (~167 units at 60 fps) is
+  clipped, hence 1000 only doubling.
+- At 78 the frame is black except the lit screen, a sharp-edged bright quad — the image the
+  border detector expects.
+
+For the Rust port: the same requests through IOKit from Rust (`io-kit-sys` or hand-written FFI),
+matched to the camera by its location ID.
