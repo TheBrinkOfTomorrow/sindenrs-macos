@@ -882,6 +882,7 @@ fn camera_for_port(port: &str) -> Result<PathBuf> {
     default_camera(None)
 }
 
+#[cfg(target_os = "linux")]
 fn camera(cmd: CameraCmd) -> Result<()> {
     use sindenrs::camera::v4l2::{control_name, Device};
 
