@@ -50,7 +50,7 @@ SMSC hub 0424:2512                    location 0x08340000
 - Open, authenticate (0.65 s), firmware 2.1, camera name `SindenCameraJ`, unique id
   `0942670342`: all work unchanged through the `serialport` crate.
 - Streaming positions at 60 Hz moves the macOS cursor through the gun's own HID mouse. No
-  driver, no extra permission. Button events over serial were not exercised yet.
+  driver, no extra permission. Buttons: see the section below.
 
 ### Camera permission (TCC)
 
@@ -87,3 +87,31 @@ AVFoundation streams. **Risk #1 is retired.**
 
 For the Rust port: the same requests through IOKit from Rust (`io-kit-sys` or hand-written FFI),
 matched to the camera by its location ID.
+
+## 2026-09-23 — Buttons, trigger, d-pad (`serial_probe --buttons`, `tools/macos/input_window.swift`)
+
+The probe sends the default button map (recoil off), holds the aim at screen centre, and prints
+button-bit changes with wall-clock times; the input window covers the main screen, draws a
+crosshair at the centre and logs every mouse, key and scroll event it gets plus
+`NSEvent.pressedMouseButtons`. Neither needs Input Monitoring: a window sees its own events.
+
+| Control     | Serial bit | macOS event (default map) |
+|-------------|------------|---------------------------|
+| trigger     | s1.0       | left mouse                |
+| pump        | s1.1       | right mouse               |
+| front left  | s1.2       | right mouse               |
+| front right | s1.3       | middle mouse (button 2)   |
+| rear left   | s1.4       | key `1`                   |
+| rear right  | s1.5       | key `5`                   |
+| d-pad up / down / left / right | s2.0 / s2.1 / s2.2 / s2.3 | arrow keys |
+
+- All ten controls report press and release over serial (`FE s1 s2 96`); a held trigger is one
+  down and one up, no repeats. The serial event arrives 10-25 ms *after* the HID event.
+- HID clicks land at the gun's aim, not at the visible cursor. The gun only sends a mouse report
+  when its position changes or a button does, so a constant aim leaves the cursor wherever the
+  trackpad put it, while clicks still go to the aim point (screen centre, `(1680, 945)` on this
+  3360x1890-point display). Irrelevant while tracking (the aim changes every frame), but an
+  earlier test window that did not cover the centre saw `pressedMouseButtons` change with no
+  click delivered, which looked like dropped clicks.
+- The HID report descriptor (from `ioreg`): report 2 keyboard, report 1 absolute mouse (5
+  buttons, X/Y 0..32767), report 3 joystick (32 buttons, throttle/rudder, two hats).
