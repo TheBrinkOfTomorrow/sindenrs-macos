@@ -56,7 +56,9 @@ hardware findings and the roadmap.
   `wayland.rs` (layer shell) behind the `Backend` trait, `artwork.rs` MAME artwork export.
   No main-thread requirement; `run` draws it from a worker.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
-- **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle
+- **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle; `src/discovery/macos.rs`
+  reads the IOKit registry (`locationID` rendered as `bus-port.port`, camera node = AVFoundation
+  `uniqueID`)
 - **src/vision/** — `homography.rs` (quad map plus a DLT over line and point
   correspondences), luma helpers, `lens.rs` division-model undistortion, `lines.rs` RANSAC
   line extraction, `code.rs` the coded-border tab layout (shared by overlay and detector),

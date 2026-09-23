@@ -115,3 +115,14 @@ crosshair at the centre and logs every mouse, key and scroll event it gets plus
   click delivered, which looked like dropped clicks.
 - The HID report descriptor (from `ioreg`): report 2 keyboard, report 1 absolute mouse (5
   buttons, X/Y 0..32767), report 3 joystick (32 buttons, throttle/rudder, two hats).
+
+## 2026-09-23 — Phase 1: discovery (`src/discovery/macos.rs`)
+
+IOKit registry walk over `IOUSBHostDevice` (VID, PID, `locationID`, product and serial strings);
+a gun's port is the `IOCalloutDevice` found by a recursive search below its device. `locationID`
+becomes a Linux-style path (`0x08342000` → `8-3.4.2`), so the existing `sibling_camera` pairing
+is reused as is; a camera's `node` is its AVFoundation `uniqueID`, computed from location, VID
+and PID (`0x834100032e49210`), which capture will open. No permissions needed.
+
+`sindenrs list` finds gun, port, camera and pairing, and connects; `debug gun-info` and every
+other command that selects a gun through discovery now work on macOS.

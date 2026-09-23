@@ -629,7 +629,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "core-foundation",
  "ctrlc",
+ "io-kit-sys",
  "libc",
  "serde",
  "serialport",
