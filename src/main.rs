@@ -1254,7 +1254,92 @@ fn run_capture(
     Ok(st)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: AVFoundation delivers decoded luma, so only `capture` applies; format, buffer and
+/// V4L2 control options are ignored (camera controls come with the UVC backend).
+#[cfg(target_os = "macos")]
+fn camera(cmd: CameraCmd) -> Result<()> {
+    use sindenrs::camera::avfoundation::Device;
+    use sindenrs::vision::luma;
+
+    let CameraCmd::Capture {
+        settings,
+        frames,
+        out,
+        save_every,
+        no_drain,
+        stall_ms,
+        per_frame,
+    } = cmd
+    else {
+        bail!("only `debug camera capture` is available on macOS so far");
+    };
+    let id = default_camera(settings.device.clone())?;
+    let dev = Device::open(&id).with_context(|| format!("opening camera {}", id.display()))?;
+    let mut stream = dev.start_stream(settings.width, settings.height)?;
+    let (w, h) = (stream.width(), stream.height());
+    if let Some(dir) = &out {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Time from the first frame, so session start-up does not count against the rate.
+    let mut start = Instant::now();
+    let (mut n, mut skipped, mut age_sum, mut age_max) =
+        (0u32, 0u64, Duration::ZERO, Duration::ZERO);
+    let mut luma_sum = 0.0;
+    while n < frames {
+        let Some(f) = stream.next(Some(Duration::from_secs(3)), !no_drain)? else {
+            warn!("frame timeout");
+            continue;
+        };
+        n += 1;
+        if n == 1 {
+            start = Instant::now();
+        }
+        skipped += u64::from(f.dropped);
+        let age = f.age().unwrap_or_default();
+        age_sum += age;
+        age_max = age_max.max(age);
+        #[allow(clippy::cast_precision_loss)]
+        let mean = f.data.iter().map(|&v| u64::from(v)).sum::<u64>() as f64 / f.data.len() as f64;
+        luma_sum += mean;
+        if per_frame {
+            println!(
+                "seq={:<6} age={} skipped={} luma={mean:.1}",
+                f.sequence,
+                fmt_ms(age),
+                f.dropped
+            );
+        }
+        if let Some(dir) = &out {
+            if save_every > 0 && n % save_every == 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                luma::write_pgm(
+                    &dir.join(format!("frame_{:06}.pgm", f.sequence)),
+                    w as u32,
+                    h as u32,
+                    f.data,
+                )?;
+            }
+        }
+        if stall_ms > 0 {
+            std::thread::sleep(Duration::from_millis(stall_ms));
+        }
+    }
+    let wall = start.elapsed();
+    println!(
+        "{n} frames {w}x{h} in {:.2}s = {:.2} fps (camera set to {:.1}); age mean {} max {}; \
+         skipped by drain {skipped}, dropped in capture {}; luma mean {:.1}",
+        wall.as_secs_f64(),
+        f64::from(n.saturating_sub(1)) / wall.as_secs_f64(),
+        stream.fps(),
+        fmt_ms(age_sum / n.max(1)),
+        fmt_ms(age_max),
+        stream.dropped(),
+        luma_sum / f64::from(n.max(1)),
+    );
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn camera(_cmd: CameraCmd) -> Result<()> {
     bail!("camera capture is not implemented on this platform yet")
 }

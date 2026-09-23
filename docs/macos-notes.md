@@ -126,3 +126,23 @@ and PID (`0x834100032e49210`), which capture will open. No permissions needed.
 
 `sindenrs list` finds gun, port, camera and pairing, and connects; `debug gun-info` and every
 other command that selects a gun through discovery now work on macOS.
+
+## 2026-09-23 — Phase 1: capture (`src/camera/avfoundation.rs`)
+
+`objc2` bindings: open the device by `uniqueID`, pick the `420v` 640x480 format and its fastest
+frame duration, set both while the device is locked after adding the input (so the session
+preset cannot override it), and deliver through an `AVCaptureVideoDataOutput` delegate on a
+serial dispatch queue. The callback copies plane 0 (stride removed) into a pooled buffer and
+sends it over a bounded channel; `Stream::next` drains to the newest frame like the V4L2 path.
+Timestamps are the sample's presentation time on the host clock, compared with host-clock now.
+
+`tools/macos/run-bundled.sh -- debug camera capture --frames 900 --out /abs/dir`:
+900 frames in 14.98 s = **60.03 fps**, 1 skipped by the drain, 1 dropped in capture.
+
+- **Frame age at dequeue is ~31 ms** (max 103 ms) against one frame period (16 ms) on Linux.
+  The extra ~15 ms is likely macOS's MJPEG decode and delivery, or a different presentation
+  timestamp origin. Open question: measure end to end (screen flash to detection) on both.
+- The camera keeps UVC settings across sessions: frames still came out at the exposure set by
+  `uvcctl` earlier.
+- Running from the Claude session needs the bundle (`run-bundled.sh`); arguments must be
+  absolute paths, since LaunchServices starts the app in `/`.
