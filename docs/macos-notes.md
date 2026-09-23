@@ -51,7 +51,13 @@ SMSC hub 0424:2512                    location 0x08340000
 
 ### Camera permission (TCC)
 
-Processes started from the Claude session are denied camera access silently (no prompt, even
-after granting the Claude app in System Settings, and even outside the sandbox). Run anything
-that captures from **Terminal.app**, which prompts normally. `sindenrs run` will need its own
-camera grant: from Terminal, or later as a signed app bundle with `NSCameraUsageDescription`.
+Camera access is granted per app, and macOS refuses it *without a prompt* to an app whose
+Info.plist has no `NSCameraUsageDescription`. A bare binary is judged as the app that launched
+it: from Terminal.app it prompts normally, but from the Claude desktop app (no usage
+description; it never shows up under Privacy & Security → Camera, and that pane has no + button
+on macOS 27) it is silently denied.
+
+Fix: wrap the binary in an app bundle that declares `NSCameraUsageDescription`, ad-hoc sign it,
+and start it with `open` so LaunchServices makes it its own responsible process. It then gets its
+own entry and prompt. `tools/macos/probe-app.sh` does this for the capture probe; `sindenrs` will
+need the same treatment (a `.app` wrapper, or run from Terminal).

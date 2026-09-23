@@ -1,6 +1,6 @@
 // Phase 0 macOS check: capture 180 frames from the Sinden camera at 640x480 420v through
-// AVFoundation, report the frame rate, and save the last luma plane as frame.pgm.
-// Run from Terminal.app (it needs camera permission): swiftc -O camera_grab.swift -o grab && ./grab
+// AVFoundation, report the frame rate, and save the last luma plane (default frame.pgm).
+// Build and launch it as an app bundle so it gets its own camera permission: ./probe-app.sh
 
 import AVFoundation
 import Foundation
@@ -30,7 +30,7 @@ final class D: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
       var out = Data("P5\n\(w) \(h)\n255\n".utf8); var sum = 0
       for y in 0..<h { for x in 0..<w { let v = base[y*bpr+x]; out.append(v); sum += Int(v) } }
       CVPixelBufferUnlockBaseAddress(pb, .readOnly)
-      try! out.write(to: URL(fileURLWithPath: "frame.pgm"))
+      try! out.write(to: URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "frame.pgm"))
       let dt = Date().timeIntervalSince(t0)
       print("frames: \(n) in \(String(format: "%.2f", dt))s = \(String(format: "%.1f", Double(n-1)/dt)) fps, \(w)x\(h) bpr=\(bpr) luma mean=\(sum/(w*h))")
       done.signal()
