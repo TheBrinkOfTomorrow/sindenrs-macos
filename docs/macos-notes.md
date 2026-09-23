@@ -41,6 +41,9 @@ SMSC hub 0424:2512                    location 0x08340000
 - `isExposureModeSupported(.custom)` is false, as expected for an external UVC camera. With the
   camera's auto exposure the screen is blown out to near white, so manual exposure over UVC
   (Phase 1 risk #1) is required, not optional.
+- Aimed at the screen, the frame shows it with upside-down text: the camera is mounted rotated
+  180°, as on Linux. A fully black frame (all zeros) just means the gun faces something dark;
+  black regions of normal frames are 0 too.
 
 ### Serial / HID (`examples/serial_probe.rs`)
 
