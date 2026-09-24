@@ -1,6 +1,7 @@
 //! macOS menu bar control for `run`: a status item (crosshair icon) whose menu shows each
-//! gun's status and offers Show Border and Quit, and a global ⌃⌥⌘Q that quits from anywhere,
-//! games included. Quitting sets the same stop flag as Ctrl-C, so `run` shuts down cleanly.
+//! gun's status and offers Show Border and Quit, and global shortcuts that work from anywhere,
+//! games included: ⌥B shows or hides the border (like Alt-B in the vendor's Windows software)
+//! and ⌃⌥⌘Q quits. Quitting sets the same stop flag as Ctrl-C, so `run` shuts down cleanly.
 //!
 //! The hotkey uses Carbon's `RegisterEventHotKey`, which needs no Accessibility or Input
 //! Monitoring permission (unlike an `NSEvent` global monitor). Both it and the menu are
@@ -49,11 +50,15 @@ mod carbon {
     /// `kEventClassKeyboard` ('keyb') and `kEventHotKeyPressed`.
     pub const KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
     pub const HOT_KEY_PRESSED: u32 = 5;
-    /// Modifier bits (`cmdKey`, `optionKey`, `controlKey`) and `kVK_ANSI_Q`.
+    /// `kEventParamDirectObject` ('----') and `typeEventHotKeyID` ('hkid'): which hot key fired.
+    pub const DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
+    pub const HOT_KEY_ID_TYPE: u32 = u32::from_be_bytes(*b"hkid");
+    /// Modifier bits (`cmdKey`, `optionKey`, `controlKey`) and `kVK_ANSI_Q`, `kVK_ANSI_B`.
     pub const CMD: u32 = 1 << 8;
     pub const OPTION: u32 = 1 << 11;
     pub const CONTROL: u32 = 1 << 12;
     pub const KEY_Q: u32 = 0x0c;
+    pub const KEY_B: u32 = 0x0b;
 
     #[link(name = "Carbon", kind = "framework")]
     extern "C" {
@@ -76,15 +81,87 @@ mod carbon {
             out: *mut *mut c_void,
         ) -> i32;
         pub fn UnregisterEventHotKey(hot_key: *mut c_void) -> i32;
+        pub fn GetEventParameter(
+            event: *mut c_void,
+            name: u32,
+            desired_type: u32,
+            actual_type: *mut u32,
+            buffer_size: usize,
+            actual_size: *mut usize,
+            data: *mut c_void,
+        ) -> i32;
     }
 }
 
-/// The hot key fired: set the stop flag `user` points at.
-extern "C" fn on_hot_key(_call: *mut c_void, _event: *mut c_void, user: *mut c_void) -> i32 {
-    // SAFETY: `user` is the `AtomicBool` of the `Arc` that `MenuBar` keeps alive for as long
-    // as the handler is installed.
-    unsafe { (*user.cast::<AtomicBool>()).store(true, Ordering::Relaxed) };
+/// Hot key ids, as registered below.
+const QUIT: u32 = 1;
+const TOGGLE_BORDER: u32 = 2;
+
+/// What the hot keys act on; boxed so the handler can hold a stable pointer to it.
+struct HotKeys {
+    stop: Arc<AtomicBool>,
+    scene: Arc<Mutex<Scene>>,
+}
+
+/// A hot key fired: find out which, and act on the `HotKeys` that `user` points at.
+extern "C" fn on_hot_key(_call: *mut c_void, event: *mut c_void, user: *mut c_void) -> i32 {
+    let mut id = carbon::EventHotKeyID {
+        signature: 0,
+        id: 0,
+    };
+    // SAFETY: `event` is the hot key event Carbon passes us, and `id` is an `EventHotKeyID`
+    // sized buffer; `user` is the `HotKeys` that `MenuBar` keeps boxed for as long as the
+    // handler is installed.
+    unsafe {
+        let st = carbon::GetEventParameter(
+            event,
+            carbon::DIRECT_OBJECT,
+            carbon::HOT_KEY_ID_TYPE,
+            ptr::null_mut(),
+            std::mem::size_of::<carbon::EventHotKeyID>(),
+            ptr::null_mut(),
+            ptr::addr_of_mut!(id).cast(),
+        );
+        if st != 0 {
+            return st;
+        }
+        let keys = &*user.cast::<HotKeys>();
+        match id.id {
+            QUIT => keys.stop.store(true, Ordering::Relaxed),
+            TOGGLE_BORDER => {
+                if let Ok(mut s) = keys.scene.lock() {
+                    s.hidden = !s.hidden;
+                }
+            }
+            _ => {}
+        }
+    }
     0
+}
+
+/// Register one global hot key, logging (not failing) if another app already owns it.
+fn register(key: u32, modifiers: u32, id: u32, target: *mut c_void, name: &str) -> *mut c_void {
+    let mut out = ptr::null_mut();
+    // SAFETY: plain values and an out pointer for the ref.
+    let st = unsafe {
+        carbon::RegisterEventHotKey(
+            key,
+            modifiers,
+            carbon::EventHotKeyID {
+                signature: u32::from_be_bytes(*b"Sndn"),
+                id,
+            },
+            target,
+            0,
+            &mut out,
+        )
+    };
+    if st != 0 {
+        tracing::warn!(
+            "{name} unavailable (taken by another app?): RegisterEventHotKey returned {st}"
+        );
+    }
+    out
 }
 
 struct TargetIvars {
@@ -176,7 +253,8 @@ impl Target {
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         if iv.overlay {
-            let border = self.item("Show Border", Some(sel!(toggleBorder:)), "");
+            let border = self.item("Show Border", Some(sel!(toggleBorder:)), "b");
+            border.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
             let hidden = iv.scene.lock().map(|s| s.hidden).unwrap_or(false);
             border.setState(if hidden {
                 NSControlStateValueOff
@@ -196,20 +274,21 @@ impl Target {
     }
 }
 
-/// The status item, its menu and the global shortcut; removed on drop.
+/// The status item, its menu and the global shortcuts; removed on drop.
 pub struct MenuBar {
     item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     _target: Retained<Target>,
-    hot_key: *mut c_void,
+    hot_keys: Vec<*mut c_void>,
     handler: *mut c_void,
-    stop: Arc<AtomicBool>,
+    /// Kept alive (and in place) for the handler until it is removed.
+    keys: Box<HotKeys>,
 }
 
 impl MenuBar {
-    /// Install the menu bar item and ⌃⌥⌘Q. `status` holds one line per gun, written by the
-    /// gun supervisor; `overlay` says whether there is a border to show or hide. Must be
-    /// called on the main thread.
+    /// Install the menu bar item, ⌥B (border on/off, with an overlay) and ⌃⌥⌘Q (quit).
+    /// `status` holds one line per gun, written by the gun supervisor; `overlay` says whether
+    /// there is a border to show or hide. Must be called on the main thread.
     pub fn install(
         stop: Arc<AtomicBool>,
         scene: Arc<Mutex<Scene>>,
@@ -221,10 +300,14 @@ impl MenuBar {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+        let keys = Box::new(HotKeys {
+            stop: stop.clone(),
+            scene: scene.clone(),
+        });
         let target = Target::new(
             mtm,
             TargetIvars {
-                stop: stop.clone(),
+                stop,
                 scene,
                 status,
                 overlay,
@@ -250,14 +333,15 @@ impl MenuBar {
         }
         item.setMenu(Some(&menu));
 
-        let (mut handler, mut hot_key) = (ptr::null_mut(), ptr::null_mut());
+        let mut handler = ptr::null_mut();
+        let mut hot_keys = Vec::new();
         let types = [carbon::EventTypeSpec {
             event_class: carbon::KEYBOARD,
             event_kind: carbon::HOT_KEY_PRESSED,
         }];
         // SAFETY: the application event target, a handler with the C signature Carbon
-        // expects, and user data (the stop flag) that `MenuBar` keeps alive until it removes
-        // the handler in `drop`.
+        // expects, and user data (the boxed `HotKeys`) that `MenuBar` keeps alive, unmoved,
+        // until it removes the handler in `drop`.
         unsafe {
             let target = carbon::GetApplicationEventTarget();
             let st = carbon::InstallEventHandler(
@@ -265,52 +349,56 @@ impl MenuBar {
                 on_hot_key,
                 types.len(),
                 types.as_ptr(),
-                Arc::as_ptr(&stop).cast_mut().cast(),
+                ptr::from_ref::<HotKeys>(&keys).cast_mut().cast(),
                 &mut handler,
             );
-            if st != 0 {
-                tracing::warn!("⌃⌥⌘Q unavailable: InstallEventHandler returned {st}");
-            } else {
-                let st = carbon::RegisterEventHotKey(
+            if st == 0 {
+                hot_keys.push(register(
                     carbon::KEY_Q,
                     carbon::CONTROL | carbon::OPTION | carbon::CMD,
-                    carbon::EventHotKeyID {
-                        signature: u32::from_be_bytes(*b"Sndn"),
-                        id: 1,
-                    },
+                    QUIT,
                     target,
-                    0,
-                    &mut hot_key,
-                );
-                if st != 0 {
-                    tracing::warn!("⌃⌥⌘Q unavailable (taken by another app?): RegisterEventHotKey returned {st}");
+                    "⌃⌥⌘Q",
+                ));
+                if overlay {
+                    hot_keys.push(register(
+                        carbon::KEY_B,
+                        carbon::OPTION,
+                        TOGGLE_BORDER,
+                        target,
+                        "⌥B",
+                    ));
                 }
+            } else {
+                tracing::warn!("shortcuts unavailable: InstallEventHandler returned {st}");
             }
         }
         Ok(Self {
             item,
             _menu: menu,
             _target: target,
-            hot_key,
+            hot_keys,
             handler,
-            stop,
+            keys,
         })
     }
 }
 
 impl Drop for MenuBar {
     fn drop(&mut self) {
-        // SAFETY: refs we registered, released once; the stop flag stays alive until after.
+        // SAFETY: refs we registered, released once; `keys` stays alive until after.
         unsafe {
-            if !self.hot_key.is_null() {
-                carbon::UnregisterEventHotKey(self.hot_key);
+            for &k in &self.hot_keys {
+                if !k.is_null() {
+                    carbon::UnregisterEventHotKey(k);
+                }
             }
             if !self.handler.is_null() {
                 carbon::RemoveEventHandler(self.handler);
             }
         }
         NSStatusBar::systemStatusBar().removeStatusItem(&self.item);
-        let _ = &self.stop;
+        let _ = &self.keys;
     }
 }
 
