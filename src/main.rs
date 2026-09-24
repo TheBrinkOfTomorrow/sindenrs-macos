@@ -2774,7 +2774,7 @@ fn flip_from_config(f: sindenrs::config::Flip) -> sindenrs::vision::acquire::Fli
 }
 
 /// Short tag for a frame's tracking quality, used in debug capture filenames.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn quality_tag(q: sindenrs::overlay::Quality) -> &'static str {
     use sindenrs::overlay::Quality;
     match q {
@@ -2798,7 +2798,7 @@ struct AimResult {
     events: std::collections::BTreeMap<String, u32>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_lines)]
 fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     use sindenrs::overlay::{Quality, Scene};
@@ -3241,7 +3241,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn calibrate(_ctx: &Ctx, _a: CalibrateArgs) -> Result<()> {
     bail!("calibrate needs the camera backend, which is not implemented on this platform yet")
 }

@@ -271,3 +271,33 @@ unchanged); Linux keeps the overlay on its own thread.
   border stays on top and the gun still drives the cursor.
 - Not yet tried: the emulators' own full-screen modes (Metal, possibly exclusive), Phase 2's
   remaining risk.
+
+## 2026-09-24 — Phase 2: `calibrate` on macOS
+
+`calibrate` already runs the tracker on a worker and the overlay on the calling (main) thread,
+so enabling it on macOS was only removing the Linux gates. First run, 3x3 grid, trigger
+capture, `--no-save` (nothing written to the gun), bore from EEPROM (+3.29%, +0.69%):
+
+| target | want | got | err |
+|--------|------|-----|-----|
+| 1 | 15,15 | 29.8,88.5 | 75.0% (aimed at the wrong spot, see below) |
+| 2 | 50,15 | 49.7,15.9 | 0.99% |
+| 3 | 85,15 | 85.0,13.4 | 1.60% |
+| 4 | 15,50 | 17.7,52.7 | 3.78% (three clipped retries first) |
+| 5 | 50,50 | 49.2,48.9 | 1.32% |
+| 6 | 85,50 | 85.0,49.6 | 0.38% |
+| 7 | 15,85 | 15.4,84.8 | 0.45% |
+| 8 | 50,85 | 49.6,85.2 | 0.47% |
+| 9 | 85,85 | 85.2,85.7 | 0.76% |
+
+Without target 1 the mean error is ~1.2% of the screen, most targets under 1%: the first real
+accuracy figure. 97% of frames tracked; 27% had the border clipped at the frame edge (stand
+further back). The run's suggested bore (+2.01%, -3.87%, agreement ±2.97 / ±12.40) is
+distorted by target 1 and was not saved.
+
+The user reports aiming at the wrong spot for one target. Target 1's reading (lower left of the
+screen) and its shot frame (the whole border in view, offset as when aiming low-left) fit that,
+so it is an aiming slip, not a tracking fault. One detail to watch: replaying that single shot
+frame gives "refused: solve disagrees with its own tabs" (hull only), while the frames around
+it solved; bright clutter sits just outside one edge there. Frames kept in
+`corpus/macos-calibrate-2026-09-24/` (local).
