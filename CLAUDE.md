@@ -58,6 +58,8 @@ hardware findings and the roadmap.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/camera/avfoundation.rs** — macOS capture (objc2): `420v` luma by `uniqueID`, pooled
   frames over a channel. Camera access needs its own app bundle: `tools/macos/run-bundled.sh`
+- **src/camera/uvc.rs** — UVC controls as raw class requests (topology parse, V4L2 CID → UVC
+  selector map; pure, tested); `uvc/iokit.rs` sends them on macOS via the IOKit USB user client
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle; `src/discovery/macos.rs`
   reads the IOKit registry (`locationID` rendered as `bus-port.port`, camera node = AVFoundation
   `uniqueID`)

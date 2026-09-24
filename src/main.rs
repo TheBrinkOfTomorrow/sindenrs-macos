@@ -1254,26 +1254,91 @@ fn run_capture(
     Ok(st)
 }
 
-/// macOS: AVFoundation delivers decoded luma, so only `capture` applies; format, buffer and
-/// V4L2 control options are ignored (camera controls come with the UVC backend).
+/// macOS: AVFoundation delivers decoded luma and the UVC controls go over IOKit, so `info` lists
+/// controls and `capture` applies them; format, frame rate and buffer options do not apply.
 #[cfg(target_os = "macos")]
 fn camera(cmd: CameraCmd) -> Result<()> {
     use sindenrs::camera::avfoundation::Device;
+    use sindenrs::camera::uvc::{self, iokit::Controls};
     use sindenrs::vision::luma;
 
-    let CameraCmd::Capture {
-        settings,
-        frames,
-        out,
-        save_every,
-        no_drain,
-        stall_ms,
-        per_frame,
-    } = cmd
-    else {
-        bail!("only `debug camera capture` is available on macOS so far");
+    let open_controls = |id: &Path| {
+        Controls::open(id).with_context(|| format!("opening camera controls of {}", id.display()))
+    };
+    let (settings, frames, out, save_every, no_drain, stall_ms, per_frame) = match cmd {
+        CameraCmd::Info { device } => {
+            let id = default_camera(device)?;
+            let ctl = open_controls(&id)?;
+            let t = ctl.topology();
+            println!(
+                "{}: VideoControl interface {}, camera terminal {} (controls {:#x}), processing unit {} (controls {:#x})",
+                id.display(),
+                t.interface,
+                t.camera_terminal,
+                t.ct_controls,
+                t.processing_unit,
+                t.pu_controls
+            );
+            println!("controls (raw UVC values; exposure_auto shown as the V4L2 menu value):");
+            for (cid, name) in uvc::CONTROLS {
+                // On/off controls (the automatic modes) have no range in UVC.
+                match (ctl.get_control(cid), ctl.range(cid)) {
+                    (Err(e), _) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                    (Err(e), _) => println!("  {name:<28} {cid:#010x} error: {e}"),
+                    (Ok(v), Ok((min, max, step, def))) => println!(
+                        "  {name:<28} {cid:#010x} min={min} max={max} step={step} default={def} value={v}"
+                    ),
+                    (Ok(v), Err(_)) => println!("  {name:<28} {cid:#010x} value={v}"),
+                }
+            }
+            return Ok(());
+        }
+        CameraCmd::Capture {
+            settings,
+            frames,
+            out,
+            save_every,
+            no_drain,
+            stall_ms,
+            per_frame,
+        } => (
+            settings, frames, out, save_every, no_drain, stall_ms, per_frame,
+        ),
+        CameraCmd::SweepExposure { .. } => {
+            bail!("`debug camera sweep-exposure` is not available on macOS yet")
+        }
     };
     let id = default_camera(settings.device.clone())?;
+    let ctl = open_controls(&id)?;
+    match settings.exposure.as_deref() {
+        None => {}
+        Some("auto" | "A" | "a") => ctl.set_auto_exposure()?,
+        Some(v) => {
+            let v: i32 = v.parse().with_context(|| format!("bad --exposure {v:?}"))?;
+            ctl.set_manual_exposure(v)?;
+        }
+    }
+    for (cid, val, name) in [
+        (cid::BRIGHTNESS, settings.brightness, "brightness"),
+        (cid::CONTRAST, settings.contrast, "contrast"),
+        (cid::GAIN, settings.gain, "gain"),
+        (cid::GAMMA, settings.gamma, "gamma"),
+        (cid::SHARPNESS, settings.sharpness, "sharpness"),
+    ] {
+        if let Some(v) = val {
+            ctl.set_control(cid, v)
+                .with_context(|| format!("setting {name}={v}"))?;
+        }
+    }
+    if let (Ok(auto), Ok(exp)) = (
+        ctl.get_control(cid::EXPOSURE_AUTO),
+        ctl.get_control(cid::EXPOSURE_ABSOLUTE),
+    ) {
+        info!(
+            "exposure: auto={auto} absolute={exp} (x100 µs = {:.1} ms)",
+            f64::from(exp) / 10.0
+        );
+    }
     let dev = Device::open(&id).with_context(|| format!("opening camera {}", id.display()))?;
     let mut stream = dev.start_stream(settings.width, settings.height)?;
     let (w, h) = (stream.width(), stream.height());

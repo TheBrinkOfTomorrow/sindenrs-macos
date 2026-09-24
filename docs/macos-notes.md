@@ -75,8 +75,8 @@ AVFoundation streams. **Risk #1 is retired.**
   exposure absolute, ...), processing unit id 3 (bmControls `7f 15`: brightness, contrast, hue,
   saturation, sharpness, gamma, white balance; **no gain**). VideoStreaming interface 1, alts 0-8.
 - Ranges: AE mode default 8 (aperture priority), 1 = manual. Exposure absolute 19..5000
-  (100 µs units), default 39. Brightness 0..255 default 110. Contrast 0..127 default 32 (the
-  Linux default of 50 is in V4L2 units from the vendor's scale; check what it maps to).
+  (100 µs units), default 39. Brightness 0..255 default 110. Contrast 0..127 default 32. uvcvideo passes these
+  controls through unscaled, so the Linux default of 50 means the same raw value here.
 - Setting manual exposure before streaming survives AVFoundation starting the session.
 - Mid-stream, at 640x480 60 fps with the gun on a desk facing the screen, mean luma (1-in-16
   sampled) settled within one 0.5 s report: 78 → 6.0, 1000 → 11.8, 19 → 0.2, auto → 15.6.
@@ -146,3 +146,24 @@ Timestamps are the sample's presentation time on the host clock, compared with h
   `uvcctl` earlier.
 - Running from the Claude session needs the bundle (`run-bundled.sh`); arguments must be
   absolute paths, since LaunchServices starts the app in `/`.
+
+## 2026-09-24 — Phase 1: camera controls (`src/camera/uvc.rs`, `src/camera/uvc/iokit.rs`)
+
+`uvc.rs` is platform-neutral and unit tested: VideoControl topology from the configuration
+descriptor (interface, camera terminal, processing unit, their `bmControls`), and V4L2 control
+IDs mapped to UVC selectors, sizes and support bits, with the exposure-mode menu translated
+(V4L2 1 manual / 3 aperture priority ↔ UVC 1 / 8). `iokit.rs` is the macOS transport: a
+hand-declared `IOUSBDeviceStruct100` vtable up to `DeviceRequest` (no Rust bindings exist),
+opened through the USB user-client plug-in on the camera found by its `uniqueID`'s location.
+It offers the same `get_control` / `set_control` / `set_manual_exposure` / `set_auto_exposure`
+as the V4L2 device.
+
+- `sindenrs debug camera info` lists every control with range and value (no camera permission
+  needed; it only talks IOKit). Auto white balance has no GET_MIN/MAX (on/off controls do
+  not, per UVC), so only its value is shown.
+- `debug camera capture --exposure {auto,78,19} --contrast 50`, 180 frames each:
+  mean luma 22.1 / 17.8 / 5.0, all at 60.0-60.3 fps; the camera reads back manual 78 and 19,
+  and contrast 50.
+- The first bundled run after this rebuild sat in the camera-permission prompt until it was
+  answered (earlier rebuilds had not re-prompted). An ad-hoc signature changes with every
+  build, and TCC may tie the grant to it; a stable signing identity would avoid re-prompts.

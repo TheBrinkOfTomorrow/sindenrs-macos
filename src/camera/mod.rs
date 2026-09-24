@@ -12,6 +12,8 @@ pub mod v4l2;
 #[cfg(target_os = "macos")]
 pub mod avfoundation;
 
+pub mod uvc;
+
 #[cfg(not(target_os = "linux"))]
 pub mod v4l2 {
     //! Stub so the rest of the crate compiles off Linux.

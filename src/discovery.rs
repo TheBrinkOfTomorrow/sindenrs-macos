@@ -193,7 +193,7 @@ mod linux {
 pub use linux::{find_cameras, find_guns, find_ttys_by_ids};
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{find_cameras, find_guns, find_ttys_by_ids};
 

@@ -820,6 +820,7 @@ dependencies = [
  "block2",
  "clap",
  "core-foundation",
+ "core-foundation-sys",
  "ctrlc",
  "dispatch2",
  "io-kit-sys",

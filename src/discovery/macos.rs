@@ -25,7 +25,7 @@ use super::{CameraDevice, GunDevice};
 use crate::ids::{self, GunVariant};
 
 /// An IOKit object reference, released on drop.
-struct Object(io_object_t);
+pub(crate) struct Object(io_object_t);
 
 impl Drop for Object {
     fn drop(&mut self) {
@@ -35,6 +35,11 @@ impl Drop for Object {
 }
 
 impl Object {
+    /// The raw object, borrowed.
+    pub(crate) const fn raw(&self) -> io_object_t {
+        self.0
+    }
+
     /// A property of this entry.
     fn property(&self, key: &str) -> Option<CFType> {
         let key = CFString::new(key);
@@ -133,6 +138,28 @@ fn usb_with_ids() -> std::io::Result<Vec<Usb>> {
         .collect())
 }
 
+/// The USB device at `location` with the given IDs.
+pub(crate) fn usb_device_at(location: u32, vid: u16, pid: u16) -> std::io::Result<Option<Object>> {
+    Ok(usb_with_ids()?
+        .into_iter()
+        .find(|d| d.location == location && d.vid == vid && d.pid == pid)
+        .map(|d| d.obj))
+}
+
+/// The inverse of [`avfoundation_id`]: location, VID and PID from a camera `uniqueID`.
+pub fn parse_avfoundation_id(id: &str) -> Option<(u32, u16, u16)> {
+    let hex = id.strip_prefix("0x")?;
+    if hex.len() <= 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (loc, ids) = hex.split_at(hex.len() - 8);
+    Some((
+        u32::from_str_radix(loc, 16).ok()?,
+        u16::from_str_radix(&ids[..4], 16).ok()?,
+        u16::from_str_radix(&ids[4..], 16).ok()?,
+    ))
+}
+
 /// `locationID` as a Linux-style topology path: the top byte is the bus, then one nibble per
 /// hub level, ending at the first zero nibble. `0x08342000` is `8-3.4.2`.
 pub fn location_path(location: u32) -> String {
@@ -224,6 +251,16 @@ mod tests {
             avfoundation_id(0x0834_1000, 0x32e4, 0x9210),
             "0x834100032e49210"
         );
+    }
+
+    #[test]
+    fn avfoundation_id_round_trips() {
+        assert_eq!(
+            parse_avfoundation_id("0x834100032e49210"),
+            Some((0x0834_1000, 0x32e4, 0x9210))
+        );
+        assert_eq!(parse_avfoundation_id("Camo"), None);
+        assert_eq!(parse_avfoundation_id("0x32e49210"), None);
     }
 
     #[test]
