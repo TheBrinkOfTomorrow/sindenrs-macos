@@ -17,8 +17,10 @@ identity=${SINDENRS_SIGN_IDENTITY:-sindenrs_macos_dev}
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 app="$root/target/macos/Sindenrs.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 sed "s/@VERSION@/$version/g" "$here/Sindenrs-Info.plist" > "$app/Contents/Info.plist"
+# The icon is drawn by make-icon.swift; rerun that to change it.
+cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp "$bin" "$app/Contents/MacOS/sindenrs"
 
 # Self-signed certificates are not "valid" (untrusted) but sign fine, so look them up in the

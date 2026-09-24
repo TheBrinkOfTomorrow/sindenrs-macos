@@ -5,6 +5,7 @@
 <key>CFBundleName</key><string>Sindenrs</string>
 <key>CFBundleDisplayName</key><string>Sindenrs</string>
 <key>CFBundleExecutable</key><string>sindenrs</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>@VERSION@</string>
 <key>CFBundleVersion</key><string>@VERSION@</string>
