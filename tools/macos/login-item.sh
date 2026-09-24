@@ -1,5 +1,6 @@
 #!/bin/sh
-# Start `sindenrs run` at login, from ~/Applications/Sindenrs.app, as a per-user launchd agent.
+# Opt-in: start `sindenrs run` at login, from ~/Applications/Sindenrs.app, as a per-user
+# launchd agent. Off by default: nothing installs this unless you run `install` yourself.
 #
 #   tools/macos/login-item.sh install     copy the app (tools/macos/bundle.sh) and load the agent
 #   tools/macos/login-item.sh uninstall   unload and remove the agent (the app stays)

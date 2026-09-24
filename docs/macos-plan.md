@@ -24,7 +24,7 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 |-------|-------|
 | 0 — Hardware check | **done** |
 | 1 — macOS backends | **done** |
-| 2 — Border overlay | in progress: overlay and calibrate done; packaging, emulator check left |
+| 2 — Border overlay | in progress: overlay, calibrate, packaging done; emulator check left |
 | 3 — Emulator setup | not started |
 | 4 — Two players | optional, not started |
 
@@ -71,7 +71,9 @@ Measurements and decisions are in `docs/macos-notes.md`.
   the bore it measures matches the gun's stored factory calibration, so nothing was saved.
   Run it with `--no-save`: nothing is written to the gun unless the user asks.
 - Package `sindenrs` as an app with a stable signing identity, so the camera grant survives
-  rebuilds and `run` can start at login.
+  rebuilds. **Done:** `tools/macos/bundle.sh` with a self-signed certificate; the grant held
+  across different builds. Starting `run` at login is available (`login-item.sh`) but opt-in
+  and off by default.
 - Fallback: emulator post-processing shaders that draw the coded border.
 
 ### Carried over (not blocking)

@@ -29,7 +29,8 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
   ad hoc without it). Camera access is granted to that app.
 - `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
   the camera from an agent or IDE session); pass absolute paths.
-- `tools/macos/login-item.sh install|uninstall|status` — `sindenrs run` at login via launchd.
+- `tools/macos/login-item.sh install|uninstall|status` — opt-in `sindenrs run` at login via
+  launchd. Off by default; do not install it unless the user asks.
 
 ### Nix
 

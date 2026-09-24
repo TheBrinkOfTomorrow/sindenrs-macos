@@ -320,7 +320,9 @@ with them. Without the certificate the app is signed ad hoc, with a warning. The
 belongs to the app and its signature, so a fixed identity should keep it across rebuilds.
 `run-bundled.sh` now runs every test through this one app.
 
-`login-item.sh install` copies the app to `~/Applications` and loads a per-user launchd agent
+Starting at login is opt-in and off: the user does not want the gun running at login, and
+nothing installs the agent automatically. `login-item.sh install` (only when asked) copies the
+app to `~/Applications` and loads a per-user launchd agent
 (`dev.sindenrs.run`) that runs `sindenrs run` at login, restarts it if it exits with an
 error, and logs to `~/Library/Logs/sindenrs.log`; `uninstall` removes the agent.
 
