@@ -301,3 +301,10 @@ so it is an aiming slip, not a tracking fault. One detail to watch: replaying th
 frame gives "refused: solve disagrees with its own tabs" (hull only), while the frames around
 it solved; bright clutter sits just outside one edge there. Frames kept in
 `corpus/macos-calibrate-2026-09-24/` (local).
+
+Second run, same settings (`--no-save`): all 9 targets measured, **mean error 1.14% of the
+screen, max 4.07%** (the top-middle target, right after a clipped retry); 7 of 9 within 1.3%.
+Bias dx -0.02%, dy +0.44%. The bore it would set is +3.31% / +0.66% (agreement ±0.26 /
+±0.48) against the +3.29% / +0.69% already in the gun's EEPROM: the factory calibration is
+right, so nothing needs saving (and nothing was written). 28% of frames still had the border
+clipped at the frame edge; stepping further back would help the top-middle target.
