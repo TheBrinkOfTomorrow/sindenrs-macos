@@ -1,7 +1,7 @@
 //! The per-gun tracking loop, shared by `track` (one gun, diagnostics) and `run` (every gun,
 //! forever). Capture, decode, acquire, solve, send: all on the calling thread, no queues.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -9,12 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::camera::v4l2::Device;
-use crate::camera::{cid, PixelFormat};
-use crate::config::{Display, Exposure, GunConfig};
+use crate::camera::source::{Camera, Next};
+use crate::config::{Display, GunConfig};
 use crate::gun::Gun;
 use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
@@ -42,7 +41,7 @@ pub struct TrackerOptions {
     /// Aim tracker blend weight for a four-edge solve (config: display.hover_smoothing;
     /// 1 = off); weaker solves are smoothed harder.
     pub hover_smoothing: f64,
-    /// Requested mmap buffer count.
+    /// Requested mmap buffer count (V4L2 only).
     pub buffers: u32,
     /// Stop after this many frames; 0 = until `stop` is set.
     pub frames: u32,
@@ -56,8 +55,18 @@ pub struct TrackerOptions {
 
 /// One processed frame, handed to the caller's hook.
 pub struct Sample<'a> {
-    /// The encoded frame exactly as the camera delivered it, for saving alongside a decision.
+    /// The frame as captured, for saving alongside a decision: MJPEG on Linux, PGM luma on
+    /// macOS; `raw_ext` is its file extension.
     pub raw: &'a [u8],
+    pub raw_ext: &'static str,
+    /// The luma the solve ran on (after the configured flip), `width * height`.
+    pub luma: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    /// The detection threshold used on `luma`.
+    pub threshold: u8,
+    /// The camera pixel treated as the bore axis, after any flip.
+    pub aim_pixel: [f64; 2],
     pub aim: Option<[f64; 2]>,
     pub quad: Option<Quad>,
     /// The camera frame's corners in screen percent (TL, TR, BR, BL of the image), i.e.
@@ -230,30 +239,6 @@ pub struct Status {
     pub frame: (usize, usize),
 }
 
-pub fn apply_display_to_camera(dev: &Device, d: &Display) -> Result<()> {
-    if let Some(fps) = d.fps {
-        let (n, den) = dev.set_frame_interval(1, fps)?;
-        info!("frame interval {n}/{den} s");
-    }
-    match d.exposure {
-        Exposure::Manual(v) => dev.set_manual_exposure(v)?,
-        Exposure::Auto(_) => dev.set_auto_exposure()?,
-    }
-    for (id, val, name) in [
-        (cid::BRIGHTNESS, d.brightness, "brightness"),
-        (cid::CONTRAST, d.contrast, "contrast"),
-        (cid::GAIN, d.gain, "gain"),
-        (cid::GAMMA, d.gamma, "gamma"),
-        (cid::SHARPNESS, d.sharpness, "sharpness"),
-    ] {
-        if let Some(v) = val {
-            dev.set_control(id, v)
-                .with_context(|| format!("setting {name}={v}"))?;
-        }
-    }
-    Ok(())
-}
-
 /// Run one tracker until `frames` is reached or `stop` is set. `gun` is `Some` to drive a gun
 /// (it must already be authenticated, configured and streaming); `None` only tracks.
 #[allow(clippy::too_many_lines)]
@@ -280,25 +265,8 @@ pub fn run_tracker_with(
     status: &Arc<Mutex<Status>>,
     hook: &mut dyn FnMut(&Sample) -> Flow,
 ) -> Result<()> {
-    let dev = Device::open(camera).with_context(|| format!("opening {}", camera.display()))?;
-    let busy = |e: anyhow::Error| {
-        if e.downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.raw_os_error() == Some(16))
-        {
-            e.context(format!(
-                "{} is busy: another process is streaming it (a `track`, `run` or \
-                 `aim-test` still going?); only one can use a camera at a time",
-                camera.display()
-            ))
-        } else {
-            e
-        }
-    };
-    let fmt = dev
-        .set_format(640, 480, PixelFormat::Mjpeg)
-        .map_err(|e| busy(e.into()))?;
-    apply_display_to_camera(&dev, &opts.display)?;
-    let (w, h) = (fmt.width as usize, fmt.height as usize);
+    let cam = Camera::open(camera, &opts.display)?;
+    let (w, h) = cam.size();
     let d = &opts.display;
     let threshold = opts.threshold.unwrap_or(d.threshold);
     let min_size = opts.min_size.unwrap_or(d.min_size);
@@ -344,8 +312,8 @@ pub fn run_tracker_with(
     ]
     .map(|c| lens.undistort(c));
     info!(
-        "[{name}] tracking {}x{} {} on {}, aim pixel ({:.1}, {:.1}), threshold {threshold}, flip {flip:?}, bore ({cal_x:+.2}%, {cal_y:+.2}%), lens k1 {}",
-        w, h, fmt.format, camera.display(), aim_px[0], aim_px[1], opts.lens_k1
+        "[{name}] tracking {} on {}, aim pixel ({:.1}, {:.1}), threshold {threshold}, flip {flip:?}, bore ({cal_x:+.2}%, {cal_y:+.2}%), lens k1 {}",
+        cam.description(), camera.display(), aim_px[0], aim_px[1], opts.lens_k1
     );
 
     let mut csv = None;
@@ -359,7 +327,7 @@ pub fn run_tracker_with(
         csv = Some(f);
     }
 
-    let mut stream = dev.start_stream(opts.buffers).map_err(|e| busy(e.into()))?;
+    let mut frames = cam.start(opts.buffers, camera)?;
     let start = Instant::now();
     let mut n = 0u32;
     let mut found = 0u64;
@@ -370,7 +338,6 @@ pub fn run_tracker_with(
     let mut last_aim: Option<[f64; 2]> = None;
     let mut last_quad: Option<Quad> = None;
     let mut guard = JumpGuard::new(opts.jump_limit);
-    let mut sizes: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut corrupt = 0u64;
     let mut corrupt_window = 0u64;
     let mut last_corrupt_report = Instant::now();
@@ -381,60 +348,46 @@ pub fn run_tracker_with(
     let mut window_frames = 0u32;
     let mut fps = 0.0;
     while !stop.load(Ordering::Relaxed) && (opts.frames == 0 || n < opts.frames) {
-        let Some(frame) = stream.next(Some(Duration::from_secs(3)), true)? else {
-            warn!("[{name}] frame timeout");
-            continue;
-        };
-        n += 1;
-        window_frames += 1;
-        if window_start.elapsed() >= Duration::from_secs(1) {
-            fps = f64::from(window_frames) / window_start.elapsed().as_secs_f64();
-            window_start = Instant::now();
-            window_frames = 0;
-        }
-        let t0 = Instant::now();
-        // A frame the USB link truncated decodes (non-strict) with its missing part as flat
-        // grey, which the solver would then read as a bright screen. A truncated frame is
-        // far smaller than its neighbours, so compare against the recent median size.
-        // Corrupt frames are counted and reported once a second: a stream of them means
-        // the camera's link (hub, cable, EMI from the recoil) is failing, and a warning
-        // per frame at 60 fps would bury everything else.
-        let size = frame.data.len();
-        let median_size = {
-            let mut v: Vec<usize> = sizes.iter().copied().collect();
-            v.sort_unstable();
-            v.get(v.len() / 2).copied()
-        };
-        let truncated = median_size.is_some_and(|m| sizes.len() >= 10 && size * 10 < m * 6);
-        if !truncated {
-            sizes.push_back(size);
-            if sizes.len() > 30 {
-                sizes.pop_front();
+        let next = frames.next(Duration::from_secs(3))?;
+        if !matches!(next, Next::Timeout) {
+            n += 1;
+            window_frames += 1;
+            if window_start.elapsed() >= Duration::from_secs(1) {
+                fps = f64::from(window_frames) / window_start.elapsed().as_secs_f64();
+                window_start = Instant::now();
+                window_frames = 0;
             }
         }
-        let decoded = if truncated {
-            None
-        } else {
-            luma::mjpeg_to_luma(frame.data).ok()
-        };
-        let Some((_, _, mut l)) = decoded else {
-            corrupt += 1;
-            corrupt_window += 1;
-            if last_corrupt_report.elapsed() >= Duration::from_secs(1) {
-                warn!(
-                    "[{name}] {corrupt_window} corrupt frames in the last second ({} total): the camera's USB link is dropping data (hub, cable, or EMI from the recoil?)",
-                    corrupt
-                );
-                last_corrupt_report = Instant::now();
-                corrupt_window = 0;
+        let frame = match next {
+            Next::Frame(f) => f,
+            Next::Timeout => {
+                warn!("[{name}] frame timeout");
+                continue;
             }
-            continue;
+            // Corrupt frames are counted and reported once a second: a stream of them means
+            // the camera's link (hub, cable, EMI from the recoil) is failing, and a warning
+            // per frame at 60 fps would bury everything else.
+            Next::Corrupt => {
+                corrupt += 1;
+                corrupt_window += 1;
+                if last_corrupt_report.elapsed() >= Duration::from_secs(1) {
+                    warn!(
+                        "[{name}] {corrupt_window} corrupt frames in the last second ({} total): the camera's USB link is dropping data (hub, cable, or EMI from the recoil?)",
+                        corrupt
+                    );
+                    last_corrupt_report = Instant::now();
+                    corrupt_window = 0;
+                }
+                continue;
+            }
         };
-        if l.len() != w * h {
-            continue;
-        }
-        flip_luma(&mut l, w, flip);
-        let quad = acquire(&l, w, h, &params);
+        // Processing time includes the decode, which happened inside `next`.
+        let t0 = Instant::now()
+            .checked_sub(frame.decode)
+            .unwrap_or_else(Instant::now);
+        let l = frame.luma;
+        flip_luma(l, w, flip);
+        let quad = acquire(l, w, h, &params);
         let mut aim = None;
         let mut view = None;
         // The solve's own aim before the guard and tracker touch it, for the recording.
@@ -490,7 +443,7 @@ pub fn run_tracker_with(
         }
         let proc = t0.elapsed();
         proc_sum += proc;
-        if let Some(age) = frame.age() {
+        if let Some(age) = frame.age {
             age_sum += age;
             age_n += 1;
         }
@@ -510,7 +463,7 @@ pub fn run_tracker_with(
                 "{},{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2},{:.2},{:.2}",
                 frame.sequence,
                 frame.timestamp.map_or(0, |t| t.as_micros()),
-                frame.age().map_or(0, |t| t.as_micros()),
+                frame.age.map_or(0, |t| t.as_micros()),
                 proc.as_micros(),
                 u8::from(quad.is_some()),
                 u8::from(clipped),
@@ -531,8 +484,8 @@ pub fn run_tracker_with(
             )?;
             if let Some(dir) = &opts.record {
                 std::fs::write(
-                    dir.join(format!("frame_{:06}.jpg", frame.sequence)),
-                    frame.data,
+                    dir.join(format!("frame_{:06}.{}", frame.sequence, frame.raw_ext)),
+                    frame.raw,
                 )?;
             }
         }
@@ -553,21 +506,27 @@ pub fn run_tracker_with(
                         (true, 0) => "",
                         (true, _) => " coded",
                     },
-                    proc.as_secs_f64() * 1000.0, frame.age().map_or(0.0, |a| a.as_secs_f64() * 1000.0)
+                    proc.as_secs_f64() * 1000.0, frame.age.map_or(0.0, |a| a.as_secs_f64() * 1000.0)
                 ),
                 _ => {
-                    let (mean, max) = luma::luma_stats(&l);
+                    let (mean, max) = luma::luma_stats(l);
                     println!("[{name}] {:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={:.2}ms", start.elapsed().as_secs_f64(), frame.sequence, mean, max, proc.as_secs_f64() * 1000.0);
                 }
             }
         }
         let flow = hook(&Sample {
-            raw: frame.data,
+            raw: frame.raw,
+            raw_ext: frame.raw_ext,
+            luma: l,
+            width: w,
+            height: h,
+            threshold,
+            aim_pixel: aim_px,
             aim,
             quad,
             view,
             sequence: frame.sequence,
-            age: frame.age(),
+            age: frame.age,
             events: &frame_events,
         });
         if let Ok(mut s) = status.lock() {

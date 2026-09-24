@@ -1,13 +1,19 @@
 //! Frame capture.
 //!
-//! Platform-neutral types live here; the Linux implementation is [`v4l2`]. Windows is a stub
-//! until a Media Foundation backend exists.
+//! Platform-neutral types live here; the Linux implementation is [`v4l2`], the macOS one
+//! `avfoundation`. Windows is a stub until a Media Foundation backend exists.
 
 use std::fmt;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub mod v4l2;
+
+#[cfg(target_os = "macos")]
+pub mod avfoundation;
+
+pub mod source;
+pub mod uvc;
 
 #[cfg(not(target_os = "linux"))]
 pub mod v4l2 {

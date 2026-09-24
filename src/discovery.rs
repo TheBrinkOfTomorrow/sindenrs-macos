@@ -1,7 +1,8 @@
 //! Finding guns and cameras.
 //!
 //! On Linux this walks sysfs directly instead of shelling out to `lsusb`/`udevadm`/`v4l2-ctl`
-//! as the stock driver does. Other platforms return nothing until their backends exist.
+//! as the stock driver does; on macOS it reads the IOKit registry. Other platforms return
+//! nothing until their backends exist.
 
 use std::path::PathBuf;
 
@@ -9,7 +10,7 @@ use crate::ids::GunVariant;
 
 #[derive(Clone, Debug)]
 pub struct GunDevice {
-    /// Serial device node, e.g. `/dev/ttyACM0` or `COM3`.
+    /// Serial device node, e.g. `/dev/ttyACM0`, `/dev/cu.usbmodemHIDDO1` or `COM3`.
     pub port: PathBuf,
     pub vid: u16,
     pub pid: u16,
@@ -22,7 +23,7 @@ pub struct GunDevice {
 
 #[derive(Clone, Debug)]
 pub struct CameraDevice {
-    /// Capture device node, e.g. `/dev/video4`.
+    /// Capture device node, e.g. `/dev/video4`; on macOS the AVFoundation `uniqueID`.
     pub node: PathBuf,
     pub name: String,
     pub vid: u16,
@@ -191,19 +192,24 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::{find_cameras, find_guns, find_ttys_by_ids};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{find_cameras, find_guns, find_ttys_by_ids};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn find_guns() -> std::io::Result<Vec<GunDevice>> {
     // TODO(windows): enumerate COM ports by VID/PID via SetupAPI (serialport::available_ports).
     Ok(Vec::new())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn find_ttys_by_ids(_vid: u16, _pid: u16) -> std::io::Result<Vec<PathBuf>> {
     // TODO(windows): SetupAPI enumeration by VID/PID.
     Ok(Vec::new())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn find_cameras() -> std::io::Result<Vec<CameraDevice>> {
     // TODO(windows): enumerate via Media Foundation.
     Ok(Vec::new())

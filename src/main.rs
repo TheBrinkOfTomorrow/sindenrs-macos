@@ -171,7 +171,7 @@ enum DebugCmd {
 
 #[derive(Args)]
 struct ReplayArgs {
-    /// Directories of recorded .jpg frames.
+    /// Directories of recorded frames (.jpg from Linux, .pgm from macOS).
     #[arg(required = true)]
     dirs: Vec<PathBuf>,
     /// Use every Nth frame.
@@ -406,6 +406,11 @@ struct TrackArgs {
     /// Print one line per frame.
     #[arg(long)]
     per_frame: bool,
+    /// Show a full-screen page with the border, aiming targets, the camera feed and what the
+    /// detector made of it, and log every click against the targets (macOS). Runs until Esc;
+    /// --frames does not apply.
+    #[arg(long)]
+    preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -882,6 +887,7 @@ fn camera_for_port(port: &str) -> Result<PathBuf> {
     default_camera(None)
 }
 
+#[cfg(target_os = "linux")]
 fn camera(cmd: CameraCmd) -> Result<()> {
     use sindenrs::camera::v4l2::{control_name, Device};
 
@@ -1253,7 +1259,157 @@ fn run_capture(
     Ok(st)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: AVFoundation delivers decoded luma and the UVC controls go over IOKit, so `info` lists
+/// controls and `capture` applies them; format, frame rate and buffer options do not apply.
+#[cfg(target_os = "macos")]
+fn camera(cmd: CameraCmd) -> Result<()> {
+    use sindenrs::camera::avfoundation::Device;
+    use sindenrs::camera::uvc::{self, iokit::Controls};
+    use sindenrs::vision::luma;
+
+    let open_controls = |id: &Path| {
+        Controls::open(id).with_context(|| format!("opening camera controls of {}", id.display()))
+    };
+    let (settings, frames, out, save_every, no_drain, stall_ms, per_frame) = match cmd {
+        CameraCmd::Info { device } => {
+            let id = default_camera(device)?;
+            let ctl = open_controls(&id)?;
+            let t = ctl.topology();
+            println!(
+                "{}: VideoControl interface {}, camera terminal {} (controls {:#x}), processing unit {} (controls {:#x})",
+                id.display(),
+                t.interface,
+                t.camera_terminal,
+                t.ct_controls,
+                t.processing_unit,
+                t.pu_controls
+            );
+            println!("controls (raw UVC values; exposure_auto shown as the V4L2 menu value):");
+            for (cid, name) in uvc::CONTROLS {
+                // On/off controls (the automatic modes) have no range in UVC.
+                match (ctl.get_control(cid), ctl.range(cid)) {
+                    (Err(e), _) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                    (Err(e), _) => println!("  {name:<28} {cid:#010x} error: {e}"),
+                    (Ok(v), Ok((min, max, step, def))) => println!(
+                        "  {name:<28} {cid:#010x} min={min} max={max} step={step} default={def} value={v}"
+                    ),
+                    (Ok(v), Err(_)) => println!("  {name:<28} {cid:#010x} value={v}"),
+                }
+            }
+            return Ok(());
+        }
+        CameraCmd::Capture {
+            settings,
+            frames,
+            out,
+            save_every,
+            no_drain,
+            stall_ms,
+            per_frame,
+        } => (
+            settings, frames, out, save_every, no_drain, stall_ms, per_frame,
+        ),
+        CameraCmd::SweepExposure { .. } => {
+            bail!("`debug camera sweep-exposure` is not available on macOS yet")
+        }
+    };
+    let id = default_camera(settings.device.clone())?;
+    let ctl = open_controls(&id)?;
+    match settings.exposure.as_deref() {
+        None => {}
+        Some("auto" | "A" | "a") => ctl.set_auto_exposure()?,
+        Some(v) => {
+            let v: i32 = v.parse().with_context(|| format!("bad --exposure {v:?}"))?;
+            ctl.set_manual_exposure(v)?;
+        }
+    }
+    for (cid, val, name) in [
+        (cid::BRIGHTNESS, settings.brightness, "brightness"),
+        (cid::CONTRAST, settings.contrast, "contrast"),
+        (cid::GAIN, settings.gain, "gain"),
+        (cid::GAMMA, settings.gamma, "gamma"),
+        (cid::SHARPNESS, settings.sharpness, "sharpness"),
+    ] {
+        if let Some(v) = val {
+            ctl.set_control(cid, v)
+                .with_context(|| format!("setting {name}={v}"))?;
+        }
+    }
+    if let (Ok(auto), Ok(exp)) = (
+        ctl.get_control(cid::EXPOSURE_AUTO),
+        ctl.get_control(cid::EXPOSURE_ABSOLUTE),
+    ) {
+        info!(
+            "exposure: auto={auto} absolute={exp} (x100 µs = {:.1} ms)",
+            f64::from(exp) / 10.0
+        );
+    }
+    let dev = Device::open(&id).with_context(|| format!("opening camera {}", id.display()))?;
+    let mut stream = dev.start_stream(settings.width, settings.height)?;
+    let (w, h) = (stream.width(), stream.height());
+    if let Some(dir) = &out {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Time from the first frame, so session start-up does not count against the rate.
+    let mut start = Instant::now();
+    let (mut n, mut skipped, mut age_sum, mut age_max) =
+        (0u32, 0u64, Duration::ZERO, Duration::ZERO);
+    let mut luma_sum = 0.0;
+    while n < frames {
+        let Some(f) = stream.next(Some(Duration::from_secs(3)), !no_drain)? else {
+            warn!("frame timeout");
+            continue;
+        };
+        n += 1;
+        if n == 1 {
+            start = Instant::now();
+        }
+        skipped += u64::from(f.dropped);
+        let age = f.age().unwrap_or_default();
+        age_sum += age;
+        age_max = age_max.max(age);
+        #[allow(clippy::cast_precision_loss)]
+        let mean = f.data.iter().map(|&v| u64::from(v)).sum::<u64>() as f64 / f.data.len() as f64;
+        luma_sum += mean;
+        if per_frame {
+            println!(
+                "seq={:<6} age={} skipped={} luma={mean:.1}",
+                f.sequence,
+                fmt_ms(age),
+                f.dropped
+            );
+        }
+        if let Some(dir) = &out {
+            if save_every > 0 && n % save_every == 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                luma::write_pgm(
+                    &dir.join(format!("frame_{:06}.pgm", f.sequence)),
+                    w as u32,
+                    h as u32,
+                    f.data,
+                )?;
+            }
+        }
+        if stall_ms > 0 {
+            std::thread::sleep(Duration::from_millis(stall_ms));
+        }
+    }
+    let wall = start.elapsed();
+    println!(
+        "{n} frames {w}x{h} in {:.2}s = {:.2} fps (camera set to {:.1}); age mean {} max {}; \
+         skipped by drain {skipped}, dropped in capture {}; luma mean {:.1}",
+        wall.as_secs_f64(),
+        f64::from(n.saturating_sub(1)) / wall.as_secs_f64(),
+        stream.fps(),
+        fmt_ms(age_sum / n.max(1)),
+        fmt_ms(age_max),
+        stream.dropped(),
+        luma_sum / f64::from(n.max(1)),
+    );
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn camera(_cmd: CameraCmd) -> Result<()> {
     bail!("camera capture is not implemented on this platform yet")
 }
@@ -1729,7 +1885,7 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::sync::atomic::AtomicBool;
@@ -1792,9 +1948,14 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         per_frame: a.per_frame,
         report_every: Some(Duration::from_secs(1)),
     };
-    let stop = AtomicBool::new(false);
     let status = Arc::new(Mutex::new(Status::default()));
-    run_tracker(&name, &camera, gun, &opts, &stop, &status)?;
+    if a.preview {
+        let border = ctx.display.border_thickness / 100.0;
+        track_with_preview(name, camera, gun, opts, status.clone(), border)?;
+    } else {
+        let stop = AtomicBool::new(false);
+        run_tracker(&name, &camera, gun, &opts, &stop, &status)?;
+    }
     let s = status.lock().map(|s| s.clone()).unwrap_or_default();
     println!(
         "frames={} found={} ({:.0}%) processing mean={} age mean={} events={}",
@@ -1815,8 +1976,109 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
+/// `debug track --preview`: the tracker on a worker thread feeding the preview page, which
+/// owns the main thread until Esc (or the tracker stops).
+#[cfg(target_os = "macos")]
+fn track_with_preview(
+    name: String,
+    camera: PathBuf,
+    gun: Option<(Gun, sindenrs::config::GunConfig)>,
+    mut opts: sindenrs::runtime::TrackerOptions,
+    status: std::sync::Arc<std::sync::Mutex<sindenrs::runtime::Status>>,
+    border_frac: f64,
+) -> Result<()> {
+    use sindenrs::preview::{self, Shared};
+    use sindenrs::protocol::event::Event;
+    use sindenrs::runtime::{run_tracker_with, Flow, Sample};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    opts.frames = 0;
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (shared, stop) = (shared.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let (mut n, mut window, mut fps) = (0u64, (Instant::now(), 0u32), 0.0);
+            let mut hook = |s: &Sample| -> Flow {
+                n += 1;
+                window.1 += 1;
+                if window.0.elapsed() >= Duration::from_secs(1) {
+                    fps = f64::from(window.1) / window.0.elapsed().as_secs_f64();
+                    window = (Instant::now(), 0);
+                }
+                let Ok(mut sh) = shared.lock() else {
+                    return Flow::Continue;
+                };
+                sh.aim = s.aim;
+                for ev in s.events {
+                    if let Event::Buttons { state1, state2, .. } = ev {
+                        sh.push_log(format!("gun buttons s1={state1:08b} s2={state2:08b}"));
+                    }
+                }
+                // Previews at half the frame rate are plenty to watch.
+                if n % 2 == 0 {
+                    let (camera, processed) = preview::images_for(s);
+                    sh.camera = camera;
+                    sh.processed = processed;
+                    sh.serial += 1;
+                }
+                let solve = s.quad.map_or_else(
+                    || "no border".to_owned(),
+                    |q| {
+                        format!(
+                            "{} sides {} tabs{}",
+                            q.sides.count_ones(),
+                            q.tabs,
+                            if q.from_lines { "" } else { " (hull)" }
+                        )
+                    },
+                );
+                let aim = s.aim.map_or_else(
+                    || "-".to_owned(),
+                    |a| format!("({:5.1}%, {:5.1}%)", a[0], a[1]),
+                );
+                sh.status = format!(
+                    "{fps:4.1} fps  aim {aim}  {solve}  age {:.0} ms   Esc quits",
+                    s.age.map_or(0.0, |a| a.as_secs_f64() * 1000.0)
+                );
+                Flow::Continue
+            };
+            let r = run_tracker_with(&name, &camera, gun, &opts, &stop, &status, &mut hook);
+            if let Ok(mut sh) = shared.lock() {
+                sh.done = true;
+            }
+            r
+        })
+    };
+    let shown = preview::appkit::run(shared.clone(), stop.clone(), border_frac);
+    stop.store(true, Ordering::Relaxed);
+    let tracked = worker
+        .join()
+        .map_err(|_| anyhow!("the tracker thread panicked"))?;
+    if let Ok(sh) = shared.lock() {
+        for line in &sh.history {
+            println!("{line}");
+        }
+    }
+    shown?;
+    tracked
+}
+
 #[cfg(target_os = "linux")]
+fn track_with_preview(
+    _name: String,
+    _camera: PathBuf,
+    _gun: Option<(Gun, sindenrs::config::GunConfig)>,
+    _opts: sindenrs::runtime::TrackerOptions,
+    _status: std::sync::Arc<std::sync::Mutex<sindenrs::runtime::Status>>,
+    _border_frac: f64,
+) -> Result<()> {
+    bail!("--preview is only available on macOS so far")
+}
+
+/// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::collections::HashMap;
@@ -2012,12 +2274,12 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_all(_ctx: &Ctx, _overlay: bool) -> Result<()> {
     bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn track(_ctx: &Ctx, _a: TrackArgs) -> Result<()> {
     bail!("tracking needs the camera backend, which is not implemented on this platform yet")
 }
@@ -2267,7 +2529,7 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
     use sindenrs::vision::code::Side;
     use sindenrs::vision::lens::Lens;
     use sindenrs::vision::lensfit::{fit_k1, score, FitFrame};
-    use sindenrs::vision::luma::mjpeg_to_luma;
+    use sindenrs::vision::luma::frame_to_luma;
 
     let flip = flip_from_config(ctx.display.flip);
     let mut params = AcquireParams {
@@ -2286,19 +2548,19 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
             .with_context(|| format!("reading {}", dir.display()))?
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg" || e == "pgm"))
             .collect();
         in_dir.sort();
         files.extend(in_dir.into_iter().step_by(a.every.max(1)));
     }
     if files.is_empty() {
-        bail!("no .jpg frames found");
+        bail!("no .jpg or .pgm frames found");
     }
     let mut frames: Vec<(PathBuf, usize, usize, Vec<u8>)> = Vec::new();
     for f in &files {
         let data = std::fs::read(f)?;
-        let Ok((w, h, mut l)) = mjpeg_to_luma(&data) else {
-            warn!("{}: jpeg decode failed", f.display());
+        let Ok((w, h, mut l)) = frame_to_luma(f, &data) else {
+            warn!("{}: decode failed", f.display());
             continue;
         };
         let (w, h) = (w as usize, h as usize);
@@ -2690,7 +2952,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 if use_trigger && pressed && pending.is_none() {
                     pending = Some(now);
                     shot += 1;
-                    save(&debug_dir, &format!("t{:02}-shot{:02}-pull-{}.jpg", idx + 1, shot, quality_tag(quality)), s.raw);
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-pull-{}.{}", idx + 1, shot, quality_tag(quality), s.raw_ext), s.raw);
                 }
                 let steady = use_dwell && dwell_armed && ring.len() >= a.samples.max(4) as usize && {
                     let mx = median(ring.iter().map(|(_, p)| p[0]).collect());
@@ -2708,7 +2970,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                         if let Ok(mut sc) = scene.lock() {
                             sc.flash_until = Some(now + Duration::from_millis(700));
                         }
-                        save(&debug_dir, &format!("t{:02}-shot{:02}-unmeasurable.jpg", idx + 1, shot), s.raw);
+                        save(&debug_dir, &format!("t{:02}-shot{:02}-unmeasurable.{}", idx + 1, shot, s.raw_ext), s.raw);
                         pending = None;
                     }
                     if !dwell_armed
@@ -2731,7 +2993,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                         "  target {:>2}: aim was not steady (samples spread {scatter:.1}% of screen); pull again.",
                         idx + 1
                     );
-                    save(&debug_dir, &format!("t{:02}-shot{:02}-unsteady.jpg", idx + 1, shot), s.raw);
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-unsteady.{}", idx + 1, shot, s.raw_ext), s.raw);
                     if let Ok(mut sc) = scene.lock() {
                         sc.flash_until = Some(now + Duration::from_millis(700));
                     }
@@ -2749,7 +3011,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                     if pending.is_some() { "trigger" } else { "held steady" },
                     ring.len()
                 );
-                save(&debug_dir, &format!("t{:02}-shot{:02}-measured.jpg", idx + 1, shot), s.raw);
+                save(&debug_dir, &format!("t{:02}-shot{:02}-measured.{}", idx + 1, shot, s.raw_ext), s.raw);
                 out.measured[idx] = Some(got);
                 out.quads[idx] = s.quad.as_ref().map(|q| q.corners);
                 captured_at = Some(got);

@@ -19,6 +19,8 @@ pub mod firmware;
 pub mod gun;
 pub mod ids;
 pub mod overlay;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod preview;
 pub mod protocol;
 pub mod runtime;
 pub mod usb;
