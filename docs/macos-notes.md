@@ -217,3 +217,25 @@ itself as off screen).
 Observed by eye: tracking follows the gun well over most of the screen but fails near the top
 left and top right corners. Aim accuracy against where the gun physically points is not
 measured yet: that needs aimed shots at the targets, or `calibrate` once it runs on macOS.
+
+## 2026-09-24 — Top-corner tracking losses: bright objects beside the screen
+
+Recorded run (`debug track --send --preview --record`), gun aimed ~5 s at the centre and each
+corner: 2395 frames, 97% found, aim available in 91.8%. Corner and side aims solve from 2-3
+edges plus tabs; only the centre sees all four edges. Aim was lost only right at the top corners
+(e.g. top right at (100%, <5%), 32.8-33.1 s; top left past the corner at (-12%, ...), 30.1 s),
+where solves fall back to the hull (no edges, no tabs).
+
+`debug replay` on the recorded `.pgm` frames reproduces this, so it is the shared detector on
+this scene, not capture. The frames show bright objects in the room next to the screen, as
+bright as the border (saturated at exposure 78):
+
+- top right: a vertical strip just outside the screen's right edge; its edges are fitted as
+  strong lines 17-33 px outside the real right edge. Blanking it: 21/21 frames solved from
+  edge lines (6/21 as recorded).
+- top left: a large curved bar near the screen's top-left corner. Blanking it: 18/19 from
+  edge lines (8/19 as recorded, 7 not found).
+
+They only matter when aiming high into a corner, which puts them beside the border in the
+frame. Remedies: dim or cover them in the room; upstream, the detector could reject a line
+fitted outside an edge that already has decoded tabs (worth reporting with these frames).
