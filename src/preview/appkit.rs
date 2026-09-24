@@ -19,13 +19,13 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapImageRep, NSColor,
-    NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSEventType, NSFont, NSFontWeightRegular,
-    NSImage, NSImageScaling, NSImageView, NSResponder, NSScreen, NSScreenSaverWindowLevel,
-    NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSCompositingOperation, NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSEventType,
+    NSFont, NSFontWeightRegular, NSImage, NSImageScaling, NSImageView, NSResponder, NSScreen,
+    NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
-use super::{page, score, Image, Shared, TARGETS};
+use super::{aim_marker, page, score, Image, Shared, TARGETS};
 
 /// An `NSImage` holding `img` (one RGBA bitmap representation), sized `size` points.
 fn ns_image(img: &Image, size: NSSize) -> Option<Retained<NSImage>> {
@@ -57,9 +57,11 @@ fn ns_image(img: &Image, size: NSSize) -> Option<Retained<NSImage>> {
     }
     // SAFETY: the rep owns exactly `w * h * 4` bytes at `data`.
     let out = unsafe { std::slice::from_raw_parts_mut(data, img.w * img.h * 4) };
+    // Black is transparent, so the marker draws without a square around it; everything else
+    // here sits on the black page anyway.
     for (o, &p) in out.chunks_exact_mut(4).zip(&img.px) {
         let [b, g, r, _] = p.to_le_bytes();
-        o.copy_from_slice(&[r, g, b, 0xff]);
+        o.copy_from_slice(&[r, g, b, if p == 0 { 0 } else { 0xff }]);
     }
     let ns = NSImage::initWithSize(NSImage::alloc(), size);
     ns.addRepresentation(&rep);
@@ -68,6 +70,9 @@ fn ns_image(img: &Image, size: NSSize) -> Option<Retained<NSImage>> {
 
 struct ViewIvars {
     page: Retained<NSImage>,
+    /// The aim marker and where it is drawn, if the tracker has an aim.
+    marker: Retained<NSImage>,
+    marker_at: Cell<Option<NSRect>>,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
 }
@@ -94,8 +99,19 @@ define_class!(
         }
 
         #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            self.ivars().page.drawInRect(self.bounds());
+        fn draw_rect(&self, dirty: NSRect) {
+            let iv = self.ivars();
+            // The page image is exactly the view's size, so the dirty rect is also its source
+            // rect; redrawing only that keeps the moving marker cheap.
+            iv.page.drawInRect_fromRect_operation_fraction(dirty, dirty, NSCompositingOperation::Copy, 1.0);
+            if let Some(r) = iv.marker_at.get() {
+                iv.marker.drawInRect_fromRect_operation_fraction(
+                    r,
+                    NSRect::ZERO,
+                    NSCompositingOperation::SourceOver,
+                    1.0,
+                );
+            }
         }
 
         #[unsafe(method(mouseDown:))]
@@ -142,6 +158,27 @@ impl PageView {
         let this = mtm.alloc::<Self>().set_ivars(ivars);
         // SAFETY: NSView's designated initializer.
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Put the marker at `aim` (screen percent), or hide it; redraws only what moved.
+    fn move_marker(&self, aim: Option<[f64; 2]>, size: f64) {
+        let b = self.bounds();
+        let new = aim.map(|a| {
+            NSRect::new(
+                NSPoint::new(
+                    a[0] / 100.0 * b.size.width - size / 2.0,
+                    (1.0 - a[1] / 100.0) * b.size.height - size / 2.0,
+                ),
+                NSSize::new(size, size),
+            )
+        });
+        let old = self.ivars().marker_at.replace(new);
+        if old == new {
+            return;
+        }
+        for r in [old, new].into_iter().flatten() {
+            self.setNeedsDisplayInRect(r);
+        }
     }
 
     fn log(&self, line: String) {
@@ -238,11 +275,19 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, border_frac: f64) 
     window.setLevel(NSScreenSaverWindowLevel);
     window.setBackgroundColor(Some(&NSColor::blackColor()));
 
+    // The marker is about 7% of the screen height across, rendered at twice that in pixels.
+    let marker_size = (sh * 0.07).round();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let marker_img = aim_marker((marker_size * 2.0) as usize);
+    let marker_ns = ns_image(&marker_img, NSSize::new(marker_size, marker_size))
+        .ok_or_else(|| anyhow!("could not build the aim marker"))?;
     let view = PageView::new(
         mtm,
         NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
         ViewIvars {
             page: page_ns,
+            marker: marker_ns,
+            marker_at: Cell::new(None),
             shared: shared.clone(),
             stop: stop.clone(),
         },
@@ -298,6 +343,7 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, border_frac: f64) 
     let seen = Cell::new(u64::MAX);
     let panel_size = NSSize::new(pw, ph);
     let app_t = app.clone();
+    let view_t = view.clone();
     let tick = RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
         let Ok(s) = shared.lock() else { return };
         if s.serial != seen.get() {
@@ -309,6 +355,7 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, border_frac: f64) 
                 processed_view.setImage(Some(&i));
             }
         }
+        view_t.move_marker(s.aim, marker_size);
         status.setStringValue(&NSString::from_str(&s.status));
         let text: Vec<&str> = s.log.iter().map(String::as_str).collect();
         log.setStringValue(&NSString::from_str(&text.join("\n")));

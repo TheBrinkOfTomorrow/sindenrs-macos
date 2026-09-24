@@ -173,6 +173,28 @@ pub fn page(w: u32, h: u32, border_frac: f64) -> Image {
     }
 }
 
+/// The aim marker: a thick ring with a cross, `size` pixels square, on a transparent (zero)
+/// background. Red, and kept dark enough to stay under the detection threshold like
+/// everything else inside the border, but big enough to see across a room.
+pub fn aim_marker(size: usize) -> Image {
+    let mut buf = vec![BLACK; size * size];
+    let s = i64::try_from(size).unwrap_or(0);
+    let mut c = Canvas {
+        px: &mut buf,
+        w: s,
+        h: s,
+    };
+    let colour = rgb(dim(255, 0.45), dim(40, 0.45), dim(40, 0.45));
+    let (mid, r) = (s / 2, s / 2 - s / 16);
+    c.ring(mid, mid, r, (s / 12).max(2), colour);
+    c.cross(mid, mid, r / 2, (s / 24).max(2), colour);
+    Image {
+        w: size,
+        h: size,
+        px: buf,
+    }
+}
+
 /// The target nearest to a shot at `at` (screen percent), and the shot's error from it.
 pub fn score(at: [f64; 2]) -> (usize, [f64; 2]) {
     let err = |t: [f64; 2]| [at[0] - t[0], at[1] - t[1]];
@@ -232,6 +254,23 @@ mod tests {
         let centre = img.px[90 * 320 + 160];
         assert_ne!(centre, BLACK, "target cross at the centre");
         assert!((centre >> 16) < 120, "target too bright: {centre:#08x}");
+    }
+
+    #[test]
+    fn aim_marker_is_a_dim_ring_on_transparent() {
+        let m = aim_marker(64);
+        assert_eq!(m.px[0], BLACK, "corners stay transparent");
+        assert!(m.px[32 * 64 + 32] >> 16 > 0, "cross at the centre");
+        let luma = |p: u32| {
+            let (r, g, b) = (
+                f64::from(p >> 16),
+                f64::from((p >> 8) & 0xff),
+                f64::from(p & 0xff),
+            );
+            0.299 * r + 0.587 * g + 0.114 * b
+        };
+        let max = m.px.iter().map(|&p| luma(p)).fold(0.0, f64::max);
+        assert!(max < 70.0, "marker too bright for the camera: luma {max}");
     }
 
     #[test]
