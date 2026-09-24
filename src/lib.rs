@@ -12,6 +12,7 @@
 //! the display server. Wayland, X11 and Windows only matter for the (future) border
 //! overlay, which will live behind its own module.
 
+pub mod activity;
 pub mod camera;
 pub mod config;
 pub mod discovery;

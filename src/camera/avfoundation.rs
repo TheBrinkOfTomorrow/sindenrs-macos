@@ -308,7 +308,13 @@ impl Device {
             let settings = NSDictionary::<NSString, AnyObject>::from_slices(&[key], &[&value]);
             output.setVideoSettings(Some(&settings));
             output.setAlwaysDiscardsLateVideoFrames(true);
-            let queue = DispatchQueue::new("sindenrs.camera", None);
+            // The frame callback feeds the tracker: give it the tracker's priority.
+            let attr = dispatch2::DispatchQueueAttr::with_qos_class(
+                None,
+                dispatch2::DispatchQoS::UserInteractive,
+                0,
+            );
+            let queue = DispatchQueue::new("sindenrs.camera", Some(&attr));
             output.setSampleBufferDelegate_queue(
                 Some(ProtocolObject::from_ref(&*sink)),
                 Some(&queue),
