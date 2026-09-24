@@ -59,6 +59,14 @@ pub struct Sample<'a> {
     /// macOS; `raw_ext` is its file extension.
     pub raw: &'a [u8],
     pub raw_ext: &'static str,
+    /// The luma the solve ran on (after the configured flip), `width * height`.
+    pub luma: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    /// The detection threshold used on `luma`.
+    pub threshold: u8,
+    /// The camera pixel treated as the bore axis, after any flip.
+    pub aim_pixel: [f64; 2],
     pub aim: Option<[f64; 2]>,
     pub quad: Option<Quad>,
     /// The camera frame's corners in screen percent (TL, TR, BR, BL of the image), i.e.
@@ -509,6 +517,11 @@ pub fn run_tracker_with(
         let flow = hook(&Sample {
             raw: frame.raw,
             raw_ext: frame.raw_ext,
+            luma: l,
+            width: w,
+            height: h,
+            threshold,
+            aim_pixel: aim_px,
             aim,
             quad,
             view,

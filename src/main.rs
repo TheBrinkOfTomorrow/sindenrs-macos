@@ -406,6 +406,11 @@ struct TrackArgs {
     /// Print one line per frame.
     #[arg(long)]
     per_frame: bool,
+    /// Show a full-screen page with the border, aiming targets, the camera feed and what the
+    /// detector made of it, and log every click against the targets (macOS). Runs until Esc;
+    /// --frames does not apply.
+    #[arg(long)]
+    preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1943,9 +1948,14 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         per_frame: a.per_frame,
         report_every: Some(Duration::from_secs(1)),
     };
-    let stop = AtomicBool::new(false);
     let status = Arc::new(Mutex::new(Status::default()));
-    run_tracker(&name, &camera, gun, &opts, &stop, &status)?;
+    if a.preview {
+        let border = ctx.display.border_thickness / 100.0;
+        track_with_preview(name, camera, gun, opts, status.clone(), border)?;
+    } else {
+        let stop = AtomicBool::new(false);
+        run_tracker(&name, &camera, gun, &opts, &stop, &status)?;
+    }
     let s = status.lock().map(|s| s.clone()).unwrap_or_default();
     println!(
         "frames={} found={} ({:.0}%) processing mean={} age mean={} events={}",
@@ -1964,6 +1974,107 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         println!("last corners: {q:?}");
     }
     Ok(())
+}
+
+/// `debug track --preview`: the tracker on a worker thread feeding the preview page, which
+/// owns the main thread until Esc (or the tracker stops).
+#[cfg(target_os = "macos")]
+fn track_with_preview(
+    name: String,
+    camera: PathBuf,
+    gun: Option<(Gun, sindenrs::config::GunConfig)>,
+    mut opts: sindenrs::runtime::TrackerOptions,
+    status: std::sync::Arc<std::sync::Mutex<sindenrs::runtime::Status>>,
+    border_frac: f64,
+) -> Result<()> {
+    use sindenrs::preview::{self, Shared};
+    use sindenrs::protocol::event::Event;
+    use sindenrs::runtime::{run_tracker_with, Flow, Sample};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    opts.frames = 0;
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (shared, stop) = (shared.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let (mut n, mut window, mut fps) = (0u64, (Instant::now(), 0u32), 0.0);
+            let mut hook = |s: &Sample| -> Flow {
+                n += 1;
+                window.1 += 1;
+                if window.0.elapsed() >= Duration::from_secs(1) {
+                    fps = f64::from(window.1) / window.0.elapsed().as_secs_f64();
+                    window = (Instant::now(), 0);
+                }
+                let Ok(mut sh) = shared.lock() else {
+                    return Flow::Continue;
+                };
+                sh.aim = s.aim;
+                for ev in s.events {
+                    if let Event::Buttons { state1, state2, .. } = ev {
+                        sh.push_log(format!("gun buttons s1={state1:08b} s2={state2:08b}"));
+                    }
+                }
+                // Previews at half the frame rate are plenty to watch.
+                if n % 2 == 0 {
+                    let (camera, processed) = preview::images_for(s);
+                    sh.camera = camera;
+                    sh.processed = processed;
+                    sh.serial += 1;
+                }
+                let solve = s.quad.map_or_else(
+                    || "no border".to_owned(),
+                    |q| {
+                        format!(
+                            "{} sides {} tabs{}",
+                            q.sides.count_ones(),
+                            q.tabs,
+                            if q.from_lines { "" } else { " (hull)" }
+                        )
+                    },
+                );
+                let aim = s.aim.map_or_else(
+                    || "-".to_owned(),
+                    |a| format!("({:5.1}%, {:5.1}%)", a[0], a[1]),
+                );
+                sh.status = format!(
+                    "{fps:4.1} fps  aim {aim}  {solve}  age {:.0} ms   Esc quits",
+                    s.age.map_or(0.0, |a| a.as_secs_f64() * 1000.0)
+                );
+                Flow::Continue
+            };
+            let r = run_tracker_with(&name, &camera, gun, &opts, &stop, &status, &mut hook);
+            if let Ok(mut sh) = shared.lock() {
+                sh.done = true;
+            }
+            r
+        })
+    };
+    let shown = preview::appkit::run(shared.clone(), stop.clone(), border_frac);
+    stop.store(true, Ordering::Relaxed);
+    let tracked = worker
+        .join()
+        .map_err(|_| anyhow!("the tracker thread panicked"))?;
+    if let Ok(sh) = shared.lock() {
+        for line in &sh.history {
+            println!("{line}");
+        }
+    }
+    shown?;
+    tracked
+}
+
+#[cfg(target_os = "linux")]
+fn track_with_preview(
+    _name: String,
+    _camera: PathBuf,
+    _gun: Option<(Gun, sindenrs::config::GunConfig)>,
+    _opts: sindenrs::runtime::TrackerOptions,
+    _status: std::sync::Arc<std::sync::Mutex<sindenrs::runtime::Status>>,
+    _border_frac: f64,
+) -> Result<()> {
+    bail!("--preview is only available on macOS so far")
 }
 
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.

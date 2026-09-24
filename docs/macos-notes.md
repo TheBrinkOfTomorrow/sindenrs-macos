@@ -191,3 +191,29 @@ prototype), and `run-bundled.sh --bin target/release/sindenrs -- debug track --f
   frame age 31 ms mean. The debug build takes ~20 ms/frame and drains every other frame.
 - The per-second report prints "no border" whenever there is no *aim*, including frames with a
   quad whose solve is not trusted (hull only), so it undercounts detection.
+
+## 2026-09-24 — Cursor test with the preview page (`debug track --send --preview`)
+
+`src/preview.rs` (platform-neutral: shared state, panel rendering, targets, shot scoring;
+tested) and `src/preview/appkit.rs` (the page: a borderless full-screen window at screen-saver
+level on the main thread, with the tracker on a worker). The page shows the coded border,
+five dim targets, the camera feed and the processed view (pixels over the threshold, the
+solved quad, the aim pixel), a status line and a log of every click and key, each click
+scored against the nearest target. Everything inside the border is drawn at 25% brightness
+so the camera does not take a preview for border. Esc ends it and the full log is printed.
+
+With `--send` the tracker drives the gun, whose HID mouse moves the macOS cursor. The gun was
+held at ~1-2 m and moved around the screen (not aimed at the targets, so the shot scores say
+nothing about accuracy); bore from the gun's EEPROM (+3.29% / +0.69%).
+
+The click positions match the tracker's aim to within 0.1%, so camera → solve → gun → HID →
+click works end to end. Over the whole 143 s session: 91% of frames found, 2.84 ms mean
+processing, 31 ms mean frame age; d-pad and rear buttons arrive as keys, trigger / pump /
+front buttons as left / right / right / middle clicks. In the last ~30 s the gun was turned
+and the lens covered at times; aim went off screen (to 109%) or was lost, and trigger and
+pump presses then produced serial events but no clicks on the page (likely the gun treating
+itself as off screen).
+
+Observed by eye: tracking follows the gun well over most of the screen but fails near the top
+left and top right corners. Aim accuracy against where the gun physically points is not
+measured yet: that needs aimed shots at the targets, or `calibrate` once it runs on macOS.
