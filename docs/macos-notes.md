@@ -308,3 +308,18 @@ Bias dx -0.02%, dy +0.44%. The bore it would set is +3.31% / +0.66% (agreement �
 ±0.48) against the +3.29% / +0.69% already in the gun's EEPROM: the factory calibration is
 right, so nothing needs saving (and nothing was written). 28% of frames still had the border
 clipped at the frame edge; stepping further back would help the top-middle target.
+
+## 2026-09-24 — Phase 2: packaging (`tools/macos/bundle.sh`, `login-item.sh`)
+
+`bundle.sh` builds `target/macos/Sindenrs.app` (`dev.sindenrs.sindenrs`, `LSUIElement`, a
+camera usage description, the crate version) and signs it with `$SINDENRS_SIGN_IDENTITY`,
+default "sindenrs dev": a self-signed Code Signing certificate made once in Keychain Access
+(Certificate Assistant → Create a Certificate, Self-Signed Root, Code Signing). Self-signed
+certificates are untrusted, so `security find-identity -v` hides them, but `codesign` signs
+with them. Without the certificate the app is signed ad hoc, with a warning. The camera grant
+belongs to the app and its signature, so a fixed identity should keep it across rebuilds.
+`run-bundled.sh` now runs every test through this one app.
+
+`login-item.sh install` copies the app to `~/Applications` and loads a per-user launchd agent
+(`dev.sindenrs.run`) that runs `sindenrs run` at login, restarts it if it exits with an
+error, and logs to `~/Library/Logs/sindenrs.log`; `uninstall` removes the agent.

@@ -22,6 +22,15 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 - `cargo clippy --all-targets` — lint
 - `cargo fmt` — format
 
+### macOS
+
+- `tools/macos/bundle.sh [bin]` — package a build as `target/macos/Sindenrs.app`, signed with
+  `$SINDENRS_SIGN_IDENTITY` (default "sindenrs dev", a self-signed Code Signing certificate;
+  ad hoc without it). Camera access is granted to that app.
+- `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
+  the camera from an agent or IDE session); pass absolute paths.
+- `tools/macos/login-item.sh install|uninstall|status` — `sindenrs run` at login via launchd.
+
 ### Nix
 
 - `nix build` — build the package
