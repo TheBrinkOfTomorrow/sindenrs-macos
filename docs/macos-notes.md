@@ -313,7 +313,7 @@ clipped at the frame edge; stepping further back would help the top-middle targe
 
 `bundle.sh` builds `target/macos/Sindenrs.app` (`dev.sindenrs.sindenrs`, `LSUIElement`, a
 camera usage description, the crate version) and signs it with `$SINDENRS_SIGN_IDENTITY`,
-default "sindenrs dev": a self-signed Code Signing certificate made once in Keychain Access
+default "sindenrs_macos_dev": a self-signed Code Signing certificate made once in Keychain Access
 (Certificate Assistant → Create a Certificate, Self-Signed Root, Code Signing). Self-signed
 certificates are untrusted, so `security find-identity -v` hides them, but `codesign` signs
 with them. Without the certificate the app is signed ad hoc, with a warning. The camera grant
@@ -323,3 +323,8 @@ belongs to the app and its signature, so a fixed identity should keep it across 
 `login-item.sh install` copies the app to `~/Applications` and loads a per-user launchd agent
 (`dev.sindenrs.run`) that runs `sindenrs run` at login, restarts it if it exits with an
 error, and logs to `~/Library/Logs/sindenrs.log`; `uninstall` removes the agent.
+
+Checked with the certificate in place: the app's designated requirement is `identifier
+"dev.sindenrs.sindenrs" and certificate leaf = H"…"`, so it no longer depends on the build. A
+release and a debug build (different CDHashes, `c0bf70…` and `1b19c4…`) both captured
+(`debug camera capture`, ~60 fps) back to back with no permission prompt in between.

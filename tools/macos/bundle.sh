@@ -6,13 +6,13 @@
 # macOS grants the camera per app and remembers the grant by the app's code signature. An
 # ad-hoc signature changes with every build, so macOS may ask again after each rebuild; a
 # fixed signing identity keeps the grant. The identity is $SINDENRS_SIGN_IDENTITY, default
-# "sindenrs dev" (a self-signed Code Signing certificate made in Keychain Access); without it
+# "sindenrs_macos_dev" (a self-signed Code Signing certificate made in Keychain Access); without it
 # the app is signed ad hoc, with a warning. Prints the app's path.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 bin=${1:-"$root/target/release/sindenrs"}
-identity=${SINDENRS_SIGN_IDENTITY:-sindenrs dev}
+identity=${SINDENRS_SIGN_IDENTITY:-sindenrs_macos_dev}
 [ -x "$bin" ] || { echo "no binary at $bin; build it first (cargo build --release)" >&2; exit 1; }
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
