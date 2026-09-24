@@ -29,6 +29,8 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
   ad hoc without it). Camera access is granted to that app.
 - `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
   the camera from an agent or IDE session); pass absolute paths.
+- `run` on macOS has a menu bar item (gun status, Show Border, Quit) and a global ⌃⌥⌘Q to
+  quit; `tools/macos/stop.sh` does the same from a shell (all are Ctrl-C: a clean stop).
 - `tools/macos/login-item.sh install|uninstall|status` — opt-in `sindenrs run` at login via
   launchd. Off by default; do not install it unless the user asks.
 
@@ -71,6 +73,8 @@ hardware findings and the roadmap.
   frames over a channel. Camera access needs its own app bundle: `tools/macos/run-bundled.sh`
 - **src/camera/source.rs** — the tracker's camera: per-platform open + settings + luma frames
   (V4L2 MJPEG decode with truncation check on Linux, AVFoundation + UVC controls on macOS)
+- **src/menubar.rs** — macOS menu bar item and the Carbon ⌃⌥⌘Q hot key for `run` (no
+  Accessibility permission); `run` keeps AppKit on the main thread even without the overlay
 - **src/camera/uvc.rs** — UVC controls as raw class requests (topology parse, V4L2 CID → UVC
   selector map; pure, tested); `uvc/iokit.rs` sends them on macOS via the IOKit USB user client
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle; `src/discovery/macos.rs`
