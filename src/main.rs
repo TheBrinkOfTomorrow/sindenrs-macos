@@ -2078,7 +2078,7 @@ fn track_with_preview(
 }
 
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::collections::HashMap;
@@ -2274,7 +2274,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_all(_ctx: &Ctx, _overlay: bool) -> Result<()> {
     bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
