@@ -18,6 +18,8 @@ pub mod discovery;
 pub mod firmware;
 pub mod gun;
 pub mod ids;
+#[cfg(target_os = "macos")]
+pub mod menubar;
 pub mod overlay;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod preview;

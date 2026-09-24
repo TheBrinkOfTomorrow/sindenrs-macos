@@ -126,11 +126,16 @@ fn run_inner(scene: &Mutex<Scene>, stop: &AtomicBool) -> Result<()> {
         }
         px.clear();
         px.resize(w as usize * h as usize, 0);
-        draw::render(&mut px, w, h, &cur);
+        if !cur.hidden {
+            draw::render(&mut px, w, h, &cur);
+        }
         // Only the border exists while just tracking; the calibration UI needs its black
-        // backdrop, so then the whole window is opaque.
+        // backdrop, so then the whole window is opaque. Hidden, nothing exists.
         let rects;
-        let opaque = if cur.targets.is_empty() && cur.aim.is_none() {
+        let opaque = if cur.hidden {
+            rects = Vec::new();
+            Some(rects.as_slice())
+        } else if cur.targets.is_empty() && cur.aim.is_none() {
             rects = draw::border_rects(w, h, cur.border_frac);
             Some(rects.as_slice())
         } else {

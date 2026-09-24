@@ -555,8 +555,28 @@ enum AnyGunCmd {
     },
 }
 
+/// Opened as `Sindenrs.app` with no arguments (a double-click, Spotlight, `open`): nothing to
+/// print help to, so act as `sindenrs run` and log to a file. Run from a shell, no arguments
+/// still prints the help.
+#[cfg(target_os = "macos")]
+fn opened_as_app() -> bool {
+    std::env::args_os().len() == 1
+        && std::env::current_exe()
+            .is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn opened_as_app() -> bool {
+    false
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let as_app = opened_as_app();
+    let cli = if as_app {
+        Cli::parse_from(["sindenrs", "run"])
+    } else {
+        Cli::parse()
+    };
     let path = cli
         .config
         .clone()
@@ -575,10 +595,27 @@ fn main() -> Result<()> {
     let log = cli.log.clone().unwrap_or_else(|| cfg.global.log.clone());
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log));
-    tracing_subscriber::fmt()
+    let log_file = as_app
+        .then(|| {
+            let path = std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Library/Logs/Sindenrs.log"))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        })
+        .flatten();
+    let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    match log_file {
+        Some(f) => fmt
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(f))
+            .init(),
+        None => fmt.init(),
+    }
     let display = cfg.display_for(cli.profile.as_deref())?;
     let ctx = Ctx {
         path,
@@ -2083,6 +2120,20 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // One `run` per user on macOS: opening Sindenrs.app again (or a second `run`) would fight
+    // the first for the cameras and draw a second border. The lock goes with the process.
+    #[cfg(target_os = "macos")]
+    let _single = {
+        let path = std::env::temp_dir().join("sindenrs-run.lock");
+        let f =
+            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        if f.try_lock().is_err() {
+            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+            return Ok(());
+        }
+        f
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -2097,42 +2148,73 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
         ctx.display.border_thickness / 100.0,
     )));
 
-    // AppKit windows live on the main thread, so on macOS the overlay takes it and the guns
-    // are supervised beside it; losing the overlay still leaves the guns tracking.
+    // AppKit lives on the main thread, so on macOS it takes it (for the overlay, and for the
+    // menu bar item and ⌃⌥⌘Q, which quit like Ctrl-C) and the guns are supervised beside it.
+    // Losing the overlay still leaves the guns tracking and the menu working.
+    // `return` so that on other platforms the path below is what runs.
     #[cfg(target_os = "macos")]
-    if overlay {
+    #[allow(clippy::needless_return)]
+    {
+        let status = Arc::new(Mutex::new(Vec::new()));
         return std::thread::scope(|sc| {
-            let guns = sc.spawn(|| supervise_guns(ctx, &stop));
-            if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
-                warn!("overlay: {e:#}; tracking continues without it");
+            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status)));
+            let menu = sindenrs::menubar::MenuBar::install(
+                stop.clone(),
+                scene.clone(),
+                status.clone(),
+                overlay,
+            )
+            .inspect_err(|e| warn!("menu bar: {e:#}"))
+            .ok();
+            let shown = if overlay {
+                sindenrs::overlay::run_until(scene, &stop)
+                    .inspect_err(|e| warn!("overlay: {e:#}; tracking continues without it"))
+                    .is_ok()
+            } else {
+                false
+            };
+            if !shown && !stop.load(Ordering::Relaxed) {
+                if let Err(e) = sindenrs::menubar::pump_until(&stop) {
+                    warn!("event loop: {e:#}");
+                }
             }
+            drop(menu);
             guns.join()
                 .map_err(|_| anyhow!("the gun supervisor panicked"))?
         });
     }
 
-    let overlay_thread = overlay.then(|| {
-        let stop = stop.clone();
-        std::thread::Builder::new()
-            .name("overlay".into())
-            .spawn(move || {
-                if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
-                    warn!("overlay: {e:#}; tracking continues without it");
-                }
-            })
-    });
+    // Elsewhere the overlay has a thread of its own and the guns are supervised here.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let overlay_thread = overlay.then(|| {
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("overlay".into())
+                .spawn(move || {
+                    if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
+                        warn!("overlay: {e:#}; tracking continues without it");
+                    }
+                })
+        });
 
-    let r = supervise_guns(ctx, &stop);
-    if let Some(Ok(t)) = overlay_thread {
-        let _ = t.join();
+        let r = supervise_guns(ctx, &stop, None);
+        if let Some(Ok(t)) = overlay_thread {
+            let _ = t.join();
+        }
+        r
     }
-    r
 }
 
 /// `run`'s gun supervisor: rediscover every second, start a tracker for each gun that
 /// appears, reap the ones that end, print a status line, and stop them all once `stop` is set.
+/// With `status_out`, it also keeps one line per gun there (the macOS menu shows them).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn supervise_guns(ctx: &Ctx, stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+fn supervise_guns(
+    ctx: &Ctx,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    status_out: Option<&std::sync::Mutex<Vec<String>>>,
+) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -2246,6 +2328,11 @@ fn supervise_guns(ctx: &Ctx, stop: &std::sync::Arc<std::sync::atomic::AtomicBool
         }
 
         if running.is_empty() {
+            if let Some(out) = status_out {
+                if let Ok(mut o) = out.lock() {
+                    *o = vec!["No gun attached".to_owned()];
+                }
+            }
             if !announced_empty {
                 info!("no gun attached; waiting (Ctrl-C to stop)");
                 announced_empty = true;
@@ -2253,6 +2340,7 @@ fn supervise_guns(ctx: &Ctx, stop: &std::sync::Arc<std::sync::atomic::AtomicBool
         } else {
             announced_empty = false;
             let mut line = format!("{:>6.0}s", started.elapsed().as_secs_f64());
+            let mut menu_lines = Vec::new();
             let mut names: Vec<&String> = running.keys().collect();
             names.sort();
             for key in names {
@@ -2277,8 +2365,24 @@ fn supervise_guns(ctx: &Ctx, stop: &std::sync::Arc<std::sync::atomic::AtomicBool
                     s.proc_mean.as_secs_f64() * 1000.0,
                     if s.clipped { " clipped" } else { "" },
                 ));
+                menu_lines.push(format!(
+                    "{}: {:.0} fps, border found {:.0}%{}",
+                    s.name,
+                    s.fps,
+                    if s.frames > 0 {
+                        s.found as f64 * 100.0 / s.frames as f64
+                    } else {
+                        0.0
+                    },
+                    if s.clipped { ", clipped" } else { "" },
+                ));
             }
             println!("{line}");
+            if let Some(out) = status_out {
+                if let Ok(mut o) = out.lock() {
+                    *o = menu_lines;
+                }
+            }
         }
         // Sleep in short steps so Ctrl-C is prompt.
         for _ in 0..10 {

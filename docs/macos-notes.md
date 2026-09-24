@@ -330,3 +330,28 @@ Checked with the certificate in place: the app's designated requirement is `iden
 "dev.sindenrs.sindenrs" and certificate leaf = H"…"`, so it no longer depends on the build. A
 release and a debug build (different CDHashes, `c0bf70…` and `1b19c4…`) both captured
 (`debug camera capture`, ~60 fps) back to back with no permission prompt in between.
+
+## 2026-09-24 — Phase 3 start: controls, the app, ARMSX2
+
+- **Menu bar and shortcuts** (`src/menubar.rs`): an `NSStatusItem` (SF Symbol `scope`) whose
+  menu is rebuilt on open (gun status lines from the supervisor, Show Border, Quit), and two
+  Carbon `RegisterEventHotKey` hot keys, ⌃⌥⌘Q (quit, via the Ctrl-C flag) and ⌥B (the overlay
+  scene's new `hidden` flag). No Accessibility permission. `run` keeps AppKit on the main
+  thread with or without the overlay (`pump_until` when there is none). Checked: ⌃⌥⌘Q quits
+  from a full-screen game. The overlay's top band covers the menu bar, so the item is only
+  visible with the border hidden (⌥B).
+- **Clickable app**: opened as `Sindenrs.app` with no arguments, the binary runs `run` and logs
+  to `~/Library/Logs/Sindenrs.log`; a lock in the temp dir keeps one `run` per user. An icon
+  (`make-icon.swift` → `AppIcon.icns`); `install.sh` copies the release app into place.
+- **Overlay fix**: the macOS backend showed the calibration status panel (quality bar, side
+  frames) that the scene always draws, because it only cleared black; the X11/Wayland windows
+  are shaped to the border's rectangles. Now everything outside the opaque rectangles is
+  transparent (tested against the real renderer).
+- **ARMSX2 + Virtua Cop Elite Edition**: GunCon 2 on USB port 1 bound as in
+  `docs/macos-emulators.md` (profile `Sinden-P1`); full screen with a centred 4:3 picture on
+  16:9, shooting accurate, border on top. A first attempt at binding looked broken: presses
+  land where the gun aims, so aiming away from the ARMSX2 window sent clicks elsewhere (at one
+  point to the Dock, with tracking lost and the last aim below the screen).
+- A `sindenrs` crash report (SIGABRT, a release-build panic) from 12:24 that day came from a
+  bare command-line run during the corner-frame analysis, not from `run`; no symbols. Watch
+  for a repeat.

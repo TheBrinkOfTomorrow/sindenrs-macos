@@ -27,7 +27,13 @@ use super::{aim_marker, page, score, Image, Shared, TARGETS};
 /// An `NSImage` of a preview image; black is transparent, so the marker draws without a
 /// square around it (everything else here sits on the black page anyway).
 fn ns_image(img: &Image, size: NSSize) -> Option<Retained<NSImage>> {
-    crate::overlay::macos::ns_image(&img.px, img.w, img.h, size, true)
+    crate::overlay::macos::ns_image(
+        &img.px,
+        img.w,
+        img.h,
+        size,
+        crate::overlay::macos::Clear::Black,
+    )
 }
 
 struct ViewIvars {

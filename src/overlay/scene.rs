@@ -33,6 +33,9 @@ pub struct Scene {
     /// Set to flash the current target when a shot could not be measured.
     pub flash_until: Option<Instant>,
     pub done: bool,
+    /// Draw nothing at all (the window stays, fully transparent): the border switched off
+    /// from the macOS menu bar, e.g. while the game or MAME artwork draws its own.
+    pub hidden: bool,
 }
 
 /// What the tracker's last solve was built from, shown so the operator can tell a
