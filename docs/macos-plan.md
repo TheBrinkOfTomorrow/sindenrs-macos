@@ -24,7 +24,7 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 |-------|-------|
 | 0 — Hardware check | **done** |
 | 1 — macOS backends | **done** |
-| 2 — Border overlay | in progress: overlay done; calibrate, packaging, emulator check left |
+| 2 — Border overlay | in progress: overlay and calibrate done; packaging, emulator check left |
 | 3 — Emulator setup | not started |
 | 4 — Two players | optional, not started |
 
@@ -67,7 +67,9 @@ Measurements and decisions are in `docs/macos-notes.md`.
   border and tracks against it (100% of frames found); clicks pass through; it stays on top of
   apps in native full screen. Still to check: the emulators' own full-screen modes.
 - `calibrate` on macOS: it draws its targets through the overlay, so it follows the overlay.
-  It is also the first real accuracy measurement (aimed shots, not just tracking).
+  **Done:** works as on Linux; measured mean error 1.14% of the screen over a 3x3 grid, and
+  the bore it measures matches the gun's stored factory calibration, so nothing was saved.
+  Run it with `--no-save`: nothing is written to the gun unless the user asks.
 - Package `sindenrs` as an app with a stable signing identity, so the camera grant survives
   rebuilds and `run` can start at login.
 - Fallback: emulator post-processing shaders that draw the coded border.
