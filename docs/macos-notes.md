@@ -378,3 +378,9 @@ emulator. Fix (`src/activity.rs`): `run`, `debug track` and `calibrate` hold an
 idle sleep), each tracker thread sets `QOS_CLASS_USER_INTERACTIVE`, and the AVFoundation
 callback queue gets the same QoS. Checked: `pmset -g assertions` lists "tracking the Sinden
 Lightgun", the process runs at priority 58 (default 31). To be confirmed in play.
+
+Confirmed in play with the installed app (the fixed build): Virtua Cop on ARMSX2 is back to
+normal: steady pointer, shots on time and where aimed, pump reload working. The 5.5-minute
+session found the border in 91% of frames at 4.5 ms mean processing, with the Backblaze upload
+still running. Lesson: macOS will starve a windowless helper under load unless it says it is
+latency-critical; do this for anything real-time.
