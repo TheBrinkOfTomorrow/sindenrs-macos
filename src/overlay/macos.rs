@@ -26,14 +26,25 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 use super::draw::{self, Rect};
 use super::{Backend, Event};
 
-/// An `NSImage` of `px` (row-major `0x00RRGGBB`, `w * h` long), `size` points big. With
-/// `black_is_clear`, pure black pixels are fully transparent.
+/// Which pixels of an image are see-through.
+#[derive(Clone, Copy)]
+pub(crate) enum Clear<'a> {
+    /// None: the whole image is opaque.
+    Nothing,
+    /// Pure black pixels.
+    Black,
+    /// Everything outside these rectangles, like the shaped windows of the other backends.
+    Outside(&'a [Rect]),
+}
+
+/// An `NSImage` of `px` (row-major `0x00RRGGBB`, `w * h` long), `size` points big, with the
+/// pixels `clear` names fully transparent.
 pub(crate) fn ns_image(
     px: &[u32],
     w: usize,
     h: usize,
     size: NSSize,
-    black_is_clear: bool,
+    clear: Clear<'_>,
 ) -> Option<Retained<NSImage>> {
     // AppKit rejects a zero-sized bitmap (a preview before its first frame).
     if w == 0 || h == 0 || px.len() < w * h {
@@ -65,16 +76,40 @@ pub(crate) fn ns_image(
     let out = unsafe { std::slice::from_raw_parts_mut(data, w * h * 4) };
     for (o, &p) in out.chunks_exact_mut(4).zip(px) {
         let [b, g, r, _] = p.to_le_bytes();
-        let a = if black_is_clear && p == draw::BLACK {
-            0
-        } else {
-            0xff
+        let a = match clear {
+            Clear::Black if p == draw::BLACK => 0,
+            _ => 0xff,
         };
         o.copy_from_slice(&[r, g, b, a]);
+    }
+    if let Clear::Outside(rects) = clear {
+        for (o, k) in out.chunks_exact_mut(4).zip(inside(w, h, rects)) {
+            if !k {
+                o.copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
     }
     let ns = NSImage::initWithSize(NSImage::alloc(), size);
     ns.addRepresentation(&rep);
     Some(ns)
+}
+
+/// For each pixel of a `w`x`h` image, whether it lies inside one of `rects`.
+fn inside(w: usize, h: usize, rects: &[Rect]) -> Vec<bool> {
+    let mut keep = vec![false; w * h];
+    for r in rects {
+        let x0 = usize::try_from(r.x.max(0)).unwrap_or(0).min(w);
+        let y0 = usize::try_from(r.y.max(0)).unwrap_or(0).min(h);
+        let x1 = (x0 + r.w as usize).min(w);
+        let y1 = (y0 + r.h as usize).min(h);
+        if w == 0 || x0 >= x1 {
+            continue;
+        }
+        for row in keep.chunks_exact_mut(w).take(y1).skip(y0) {
+            row[x0..x1].fill(true);
+        }
+    }
+    keep
 }
 
 /// Stop `-[NSApplication run]` from inside a callback: `stop:` takes effect after the next
@@ -163,9 +198,11 @@ impl Backend for MacOverlay {
 
     fn present(&mut self, px: &[u32], opaque: Option<&[Rect]>) -> Result<()> {
         let (w, h) = self.size();
-        // With opaque rectangles the scene is the border alone, drawn on black; clearing black
-        // leaves exactly the border. Without them the whole window is opaque.
-        let img = ns_image(px, w as usize, h as usize, self.size, opaque.is_some())
+        // Only the opaque rectangles exist (as on the shaped X11 and Wayland windows); the rest
+        // of the scene, such as the calibration status panel, is not shown. Without them the
+        // whole window is opaque.
+        let clear = opaque.map_or(Clear::Nothing, Clear::Outside);
+        let img = ns_image(px, w as usize, h as usize, self.size, clear)
             .ok_or_else(|| anyhow!("could not build the overlay image"))?;
         self.view.setImage(Some(&img));
         Ok(())
@@ -195,5 +232,49 @@ impl Backend for MacOverlay {
 impl Drop for MacOverlay {
     fn drop(&mut self) {
         self.window.orderOut(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inside;
+    use crate::overlay::draw::{self, border_rects, BLACK, WHITE};
+    use crate::overlay::Scene;
+
+    /// A border-only scene still paints the calibration status panel; only the border's
+    /// rectangles may show, as on the shaped Linux windows.
+    #[test]
+    fn only_the_border_shows() {
+        let (w, h) = (640u32, 360u32);
+        let mut px = vec![BLACK; (w * h) as usize];
+        draw::render(&mut px, w, h, &Scene::border_only(0.03));
+        let keep = inside(w as usize, h as usize, &border_rects(w, h, 0.03));
+        let hidden = px
+            .iter()
+            .zip(&keep)
+            .filter(|(&p, &k)| !k && p != BLACK)
+            .count();
+        assert!(
+            hidden > 0,
+            "the scene draws a status panel besides the border"
+        );
+        for (&p, &k) in px.iter().zip(&keep) {
+            if k {
+                assert_eq!(p, WHITE, "a kept pixel that is not border");
+            }
+        }
+    }
+
+    #[test]
+    fn rects_are_clipped_to_the_image() {
+        let r = [draw::Rect {
+            x: -5,
+            y: 2,
+            w: 20,
+            h: 50,
+        }];
+        let keep = inside(10, 4, &r);
+        assert_eq!(keep.iter().filter(|&&k| k).count(), 10 * 2);
+        assert!(inside(0, 0, &r).is_empty());
     }
 }
