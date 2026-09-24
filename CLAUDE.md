@@ -27,6 +27,9 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 - `tools/macos/bundle.sh [bin]` — package a build as `target/macos/Sindenrs.app`, signed with
   `$SINDENRS_SIGN_IDENTITY` (default "sindenrs_macos_dev", a self-signed Code Signing certificate;
   ad hoc without it). Camera access is granted to that app.
+- `tools/macos/install.sh [dir]` — build the release app and copy it to `/Applications` (or
+  `dir`). Opening Sindenrs.app with no arguments runs `sindenrs run`, logging to
+  `~/Library/Logs/Sindenrs.log`; a second `run` exits (one per user).
 - `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
   the camera from an agent or IDE session); pass absolute paths.
 - `run` on macOS has a menu bar item (gun status, Show Border, Quit) and global shortcuts:

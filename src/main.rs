@@ -555,8 +555,28 @@ enum AnyGunCmd {
     },
 }
 
+/// Opened as `Sindenrs.app` with no arguments (a double-click, Spotlight, `open`): nothing to
+/// print help to, so act as `sindenrs run` and log to a file. Run from a shell, no arguments
+/// still prints the help.
+#[cfg(target_os = "macos")]
+fn opened_as_app() -> bool {
+    std::env::args_os().len() == 1
+        && std::env::current_exe()
+            .is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn opened_as_app() -> bool {
+    false
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let as_app = opened_as_app();
+    let cli = if as_app {
+        Cli::parse_from(["sindenrs", "run"])
+    } else {
+        Cli::parse()
+    };
     let path = cli
         .config
         .clone()
@@ -575,10 +595,27 @@ fn main() -> Result<()> {
     let log = cli.log.clone().unwrap_or_else(|| cfg.global.log.clone());
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log));
-    tracing_subscriber::fmt()
+    let log_file = as_app
+        .then(|| {
+            let path = std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Library/Logs/Sindenrs.log"))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        })
+        .flatten();
+    let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    match log_file {
+        Some(f) => fmt
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(f))
+            .init(),
+        None => fmt.init(),
+    }
     let display = cfg.display_for(cli.profile.as_deref())?;
     let ctx = Ctx {
         path,
@@ -2082,6 +2119,20 @@ fn track_with_preview(
 fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    // One `run` per user on macOS: opening Sindenrs.app again (or a second `run`) would fight
+    // the first for the cameras and draw a second border. The lock goes with the process.
+    #[cfg(target_os = "macos")]
+    let _single = {
+        let path = std::env::temp_dir().join("sindenrs-run.lock");
+        let f =
+            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        if f.try_lock().is_err() {
+            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+            return Ok(());
+        }
+        f
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     {
