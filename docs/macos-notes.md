@@ -248,3 +248,26 @@ display. The preview page now draws its own marker at the aim: a thick dark-red 
 ~7% of the screen height, under the detection threshold like the rest of the page. Checked on
 hardware: easy to see from the shooting position, follows the gun smoothly, and clicks land
 within 0.3% of it. Tracking during that 35 s run found the border in 85% of frames.
+
+## 2026-09-24 — Phase 2: the macOS overlay (`src/overlay/macos.rs`)
+
+The overlay is an ordinary `Backend`: a borderless window over the main screen at screen-saver
+level (layer 1000), `CanJoinAllSpaces | FullScreenAuxiliary | Stationary | IgnoresCycle`,
+`ignoresMouseEvents`, never key, and an accessory app (no Dock icon), so the game keeps focus.
+`present` shows the rendered scene as an `NSImage`, with black transparent while only the
+border shows; `pump` runs the AppKit event loop by hand for up to its timeout. So the shared
+overlay loop (and `border`, and later `calibrate`) works unchanged; the one macOS rule is that
+it must run on the main thread. `run` therefore gives the main thread to the overlay on macOS
+and supervises the guns on a scoped thread (`supervise_guns`, moved out of `run_all`
+unchanged); Linux keeps the overlay on its own thread.
+
+- `sindenrs border`: window listed on screen (layer 1000, 3360x1890); Ctrl-C closes it and the
+  process exits.
+- `sindenrs run` (overlay on), 60 s: window up throughout; 3307/3307 frames found at 58-61 fps
+  (6.7 ms mean) against the overlay's own border; the cursor followed the aim (318 moves logged);
+  clean exit on Ctrl-C.
+- Checked by eye: the border shows around the whole edge, including over the menu bar and Dock;
+  mouse clicks pass through to the apps underneath; with an app in native full screen the
+  border stays on top and the gun still drives the cursor.
+- Not yet tried: the emulators' own full-screen modes (Metal, possibly exclusive), Phase 2's
+  remaining risk.
