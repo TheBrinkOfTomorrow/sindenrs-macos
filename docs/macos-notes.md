@@ -237,5 +237,5 @@ bright as the border (saturated at exposure 78):
   edge lines (8/19 as recorded, 7 not found).
 
 They only matter when aiming high into a corner, which puts them beside the border in the
-frame. Remedies: dim or cover them in the room; upstream, the detector could reject a line
-fitted outside an edge that already has decoded tabs (worth reporting with these frames).
+frame. Remedies: dim or cover them in the room; in the detector, reject a line fitted just
+outside an edge that already has decoded tabs.
