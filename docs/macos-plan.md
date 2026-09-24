@@ -24,8 +24,8 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 |-------|-------|
 | 0 — Hardware check | **done** |
 | 1 — macOS backends | **done** |
-| 2 — Border overlay | in progress: overlay, calibrate, packaging done; emulator check left |
-| 3 — Emulator setup | not started |
+| 2 — Border overlay | **done** (per-emulator full-screen checks continue in Phase 3) |
+| 3 — Emulator setup | in progress: ARMSX2 done; Flycast, Mednafen, RPCS3 next |
 | 4 — Two players | optional, not started |
 
 Measurements and decisions are in `docs/macos-notes.md`.
@@ -83,11 +83,21 @@ Measurements and decisions are in `docs/macos-notes.md`.
 - Frame age is ~31 ms on macOS against ~16 ms on Linux; measure end to end.
 - `sindenrs list` gives Linux-only advice when a port cannot be opened.
 
-### Phase 3 — Single-player emulator setup
-- PCSX2: GunCon2 bound to pointer.
-- Dolphin: Wii Remote IR bound to cursor.
-- RPCS3: GunCon 3 bound to mouse.
-- Document working configs; add calibration steps.
+### Phase 3 — Single-player emulator setup — in progress
+The emulators actually in use: ARMSX2 (Apple-silicon PCSX2 fork), Flycast, Mednafen (Saturn)
+and RPCS3. Working configs go in `docs/macos-emulators.md`.
+- ARMSX2 (PS2): GunCon 2 on the pointer. **Done:** Virtua Cop Elite Edition, full screen, 4:3;
+  accurate, and the border stays on top.
+- Flycast (Dreamcast / NAOMI / Atomiswave): light gun on the mouse.
+- Mednafen (Saturn): Virtua Gun / Stunner on the mouse.
+- RPCS3 (PS3): GunCon 3 on the mouse; needs the PS3 system software.
+- Supporting pieces, done: `Sindenrs.app` starts `run` when opened, with an icon, a menu bar
+  item (gun status, Show Border, Quit), ⌥B to toggle the border and ⌃⌥⌘Q to quit, and one
+  instance at a time; starting at login is opt-in and off.
+- Later: a 4:3 border mode, cycled with ⌥B like the vendor's Alt-B. The tracker already
+  supports it through `display.aspect` and `ratio_x` / `offset_x`, but switching live needs
+  the tracking loop to take display settings at run time. Not needed for accuracy: with the
+  full-screen border, the emulator maps the pointer into its 4:3 picture itself.
 
 ### Phase 4 (optional) — Two players
 - macOS merges all mice into one cursor. Each emulator must read each gun's HID device
