@@ -49,7 +49,8 @@ hardware findings and the roadmap.
 - **src/config.rs** — TOML config (global / display+profiles / `[gun]` baseline + `[guns."<id>"]`
   overrides); `~/.config/sindenrs/config.toml`; `to_toml` writes only non-default keys
 - **src/gun.rs** — serial session with one gun; `apply_config` sends the vendor startup burst
-- **src/runtime.rs** — the per-gun tracking loop shared by `debug track`, `run` and `calibrate`;
+- **src/runtime.rs** — the per-gun tracking loop shared by `debug track`, `run` and `calibrate`
+  (Linux and macOS; `run`/`calibrate` still Linux-only for the overlay);
   `JumpGuard` holds a frame that leaps on a weaker solve
 - **src/overlay/** — the on-screen border and calibration UI: `draw.rs` CPU renderer, `scene.rs`
   shared state, `x11.rs` (x11rb: override-redirect, shaped, click-through, re-raised) and
@@ -58,6 +59,8 @@ hardware findings and the roadmap.
 - **src/camera/v4l2/** — hand-written V4L2 ABI + capture; `sys.rs` tests pin struct sizes
 - **src/camera/avfoundation.rs** — macOS capture (objc2): `420v` luma by `uniqueID`, pooled
   frames over a channel. Camera access needs its own app bundle: `tools/macos/run-bundled.sh`
+- **src/camera/source.rs** — the tracker's camera: per-platform open + settings + luma frames
+  (V4L2 MJPEG decode with truncation check on Linux, AVFoundation + UVC controls on macOS)
 - **src/camera/uvc.rs** — UVC controls as raw class requests (topology parse, V4L2 CID → UVC
   selector map; pure, tested); `uvc/iokit.rs` sends them on macOS via the IOKit USB user client
 - **src/discovery.rs**, **src/usb.rs** — sysfs discovery, hub power-cycle; `src/discovery/macos.rs`

@@ -167,3 +167,27 @@ as the V4L2 device.
 - The first bundled run after this rebuild sat in the camera-permission prompt until it was
   answered (earlier rebuilds had not re-prompted). An ad-hoc signature changes with every
   build, and TCC may tie the grant to it; a stable signing identity would avoid re-prompts.
+
+## 2026-09-24 — Phase 1: tracking (`src/camera/source.rs`, `src/runtime.rs`)
+
+The tracker was Linux-only: it opened V4L2, decoded MJPEG and set controls itself. A frame
+source (`camera::source::{Camera, Frames}`) now does that per platform and yields luma frames
+(`Next::Frame` / `Timeout` / `Corrupt`); the loop is otherwise unchanged. Linux keeps its
+truncated-frame check and decode (moved, not changed), corrupt frames still count toward the
+frame total, and the decode time is still part of the processing time. `Sample::raw` carries
+`raw_ext` (`jpg` on Linux, `pgm` on macOS) so recordings and calibrate's debug shots get the
+right extension, and `debug replay` reads both. Linux is checked with
+`cargo clippy --all-targets --target x86_64-unknown-linux-gnu` (build only, no run).
+
+Test: the coded border from `border export --resolution 3360x1890`, shown full screen by
+`tools/macos/show_border.swift` (transparent, click-through, screen-saver level: an overlay
+prototype), and `run-bundled.sh --bin target/release/sindenrs -- debug track --frames 2400`.
+
+- First run, gun lying rolled ~90° on the desk with a bright window beside the screen: 98%
+  found, but the aim alternated between two solutions on near-identical frames. Replay of the
+  recording (release): 82% edge-line solves, 16% hull only, 2.09 ms/frame.
+- Second run, gun held upright ~1-2 m away: **2400/2400 frames found**, corners form a proper
+  screen quad and the aim follows the gun; processing 5.46 ms mean (max ~16 ms) in release,
+  frame age 31 ms mean. The debug build takes ~20 ms/frame and drains every other frame.
+- The per-second report prints "no border" whenever there is no *aim*, including frames with a
+  quad whose solve is not trusted (hull only), so it undercounts detection.

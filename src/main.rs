@@ -171,7 +171,7 @@ enum DebugCmd {
 
 #[derive(Args)]
 struct ReplayArgs {
-    /// Directories of recorded .jpg frames.
+    /// Directories of recorded frames (.jpg from Linux, .pgm from macOS).
     #[arg(required = true)]
     dirs: Vec<PathBuf>,
     /// Use every Nth frame.
@@ -1880,7 +1880,7 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::sync::atomic::AtomicBool;
@@ -2168,7 +2168,7 @@ fn run_all(_ctx: &Ctx, _overlay: bool) -> Result<()> {
     bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn track(_ctx: &Ctx, _a: TrackArgs) -> Result<()> {
     bail!("tracking needs the camera backend, which is not implemented on this platform yet")
 }
@@ -2418,7 +2418,7 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
     use sindenrs::vision::code::Side;
     use sindenrs::vision::lens::Lens;
     use sindenrs::vision::lensfit::{fit_k1, score, FitFrame};
-    use sindenrs::vision::luma::mjpeg_to_luma;
+    use sindenrs::vision::luma::frame_to_luma;
 
     let flip = flip_from_config(ctx.display.flip);
     let mut params = AcquireParams {
@@ -2437,19 +2437,19 @@ fn replay(ctx: &Ctx, a: &ReplayArgs) -> Result<()> {
             .with_context(|| format!("reading {}", dir.display()))?
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg" || e == "pgm"))
             .collect();
         in_dir.sort();
         files.extend(in_dir.into_iter().step_by(a.every.max(1)));
     }
     if files.is_empty() {
-        bail!("no .jpg frames found");
+        bail!("no .jpg or .pgm frames found");
     }
     let mut frames: Vec<(PathBuf, usize, usize, Vec<u8>)> = Vec::new();
     for f in &files {
         let data = std::fs::read(f)?;
-        let Ok((w, h, mut l)) = mjpeg_to_luma(&data) else {
-            warn!("{}: jpeg decode failed", f.display());
+        let Ok((w, h, mut l)) = frame_to_luma(f, &data) else {
+            warn!("{}: decode failed", f.display());
             continue;
         };
         let (w, h) = (w as usize, h as usize);
@@ -2841,7 +2841,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 if use_trigger && pressed && pending.is_none() {
                     pending = Some(now);
                     shot += 1;
-                    save(&debug_dir, &format!("t{:02}-shot{:02}-pull-{}.jpg", idx + 1, shot, quality_tag(quality)), s.raw);
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-pull-{}.{}", idx + 1, shot, quality_tag(quality), s.raw_ext), s.raw);
                 }
                 let steady = use_dwell && dwell_armed && ring.len() >= a.samples.max(4) as usize && {
                     let mx = median(ring.iter().map(|(_, p)| p[0]).collect());
@@ -2859,7 +2859,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                         if let Ok(mut sc) = scene.lock() {
                             sc.flash_until = Some(now + Duration::from_millis(700));
                         }
-                        save(&debug_dir, &format!("t{:02}-shot{:02}-unmeasurable.jpg", idx + 1, shot), s.raw);
+                        save(&debug_dir, &format!("t{:02}-shot{:02}-unmeasurable.{}", idx + 1, shot, s.raw_ext), s.raw);
                         pending = None;
                     }
                     if !dwell_armed
@@ -2882,7 +2882,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                         "  target {:>2}: aim was not steady (samples spread {scatter:.1}% of screen); pull again.",
                         idx + 1
                     );
-                    save(&debug_dir, &format!("t{:02}-shot{:02}-unsteady.jpg", idx + 1, shot), s.raw);
+                    save(&debug_dir, &format!("t{:02}-shot{:02}-unsteady.{}", idx + 1, shot, s.raw_ext), s.raw);
                     if let Ok(mut sc) = scene.lock() {
                         sc.flash_until = Some(now + Duration::from_millis(700));
                     }
@@ -2900,7 +2900,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                     if pending.is_some() { "trigger" } else { "held steady" },
                     ring.len()
                 );
-                save(&debug_dir, &format!("t{:02}-shot{:02}-measured.jpg", idx + 1, shot), s.raw);
+                save(&debug_dir, &format!("t{:02}-shot{:02}-measured.{}", idx + 1, shot, s.raw_ext), s.raw);
                 out.measured[idx] = Some(got);
                 out.quads[idx] = s.quad.as_ref().map(|q| q.corners);
                 captured_at = Some(got);

@@ -261,7 +261,7 @@ impl Device {
     }
 
     /// Start capturing `width`x`height` luma at the camera's fastest rate for that size.
-    pub fn start_stream(self, width: u32, height: u32) -> io::Result<Stream> {
+    pub fn start_stream(&self, width: u32, height: u32) -> io::Result<Stream> {
         let (format, duration, fps) = self.find_format(width, height).ok_or_else(|| {
             err(format!(
                 "{} has no 420v {width}x{height} format",
@@ -335,7 +335,10 @@ impl Device {
                 width: w,
                 height: h,
                 fps,
-                _device: self,
+                _device: Self {
+                    device: self.device.clone(),
+                    unique_id: self.unique_id.clone(),
+                },
             })
         }
     }
@@ -397,6 +400,23 @@ impl Stream {
         timeout: Option<Duration>,
         newest: bool,
     ) -> io::Result<Option<Frame<'_>>> {
+        Ok(self.next_luma(timeout, newest)?.map(|f| Frame {
+            data: f.luma,
+            sequence: f.sequence,
+            timestamp: f.timestamp,
+            dequeued_at: f.dequeued_at,
+            dropped: f.dropped,
+            error: false,
+        }))
+    }
+
+    /// As [`Self::next`], with the luma mutable (callers flip it in place). It stays valid
+    /// until the next call.
+    pub fn next_luma(
+        &mut self,
+        timeout: Option<Duration>,
+        newest: bool,
+    ) -> io::Result<Option<LumaFrame<'_>>> {
         if let Some(done) = self.current.take() {
             let _ = self.spare.send(done.luma);
         }
@@ -417,14 +437,32 @@ impl Stream {
             }
         }
         let current = self.current.insert(frame);
-        Ok(Some(Frame {
-            data: &current.luma,
+        Ok(Some(LumaFrame {
+            luma: &mut current.luma,
             sequence: current.sequence,
             timestamp: current.timestamp,
             dequeued_at: host_now(),
             dropped: skipped,
-            error: false,
         }))
+    }
+}
+
+/// A frame from [`Stream::next_luma`]: packed `width * height` luma, mutable.
+#[derive(Debug)]
+pub struct LumaFrame<'a> {
+    pub luma: &'a mut [u8],
+    pub sequence: u32,
+    /// Capture time on the host clock.
+    pub timestamp: Option<Duration>,
+    /// Host-clock time at which the frame was handed out.
+    pub dequeued_at: Duration,
+    /// Frames skipped to reach this one.
+    pub dropped: u32,
+}
+
+impl LumaFrame<'_> {
+    pub fn age(&self) -> Option<Duration> {
+        self.timestamp.map(|ts| self.dequeued_at.saturating_sub(ts))
     }
 }
 

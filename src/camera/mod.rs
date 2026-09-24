@@ -12,6 +12,7 @@ pub mod v4l2;
 #[cfg(target_os = "macos")]
 pub mod avfoundation;
 
+pub mod source;
 pub mod uvc;
 
 #[cfg(not(target_os = "linux"))]
