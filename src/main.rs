@@ -2080,8 +2080,6 @@ fn track_with_preview(
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
-    use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2095,10 +2093,25 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     // The border the guns track. Its window is shaped to the border and takes no input, so
     // it can sit above a running game; if there is no display, tracking still runs (the
     // border may be coming from MAME artwork).
+    let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(
+        ctx.display.border_thickness / 100.0,
+    )));
+
+    // AppKit windows live on the main thread, so on macOS the overlay takes it and the guns
+    // are supervised beside it; losing the overlay still leaves the guns tracking.
+    #[cfg(target_os = "macos")]
+    if overlay {
+        return std::thread::scope(|sc| {
+            let guns = sc.spawn(|| supervise_guns(ctx, &stop));
+            if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
+                warn!("overlay: {e:#}; tracking continues without it");
+            }
+            guns.join()
+                .map_err(|_| anyhow!("the gun supervisor panicked"))?
+        });
+    }
+
     let overlay_thread = overlay.then(|| {
-        let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(
-            ctx.display.border_thickness / 100.0,
-        )));
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("overlay".into())
@@ -2108,6 +2121,22 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
                 }
             })
     });
+
+    let r = supervise_guns(ctx, &stop);
+    if let Some(Ok(t)) = overlay_thread {
+        let _ = t.join();
+    }
+    r
+}
+
+/// `run`'s gun supervisor: rediscover every second, start a tracker for each gun that
+/// appears, reap the ones that end, print a status line, and stop them all once `stop` is set.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn supervise_guns(ctx: &Ctx, stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+    use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     // One tracker thread per attached gun, keyed by the gun's USB path (stable per physical
     // port while it stays plugged in). The loop below rediscovers every second: a gun that
@@ -2267,9 +2296,6 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
             Ok(Err(e)) => warn!("tracker failed: {e:#}"),
             Err(_) => warn!("tracker panicked"),
         }
-    }
-    if let Some(Ok(t)) = overlay_thread {
-        let _ = t.join();
     }
     Ok(())
 }
@@ -2748,7 +2774,7 @@ fn flip_from_config(f: sindenrs::config::Flip) -> sindenrs::vision::acquire::Fli
 }
 
 /// Short tag for a frame's tracking quality, used in debug capture filenames.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn quality_tag(q: sindenrs::overlay::Quality) -> &'static str {
     use sindenrs::overlay::Quality;
     match q {
@@ -2772,7 +2798,7 @@ struct AimResult {
     events: std::collections::BTreeMap<String, u32>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_lines)]
 fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     use sindenrs::overlay::{Quality, Scene};
@@ -3215,7 +3241,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn calibrate(_ctx: &Ctx, _a: CalibrateArgs) -> Result<()> {
     bail!("calibrate needs the camera backend, which is not implemented on this platform yet")
 }

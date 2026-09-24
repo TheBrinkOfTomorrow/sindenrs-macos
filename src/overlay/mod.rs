@@ -4,12 +4,15 @@
 //! and it has to stay on screen while a game runs. That means a window that is always on
 //! top, shaped so that only the border (and, while calibrating, the UI) exists at all, and
 //! that never takes keyboard or mouse input, so everything reaches the game underneath.
-//! Each window system does that its own way; the backends live in `x11` and `wayland`
-//! behind [`Backend`], and the scene is rendered on the CPU by [`draw`]. Nothing here
-//! needs the main thread.
+//! Each window system does that its own way; the backends live in `x11`, `wayland` and
+//! `macos` behind [`Backend`], and the scene is rendered on the CPU by [`draw`]. Nothing here
+//! needs the main thread, except on macOS, where AppKit requires the overlay to be opened and
+//! run on it.
 
 pub mod artwork;
 pub mod draw;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 pub mod scene;
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -20,7 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+#[cfg(not(target_os = "macos"))]
+use anyhow::bail;
+use anyhow::Result;
 
 pub use draw::Rect;
 pub use scene::{Quality, Scene, SolveInfo};
@@ -68,7 +73,13 @@ pub fn open(title: &str) -> Result<Box<dyn Backend>> {
     bail!("no display: neither WAYLAND_DISPLAY nor DISPLAY is set")
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Open the overlay window. On macOS this must be called on the main thread.
+#[cfg(target_os = "macos")]
+pub fn open(title: &str) -> Result<Box<dyn Backend>> {
+    macos::open(title)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
     bail!("the overlay is not implemented on this platform yet")
 }

@@ -24,7 +24,7 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 |-------|-------|
 | 0 — Hardware check | **done** |
 | 1 — macOS backends | **done** |
-| 2 — Border overlay | next |
+| 2 — Border overlay | in progress: overlay, calibrate, packaging done; emulator check left |
 | 3 — Emulator setup | not started |
 | 4 — Two players | optional, not started |
 
@@ -60,16 +60,20 @@ Measurements and decisions are in `docs/macos-notes.md`.
   down cleanly on Ctrl-C. `debug track --send --preview` adds a full-screen test page with the
   camera feed, the detector's view, targets, click scoring and an aim marker.
 
-### Phase 2 — Border overlay — next
+### Phase 2 — Border overlay — in progress
 - AppKit borderless, click-through, transparent window above fullscreen apps
   (`ignoresMouseEvents`, high window level, `.canJoinAllSpaces` + `.fullScreenAuxiliary`).
-  `tools/macos/show_border.swift` already shows the approach works for normal windows; it
-  has to become the macOS overlay backend (driven from the main thread, unlike X11/Wayland)
-  so `run` draws its own border.
+  **Done:** `src/overlay/macos.rs` is an overlay backend on the main thread; `run` draws its own
+  border and tracks against it (100% of frames found); clicks pass through; it stays on top of
+  apps in native full screen. Still to check: the emulators' own full-screen modes.
 - `calibrate` on macOS: it draws its targets through the overlay, so it follows the overlay.
-  It is also the first real accuracy measurement (aimed shots, not just tracking).
+  **Done:** works as on Linux; measured mean error 1.14% of the screen over a 3x3 grid, and
+  the bore it measures matches the gun's stored factory calibration, so nothing was saved.
+  Run it with `--no-save`: nothing is written to the gun unless the user asks.
 - Package `sindenrs` as an app with a stable signing identity, so the camera grant survives
-  rebuilds and `run` can start at login.
+  rebuilds. **Done:** `tools/macos/bundle.sh` with a self-signed certificate; the grant held
+  across different builds. Starting `run` at login is available (`login-item.sh`) but opt-in
+  and off by default.
 - Fallback: emulator post-processing shaders that draw the coded border.
 
 ### Carried over (not blocking)
@@ -92,7 +96,8 @@ Measurements and decisions are in `docs/macos-notes.md`.
 
 ## Risks
 1. ~~UVC exposure control on macOS (Phase 1).~~ Retired: works mid-stream (notes, Phase 1 spike).
-2. Overlay visibility over fullscreen Metal games (Phase 2).
+2. Overlay visibility over fullscreen Metal games (Phase 2). Native full-screen apps: fine.
+   Emulator full-screen modes: not yet tested.
 3. Two-player patches: three codebases, upstream buy-in.
 4. macOS 27 permission prompts (camera, Input Monitoring). Camera: handled by running as an
    app bundle; ad-hoc signatures can re-prompt after rebuilds (see Phase 2 packaging).

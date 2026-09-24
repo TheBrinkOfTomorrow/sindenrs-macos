@@ -248,3 +248,85 @@ display. The preview page now draws its own marker at the aim: a thick dark-red 
 ~7% of the screen height, under the detection threshold like the rest of the page. Checked on
 hardware: easy to see from the shooting position, follows the gun smoothly, and clicks land
 within 0.3% of it. Tracking during that 35 s run found the border in 85% of frames.
+
+## 2026-09-24 — Phase 2: the macOS overlay (`src/overlay/macos.rs`)
+
+The overlay is an ordinary `Backend`: a borderless window over the main screen at screen-saver
+level (layer 1000), `CanJoinAllSpaces | FullScreenAuxiliary | Stationary | IgnoresCycle`,
+`ignoresMouseEvents`, never key, and an accessory app (no Dock icon), so the game keeps focus.
+`present` shows the rendered scene as an `NSImage`, with black transparent while only the
+border shows; `pump` runs the AppKit event loop by hand for up to its timeout. So the shared
+overlay loop (and `border`, and later `calibrate`) works unchanged; the one macOS rule is that
+it must run on the main thread. `run` therefore gives the main thread to the overlay on macOS
+and supervises the guns on a scoped thread (`supervise_guns`, moved out of `run_all`
+unchanged); Linux keeps the overlay on its own thread.
+
+- `sindenrs border`: window listed on screen (layer 1000, 3360x1890); Ctrl-C closes it and the
+  process exits.
+- `sindenrs run` (overlay on), 60 s: window up throughout; 3307/3307 frames found at 58-61 fps
+  (6.7 ms mean) against the overlay's own border; the cursor followed the aim (318 moves logged);
+  clean exit on Ctrl-C.
+- Checked by eye: the border shows around the whole edge, including over the menu bar and Dock;
+  mouse clicks pass through to the apps underneath; with an app in native full screen the
+  border stays on top and the gun still drives the cursor.
+- Not yet tried: the emulators' own full-screen modes (Metal, possibly exclusive), Phase 2's
+  remaining risk.
+
+## 2026-09-24 — Phase 2: `calibrate` on macOS
+
+`calibrate` already runs the tracker on a worker and the overlay on the calling (main) thread,
+so enabling it on macOS was only removing the Linux gates. First run, 3x3 grid, trigger
+capture, `--no-save` (nothing written to the gun), bore from EEPROM (+3.29%, +0.69%):
+
+| target | want | got | err |
+|--------|------|-----|-----|
+| 1 | 15,15 | 29.8,88.5 | 75.0% (aimed at the wrong spot, see below) |
+| 2 | 50,15 | 49.7,15.9 | 0.99% |
+| 3 | 85,15 | 85.0,13.4 | 1.60% |
+| 4 | 15,50 | 17.7,52.7 | 3.78% (three clipped retries first) |
+| 5 | 50,50 | 49.2,48.9 | 1.32% |
+| 6 | 85,50 | 85.0,49.6 | 0.38% |
+| 7 | 15,85 | 15.4,84.8 | 0.45% |
+| 8 | 50,85 | 49.6,85.2 | 0.47% |
+| 9 | 85,85 | 85.2,85.7 | 0.76% |
+
+Without target 1 the mean error is ~1.2% of the screen, most targets under 1%: the first real
+accuracy figure. 97% of frames tracked; 27% had the border clipped at the frame edge (stand
+further back). The run's suggested bore (+2.01%, -3.87%, agreement ±2.97 / ±12.40) is
+distorted by target 1 and was not saved.
+
+The user reports aiming at the wrong spot for one target. Target 1's reading (lower left of the
+screen) and its shot frame (the whole border in view, offset as when aiming low-left) fit that,
+so it is an aiming slip, not a tracking fault. One detail to watch: replaying that single shot
+frame gives "refused: solve disagrees with its own tabs" (hull only), while the frames around
+it solved; bright clutter sits just outside one edge there. Frames kept in
+`corpus/macos-calibrate-2026-09-24/` (local).
+
+Second run, same settings (`--no-save`): all 9 targets measured, **mean error 1.14% of the
+screen, max 4.07%** (the top-middle target, right after a clipped retry); 7 of 9 within 1.3%.
+Bias dx -0.02%, dy +0.44%. The bore it would set is +3.31% / +0.66% (agreement ±0.26 /
+±0.48) against the +3.29% / +0.69% already in the gun's EEPROM: the factory calibration is
+right, so nothing needs saving (and nothing was written). 28% of frames still had the border
+clipped at the frame edge; stepping further back would help the top-middle target.
+
+## 2026-09-24 — Phase 2: packaging (`tools/macos/bundle.sh`, `login-item.sh`)
+
+`bundle.sh` builds `target/macos/Sindenrs.app` (`dev.sindenrs.sindenrs`, `LSUIElement`, a
+camera usage description, the crate version) and signs it with `$SINDENRS_SIGN_IDENTITY`,
+default "sindenrs_macos_dev": a self-signed Code Signing certificate made once in Keychain Access
+(Certificate Assistant → Create a Certificate, Self-Signed Root, Code Signing). Self-signed
+certificates are untrusted, so `security find-identity -v` hides them, but `codesign` signs
+with them. Without the certificate the app is signed ad hoc, with a warning. The camera grant
+belongs to the app and its signature, so a fixed identity should keep it across rebuilds.
+`run-bundled.sh` now runs every test through this one app.
+
+Starting at login is opt-in and off: the user does not want the gun running at login, and
+nothing installs the agent automatically. `login-item.sh install` (only when asked) copies the
+app to `~/Applications` and loads a per-user launchd agent
+(`dev.sindenrs.run`) that runs `sindenrs run` at login, restarts it if it exits with an
+error, and logs to `~/Library/Logs/sindenrs.log`; `uninstall` removes the agent.
+
+Checked with the certificate in place: the app's designated requirement is `identifier
+"dev.sindenrs.sindenrs" and certificate leaf = H"…"`, so it no longer depends on the build. A
+release and a debug build (different CDHashes, `c0bf70…` and `1b19c4…`) both captured
+(`debug camera capture`, ~60 fps) back to back with no permission prompt in between.

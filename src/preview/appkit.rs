@@ -7,65 +7,27 @@
 
 use std::cell::Cell;
 use std::fmt::Write as _;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::{
-    define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
-};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapImageRep, NSColor,
-    NSCompositingOperation, NSDeviceRGBColorSpace, NSEvent, NSEventModifierFlags, NSEventType,
-    NSFont, NSFontWeightRegular, NSImage, NSImageScaling, NSImageView, NSResponder, NSScreen,
-    NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
+    NSCompositingOperation, NSEvent, NSFont, NSFontWeightRegular, NSImage, NSImageScaling,
+    NSImageView, NSResponder, NSScreen, NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use super::{aim_marker, page, score, Image, Shared, TARGETS};
 
-/// An `NSImage` holding `img` (one RGBA bitmap representation), sized `size` points.
+/// An `NSImage` of a preview image; black is transparent, so the marker draws without a
+/// square around it (everything else here sits on the black page anyway).
 fn ns_image(img: &Image, size: NSSize) -> Option<Retained<NSImage>> {
-    // Nothing to show before the first frame (AppKit rejects a zero-sized bitmap).
-    if img.w == 0 || img.h == 0 || img.px.len() < img.w * img.h {
-        return None;
-    }
-    let (w, h) = (isize::try_from(img.w).ok()?, isize::try_from(img.h).ok()?);
-    // SAFETY: with null planes the rep allocates its own `w * h * 4` byte buffer, which is
-    // filled below through `bitmapData` before anything reads it.
-    let rep = unsafe {
-        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            NSBitmapImageRep::alloc(),
-            ptr::null_mut(),
-            w,
-            h,
-            8,
-            4,
-            true,
-            false,
-            NSDeviceRGBColorSpace,
-            w * 4,
-            32,
-        )
-    }?;
-    let data = rep.bitmapData();
-    if data.is_null() {
-        return None;
-    }
-    // SAFETY: the rep owns exactly `w * h * 4` bytes at `data`.
-    let out = unsafe { std::slice::from_raw_parts_mut(data, img.w * img.h * 4) };
-    // Black is transparent, so the marker draws without a square around it; everything else
-    // here sits on the black page anyway.
-    for (o, &p) in out.chunks_exact_mut(4).zip(&img.px) {
-        let [b, g, r, _] = p.to_le_bytes();
-        o.copy_from_slice(&[r, g, b, if p == 0 { 0 } else { 0xff }]);
-    }
-    let ns = NSImage::initWithSize(NSImage::alloc(), size);
-    ns.addRepresentation(&rep);
-    Some(ns)
+    crate::overlay::macos::ns_image(&img.px, img.w, img.h, size, true)
 }
 
 struct ViewIvars {
@@ -361,21 +323,7 @@ pub fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, border_frac: f64) 
         log.setStringValue(&NSString::from_str(&text.join("\n")));
         if s.done || stop.load(Ordering::Relaxed) {
             stop.store(true, Ordering::Relaxed);
-            app_t.stop(None);
-            // `stop` takes effect after the next event; post one so it happens now.
-            if let Some(ev) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-                NSEventType::ApplicationDefined,
-                NSPoint::new(0.0, 0.0),
-                NSEventModifierFlags::empty(),
-                0.0,
-                0,
-                None,
-                0,
-                0,
-                0,
-            ) {
-                app_t.postEvent_atStart(&ev, true);
-            }
+            crate::overlay::macos::stop_app(&app_t);
         }
     });
     // SAFETY: a repeating timer on the main run loop with a block that only touches
