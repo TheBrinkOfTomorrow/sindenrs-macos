@@ -239,3 +239,12 @@ bright as the border (saturated at exposure 78):
 They only matter when aiming high into a corner, which puts them beside the border in the
 frame. Remedies: dim or cover them in the room; in the detector, reject a line fitted just
 outside an edge that already has decoded tabs.
+
+## 2026-09-24 — Aim marker on the preview page
+
+The system cursor moved with the aim during `run` (logged via `NSEvent.mouseLocation`, 239
+moves in 30 s, matching the tracker's aim) but could not be seen from 1-2 m on a 3360x1890
+display. The preview page now draws its own marker at the aim: a thick dark-red ring and cross,
+~7% of the screen height, under the detection threshold like the rest of the page. Checked on
+hardware: easy to see from the shooting position, follows the gun smoothly, and clicks land
+within 0.3% of it. Tracking during that 35 s run found the border in 85% of frames.
