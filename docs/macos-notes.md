@@ -384,3 +384,12 @@ normal: steady pointer, shots on time and where aimed, pump reload working. The 
 session found the border in 91% of frames at 4.5 ms mean processing, with the Backblaze upload
 still running. Lesson: macOS will starve a windowless helper under load unless it says it is
 latency-critical; do this for anything real-time.
+
+## 2026-09-25 — The border toggle is ⌃⌥B, not ⌥B
+
+⌥B never worked: with press logging added, the log showed both hot keys registered (no
+error from `RegisterEventHotKey`) and ⌃⌥⌘Q presses delivered, but no ⌥B press ever arrived.
+Since macOS 15, Carbon hot keys whose only modifiers are Option (or Option-Shift) register
+successfully yet never fire (a guard against keyloggers). The toggle is now Control-Option-B,
+still close to the vendor's Alt-B and needing no permission; keeping plain ⌥B would take a
+system-wide keyboard monitor and the Input Monitoring permission.
