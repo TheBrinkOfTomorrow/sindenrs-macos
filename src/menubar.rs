@@ -123,17 +123,22 @@ extern "C" fn on_hot_key(_call: *mut c_void, event: *mut c_void, user: *mut c_vo
             ptr::addr_of_mut!(id).cast(),
         );
         if st != 0 {
+            tracing::warn!("hot key pressed, but its id could not be read: {st}");
             return st;
         }
         let keys = &*user.cast::<HotKeys>();
         match id.id {
-            QUIT => keys.stop.store(true, Ordering::Relaxed),
+            QUIT => {
+                tracing::info!("⌃⌥⌘Q: quitting");
+                keys.stop.store(true, Ordering::Relaxed);
+            }
             TOGGLE_BORDER => {
                 if let Ok(mut s) = keys.scene.lock() {
                     s.hidden = !s.hidden;
+                    tracing::info!("⌥B: border {}", if s.hidden { "hidden" } else { "shown" });
                 }
             }
-            _ => {}
+            other => tracing::warn!("unknown hot key id {other}"),
         }
     }
     0
@@ -156,7 +161,9 @@ fn register(key: u32, modifiers: u32, id: u32, target: *mut c_void, name: &str) 
             &mut out,
         )
     };
-    if st != 0 {
+    if st == 0 {
+        tracing::info!("{name} registered");
+    } else {
         tracing::warn!(
             "{name} unavailable (taken by another app?): RegisterEventHotKey returned {st}"
         );
