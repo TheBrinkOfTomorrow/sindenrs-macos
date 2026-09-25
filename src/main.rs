@@ -2160,16 +2160,22 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     #[allow(clippy::needless_return)]
     {
         let status = Arc::new(Mutex::new(Vec::new()));
+        let live = Arc::new(Mutex::new(sindenrs::preview::Live::default()));
         return std::thread::scope(|sc| {
-            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status)));
+            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status), Some(&live)));
             let menu = sindenrs::menubar::MenuBar::install(
                 stop.clone(),
                 scene.clone(),
                 status.clone(),
+                live.clone(),
                 overlay,
             )
             .inspect_err(|e| warn!("menu bar: {e:#}"))
             .ok();
+            // Reticles and camera views, off until switched on (⌃⌥C, ⌃⌥P or the menu).
+            let hud = sindenrs::preview::hud::open(live.clone())
+                .inspect_err(|e| warn!("heads-up display: {e:#}"))
+                .ok();
             let shown = if overlay {
                 sindenrs::overlay::run_until(scene, &stop)
                     .inspect_err(|e| warn!("overlay: {e:#}; tracking continues without it"))
@@ -2182,6 +2188,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
                     warn!("event loop: {e:#}");
                 }
             }
+            drop(hud);
             drop(menu);
             guns.join()
                 .map_err(|_| anyhow!("the gun supervisor panicked"))?
@@ -2202,7 +2209,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
                 })
         });
 
-        let r = supervise_guns(ctx, &stop, None);
+        let r = supervise_guns(ctx, &stop, None, None);
         if let Some(Ok(t)) = overlay_thread {
             let _ = t.join();
         }
@@ -2212,14 +2219,17 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
 
 /// `run`'s gun supervisor: rediscover every second, start a tracker for each gun that
 /// appears, reap the ones that end, print a status line, and stop them all once `stop` is set.
-/// With `status_out`, it also keeps one line per gun there (the macOS menu shows them).
+/// With `status_out`, it also keeps one line per gun there (the macOS menu shows them), and
+/// with `live`, each tracker feeds it (the macOS heads-up display: reticles, camera view).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn supervise_guns(
     ctx: &Ctx,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     status_out: Option<&std::sync::Mutex<Vec<String>>>,
+    live: Option<&std::sync::Arc<std::sync::Mutex<sindenrs::preview::Live>>>,
 ) -> Result<()> {
-    use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
+    use sindenrs::preview::Live;
+    use sindenrs::runtime::{run_tracker_with, Flow, Status, TrackerOptions};
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -2322,10 +2332,30 @@ fn supervise_guns(
             let name = gc.name.clone();
             let camera = cam.node.clone();
             let (stop2, status2) = (stop.clone(), status.clone());
+            let live = live.cloned();
             let handle = std::thread::Builder::new()
                 .name(name.clone())
                 .spawn(move || {
-                    run_tracker(&name, &camera, Some((gun, gc)), &opts, &stop2, &status2)
+                    let mut frame = 0u64;
+                    let r = run_tracker_with(
+                        &name,
+                        &camera,
+                        Some((gun, gc)),
+                        &opts,
+                        &stop2,
+                        &status2,
+                        &mut |s| {
+                            frame += 1;
+                            if let Some(l) = &live {
+                                Live::feed(l, &name, s, frame);
+                            }
+                            Flow::Continue
+                        },
+                    );
+                    if let Some(l) = &live {
+                        Live::remove(l, &name);
+                    }
+                    r
                 })?;
             retry_after.remove(&key);
             running.insert(key, Running { handle, status });

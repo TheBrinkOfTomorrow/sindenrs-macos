@@ -393,3 +393,16 @@ Since macOS 15, Carbon hot keys whose only modifiers are Option (or Option-Shift
 successfully yet never fire (a guard against keyloggers). The toggle is now Control-Option-B,
 still close to the vendor's Alt-B and needing no permission; keeping plain ⌥B would take a
 system-wide keyboard monitor and the Input Monitoring permission.
+
+## 2026-09-25 — Reticle and camera view in `run` (⌃⌥C, ⌃⌥P)
+
+`run` gains the preview page's aim marker (per gun, at its aim) and camera panels (feed and
+detector view, per gun, stacked from the bottom-left corner), both off by default, toggled
+from the menu or with ⌃⌥C / ⌃⌥P (neither is a macOS default shortcut; while `run` is up they
+are taken system-wide). They live in a separate click-through window at screen-saver level
+(`preview/hud.rs`) whose image views a 60 Hz timer moves or refreshes: the border overlay
+redraws its whole full-screen image on any change, which at 60 Hz would cost exactly the CPU
+the latency fix freed. The trackers feed a shared `preview::Live` from `run`'s supervisor and
+make preview images only while the camera view is on, every 4th frame (~15 per second).
+Everything is drawn dim as on the preview page. Checked at start-up: both windows up, all four
+hot keys registered.

@@ -1,5 +1,6 @@
 //! macOS menu bar control for `run`: a status item (crosshair icon) whose menu shows each
-//! gun's status and offers Show Border and Quit, and global shortcuts that work from anywhere,
+//! gun's status and offers Show Border, Show Reticle, Show Camera View and Quit, and global
+//! shortcuts (⌃⌥C reticle, ⌃⌥P camera view, besides the two below) that work from anywhere,
 //! games included: ⌃⌥B shows or hides the border (close to Alt-B in the vendor's Windows software; macOS
 //! ignores Option-only hot keys)
 //! and ⌃⌥⌘Q quits. Quitting sets the same stop flag as Ctrl-C, so `run` shuts down cleanly.
@@ -28,6 +29,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSString};
 
 use crate::overlay::Scene;
+use crate::preview::Live;
 
 /// Carbon's hot key API, which has no Rust bindings. Still supported, and the only way to get
 /// a system-wide shortcut without asking for Accessibility access.
@@ -60,6 +62,9 @@ mod carbon {
     pub const CONTROL: u32 = 1 << 12;
     pub const KEY_Q: u32 = 0x0c;
     pub const KEY_B: u32 = 0x0b;
+    /// `kVK_ANSI_C`, `kVK_ANSI_P`.
+    pub const KEY_C: u32 = 0x08;
+    pub const KEY_P: u32 = 0x23;
 
     #[link(name = "Carbon", kind = "framework")]
     extern "C" {
@@ -97,11 +102,28 @@ mod carbon {
 /// Hot key ids, as registered below.
 const QUIT: u32 = 1;
 const TOGGLE_BORDER: u32 = 2;
+const TOGGLE_RETICLE: u32 = 3;
+const TOGGLE_CAMERA: u32 = 4;
 
 /// What the hot keys act on; boxed so the handler can hold a stable pointer to it.
 struct HotKeys {
     stop: Arc<AtomicBool>,
     scene: Arc<Mutex<Scene>>,
+    live: Arc<Mutex<Live>>,
+}
+
+/// Flip the heads-up display's reticle or camera view, and log it.
+fn toggle_live(live: &Mutex<Live>, reticle: bool) {
+    if let Ok(mut l) = live.lock() {
+        let (on, what, key) = if reticle {
+            l.reticle = !l.reticle;
+            (l.reticle, "reticle", "⌃⌥C")
+        } else {
+            l.camera = !l.camera;
+            (l.camera, "camera view", "⌃⌥P")
+        };
+        tracing::info!("{key}: {what} {}", if on { "shown" } else { "hidden" });
+    }
 }
 
 /// A hot key fired: find out which, and act on the `HotKeys` that `user` points at.
@@ -139,6 +161,8 @@ extern "C" fn on_hot_key(_call: *mut c_void, event: *mut c_void, user: *mut c_vo
                     tracing::info!("⌃⌥B: border {}", if s.hidden { "hidden" } else { "shown" });
                 }
             }
+            TOGGLE_RETICLE => toggle_live(&keys.live, true),
+            TOGGLE_CAMERA => toggle_live(&keys.live, false),
             other => tracing::warn!("unknown hot key id {other}"),
         }
     }
@@ -176,6 +200,7 @@ struct TargetIvars {
     stop: Arc<AtomicBool>,
     scene: Arc<Mutex<Scene>>,
     status: Arc<Mutex<Vec<String>>>,
+    live: Arc<Mutex<Live>>,
     /// Whether this `run` draws a border at all (no Show Border item otherwise).
     overlay: bool,
 }
@@ -209,6 +234,16 @@ define_class!(
             if let Ok(mut s) = self.ivars().scene.lock() {
                 s.hidden = !s.hidden;
             }
+        }
+
+        #[unsafe(method(toggleReticle:))]
+        fn toggle_reticle(&self, _sender: Option<&AnyObject>) {
+            toggle_live(&self.ivars().live, true);
+        }
+
+        #[unsafe(method(toggleCamera:))]
+        fn toggle_camera(&self, _sender: Option<&AnyObject>) {
+            toggle_live(&self.ivars().live, false);
         }
     }
 );
@@ -246,7 +281,7 @@ impl Target {
         item
     }
 
-    /// Rebuild the menu: status lines, Show Border, Quit.
+    /// Rebuild the menu: status lines, Show Border / Reticle / Camera View, Quit.
     fn fill(&self, menu: &NSMenu) {
         let mtm = self.mtm();
         let iv = self.ivars();
@@ -272,8 +307,28 @@ impl Target {
                 NSControlStateValueOn
             });
             menu.addItem(&border);
-            menu.addItem(&NSMenuItem::separatorItem(mtm));
         }
+        let (reticle_on, camera_on) = iv
+            .live
+            .lock()
+            .map(|l| (l.reticle, l.camera))
+            .unwrap_or_default();
+        for (title, action, key, on) in [
+            ("Show Reticle", sel!(toggleReticle:), "c", reticle_on),
+            ("Show Camera View", sel!(toggleCamera:), "p", camera_on),
+        ] {
+            let item = self.item(title, Some(action), key);
+            item.setKeyEquivalentModifierMask(
+                NSEventModifierFlags::Control | NSEventModifierFlags::Option,
+            );
+            item.setState(if on {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            menu.addItem(&item);
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = self.item("Quit Sindenrs", Some(sel!(quit:)), "q");
         quit.setKeyEquivalentModifierMask(
             NSEventModifierFlags::Control
@@ -296,13 +351,15 @@ pub struct MenuBar {
 }
 
 impl MenuBar {
-    /// Install the menu bar item, ⌃⌥B (border on/off, with an overlay) and ⌃⌥⌘Q (quit).
-    /// `status` holds one line per gun, written by the gun supervisor; `overlay` says whether
-    /// there is a border to show or hide. Must be called on the main thread.
+    /// Install the menu bar item and the shortcuts: ⌃⌥B (border on/off, with an overlay),
+    /// ⌃⌥C (reticle), ⌃⌥P (camera view) and ⌃⌥⌘Q (quit). `status` holds one line per gun,
+    /// written by the gun supervisor; `live` is the heads-up display's state; `overlay` says
+    /// whether there is a border to show or hide. Must be called on the main thread.
     pub fn install(
         stop: Arc<AtomicBool>,
         scene: Arc<Mutex<Scene>>,
         status: Arc<Mutex<Vec<String>>>,
+        live: Arc<Mutex<Live>>,
         overlay: bool,
     ) -> Result<Self> {
         let mtm = MainThreadMarker::new()
@@ -313,6 +370,7 @@ impl MenuBar {
         let keys = Box::new(HotKeys {
             stop: stop.clone(),
             scene: scene.clone(),
+            live: live.clone(),
         });
         let target = Target::new(
             mtm,
@@ -320,6 +378,7 @@ impl MenuBar {
                 stop,
                 scene,
                 status,
+                live,
                 overlay,
             },
         );
@@ -379,6 +438,18 @@ impl MenuBar {
                         TOGGLE_BORDER,
                         target,
                         "⌃⌥B",
+                    ));
+                }
+                for (key, id, name) in [
+                    (carbon::KEY_C, TOGGLE_RETICLE, "⌃⌥C"),
+                    (carbon::KEY_P, TOGGLE_CAMERA, "⌃⌥P"),
+                ] {
+                    hot_keys.push(register(
+                        key,
+                        carbon::CONTROL | carbon::OPTION,
+                        id,
+                        target,
+                        name,
                     ));
                 }
             } else {

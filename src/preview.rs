@@ -8,8 +8,10 @@
 
 #[cfg(target_os = "macos")]
 pub mod appkit;
+#[cfg(target_os = "macos")]
+pub mod hud;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::overlay::draw::{draw_border, px, Canvas, BLACK};
 use crate::runtime::Sample;
@@ -64,6 +66,56 @@ impl Shared {
         self.history.push(line.clone());
         self.log.push_front(line);
         self.log.truncate(LOG_LINES);
+    }
+}
+
+/// What `run`'s heads-up display shows (macOS: `hud`): per gun, the aim for its reticle and,
+/// while the camera view is on, its preview images. Written by the trackers, read by the window.
+#[derive(Debug, Default)]
+pub struct Live {
+    /// Show a reticle at each gun's aim.
+    pub reticle: bool,
+    /// Show each gun's camera view (the feed and what the detector made of it).
+    pub camera: bool,
+    /// Keyed by gun name, so the order on screen is stable.
+    pub guns: BTreeMap<String, LiveGun>,
+}
+
+#[derive(Debug, Default)]
+pub struct LiveGun {
+    pub aim: Option<[f64; 2]>,
+    pub camera: Image,
+    pub processed: Image,
+    /// Bumped whenever the images change.
+    pub serial: u64,
+}
+
+/// Frames between preview images: about 15 per second at 60 fps, plenty to watch and cheap.
+const PREVIEW_EVERY: u64 = 4;
+
+impl Live {
+    /// A tracker's hook: record gun `name`'s aim, and its images if the camera view is on.
+    /// `frame` counts the tracker's frames. Images are made outside the lock.
+    pub fn feed(live: &std::sync::Mutex<Self>, name: &str, s: &Sample, frame: u64) {
+        let want_images =
+            frame.is_multiple_of(PREVIEW_EVERY) && live.lock().is_ok_and(|l| l.camera);
+        let images = want_images.then(|| images_for(s));
+        if let Ok(mut l) = live.lock() {
+            let g = l.guns.entry(name.to_owned()).or_default();
+            g.aim = s.aim;
+            if let Some((camera, processed)) = images {
+                g.camera = camera;
+                g.processed = processed;
+                g.serial += 1;
+            }
+        }
+    }
+
+    /// A gun's tracker ended: drop its reticle and panels.
+    pub fn remove(live: &std::sync::Mutex<Self>, name: &str) {
+        if let Ok(mut l) = live.lock() {
+            l.guns.remove(name);
+        }
     }
 }
 
@@ -271,6 +323,52 @@ mod tests {
         };
         let max = m.px.iter().map(|&p| luma(p)).fold(0.0, f64::max);
         assert!(max < 70.0, "marker too bright for the camera: luma {max}");
+    }
+
+    fn sample<'a>(luma: &'a [u8], aim: Option<[f64; 2]>) -> Sample<'a> {
+        Sample {
+            raw: &[],
+            raw_ext: "pgm",
+            luma,
+            width: 4,
+            height: 4,
+            threshold: 48,
+            aim_pixel: [2.0, 2.0],
+            aim,
+            quad: None,
+            view: None,
+            sequence: 0,
+            age: None,
+            events: &[],
+        }
+    }
+
+    #[test]
+    fn live_keeps_aim_and_makes_images_only_when_asked() {
+        let live = std::sync::Mutex::new(Live::default());
+        let luma = [200u8; 16];
+        Live::feed(&live, "p1", &sample(&luma, Some([40.0, 60.0])), 4);
+        {
+            let l = live.lock().expect("lock");
+            assert_eq!(l.guns["p1"].aim, Some([40.0, 60.0]));
+            assert_eq!(l.guns["p1"].serial, 0, "camera view off: no images");
+        }
+        live.lock().expect("lock").camera = true;
+        Live::feed(&live, "p1", &sample(&luma, None), 5);
+        assert_eq!(
+            live.lock().expect("lock").guns["p1"].serial,
+            0,
+            "only every 4th frame"
+        );
+        Live::feed(&live, "p1", &sample(&luma, None), 8);
+        {
+            let l = live.lock().expect("lock");
+            let g = &l.guns["p1"];
+            assert_eq!((g.serial, g.aim), (1, None));
+            assert_eq!((g.camera.w, g.camera.h, g.processed.px.len()), (4, 4, 16));
+        }
+        Live::remove(&live, "p1");
+        assert!(live.lock().expect("lock").guns.is_empty());
     }
 
     #[test]
