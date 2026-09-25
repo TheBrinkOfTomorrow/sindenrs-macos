@@ -1924,6 +1924,7 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
+    let _activity = sindenrs::activity::begin("tracking the Sinden Lightgun");
     use sindenrs::runtime::{run_tracker, Status, TrackerOptions};
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -2133,6 +2134,9 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
         }
         f
     };
+    // Keep the trackers responsive while a game loads the machine (no App Nap, no timer
+    // coalescing): see `activity`.
+    let _activity = sindenrs::activity::begin("tracking the Sinden Lightgun");
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -2905,6 +2909,7 @@ struct AimResult {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_lines)]
 fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
+    let _activity = sindenrs::activity::begin("calibrating the Sinden Lightgun");
     use sindenrs::overlay::{Quality, Scene};
     use sindenrs::protocol::event::Event;
     use sindenrs::runtime::{run_tracker_with, Flow, Sample, Status, TrackerOptions};

@@ -1,6 +1,7 @@
 //! macOS menu bar control for `run`: a status item (crosshair icon) whose menu shows each
 //! gun's status and offers Show Border and Quit, and global shortcuts that work from anywhere,
-//! games included: ⌥B shows or hides the border (like Alt-B in the vendor's Windows software)
+//! games included: ⌃⌥B shows or hides the border (close to Alt-B in the vendor's Windows software; macOS
+//! ignores Option-only hot keys)
 //! and ⌃⌥⌘Q quits. Quitting sets the same stop flag as Ctrl-C, so `run` shuts down cleanly.
 //!
 //! The hotkey uses Carbon's `RegisterEventHotKey`, which needs no Accessibility or Input
@@ -123,17 +124,22 @@ extern "C" fn on_hot_key(_call: *mut c_void, event: *mut c_void, user: *mut c_vo
             ptr::addr_of_mut!(id).cast(),
         );
         if st != 0 {
+            tracing::warn!("hot key pressed, but its id could not be read: {st}");
             return st;
         }
         let keys = &*user.cast::<HotKeys>();
         match id.id {
-            QUIT => keys.stop.store(true, Ordering::Relaxed),
+            QUIT => {
+                tracing::info!("⌃⌥⌘Q: quitting");
+                keys.stop.store(true, Ordering::Relaxed);
+            }
             TOGGLE_BORDER => {
                 if let Ok(mut s) = keys.scene.lock() {
                     s.hidden = !s.hidden;
+                    tracing::info!("⌃⌥B: border {}", if s.hidden { "hidden" } else { "shown" });
                 }
             }
-            _ => {}
+            other => tracing::warn!("unknown hot key id {other}"),
         }
     }
     0
@@ -156,7 +162,9 @@ fn register(key: u32, modifiers: u32, id: u32, target: *mut c_void, name: &str) 
             &mut out,
         )
     };
-    if st != 0 {
+    if st == 0 {
+        tracing::info!("{name} registered");
+    } else {
         tracing::warn!(
             "{name} unavailable (taken by another app?): RegisterEventHotKey returned {st}"
         );
@@ -254,7 +262,9 @@ impl Target {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         if iv.overlay {
             let border = self.item("Show Border", Some(sel!(toggleBorder:)), "b");
-            border.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
+            border.setKeyEquivalentModifierMask(
+                NSEventModifierFlags::Control | NSEventModifierFlags::Option,
+            );
             let hidden = iv.scene.lock().map(|s| s.hidden).unwrap_or(false);
             border.setState(if hidden {
                 NSControlStateValueOff
@@ -286,7 +296,7 @@ pub struct MenuBar {
 }
 
 impl MenuBar {
-    /// Install the menu bar item, ⌥B (border on/off, with an overlay) and ⌃⌥⌘Q (quit).
+    /// Install the menu bar item, ⌃⌥B (border on/off, with an overlay) and ⌃⌥⌘Q (quit).
     /// `status` holds one line per gun, written by the gun supervisor; `overlay` says whether
     /// there is a border to show or hide. Must be called on the main thread.
     pub fn install(
@@ -361,12 +371,14 @@ impl MenuBar {
                     "⌃⌥⌘Q",
                 ));
                 if overlay {
+                    // Control as well as Option: since macOS 15, hot keys whose only
+                    // modifiers are Option (or Option-Shift) register fine but never fire.
                     hot_keys.push(register(
                         carbon::KEY_B,
-                        carbon::OPTION,
+                        carbon::CONTROL | carbon::OPTION,
                         TOGGLE_BORDER,
                         target,
-                        "⌥B",
+                        "⌃⌥B",
                     ));
                 }
             } else {

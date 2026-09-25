@@ -92,9 +92,9 @@ and RPCS3. Working configs go in `docs/macos-emulators.md`.
 - Mednafen (Saturn): Virtua Gun / Stunner on the mouse.
 - RPCS3 (PS3): GunCon 3 on the mouse; needs the PS3 system software.
 - Supporting pieces, done: `Sindenrs.app` starts `run` when opened, with an icon, a menu bar
-  item (gun status, Show Border, Quit), ⌥B to toggle the border and ⌃⌥⌘Q to quit, and one
+  item (gun status, Show Border, Quit), ⌃⌥B to toggle the border and ⌃⌥⌘Q to quit, and one
   instance at a time; starting at login is opt-in and off.
-- Later: a 4:3 border mode, cycled with ⌥B like the vendor's Alt-B. The tracker already
+- Later: a 4:3 border mode, cycled with ⌃⌥B like the vendor's Alt-B. The tracker already
   supports it through `display.aspect` and `ratio_x` / `offset_x`, but switching live needs
   the tracking loop to take display settings at run time. Not needed for accuracy: with the
   full-screen border, the emulator maps the pointer into its 4:3 picture itself.

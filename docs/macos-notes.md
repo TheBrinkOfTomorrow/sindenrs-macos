@@ -355,3 +355,41 @@ release and a debug build (different CDHashes, `c0bf70…` and `1b19c4…`) both
 - A `sindenrs` crash report (SIGABRT, a release-build panic) from 12:24 that day came from a
   bare command-line run during the corner-frame analysis, not from `run`; no symbols. Watch
   for a repeat.
+
+## 2026-09-24 — Tracker starved while ARMSX2 runs; latency-critical activity and QoS
+
+ARMSX2 + Virtua Cop turned bad after a good session: a jittery pointer, shots registering late
+and off the cursor, the pump (Shoot Offscreen) not working. Outside the game everything
+checked out: the preview test gave 24 aimed shots within 2% (most within 1%), every control
+arrived at the gun and in macOS, and ARMSX2's profile and per-game settings were unchanged.
+The machine was busy (load 18/11/9, a Backblaze upload at a full core since just before).
+
+A recording during play (`debug track --send --record` with `border`, 7800 frames, plus a
+10 ms cursor log on the same clock) showed the tracker starved: only 37 fps; for the first 40 s
+frames were dequeued 5-13 s after capture and one took 3.9 s to process; aim steps up to 80%
+of the screen between frames (308 jumps over 5%); later still 7 ms typical and 40 ms at the 95th
+percentile against ~2 ms on an idle machine. Many four-edge frames without tabs came from after
+leaving the game (white desktop windows against the border hide the tabs), not from play.
+
+Cause: a windowless background app on macOS is subject to App Nap and energy throttling,
+and the tracker threads and camera callbacks ran at default priority, losing to a busy
+emulator. Fix (`src/activity.rs`): `run`, `debug track` and `calibrate` hold an
+`NSProcessInfo` activity with `UserInteractive` (user-initiated + latency-critical; also no
+idle sleep), each tracker thread sets `QOS_CLASS_USER_INTERACTIVE`, and the AVFoundation
+callback queue gets the same QoS. Checked: `pmset -g assertions` lists "tracking the Sinden
+Lightgun", the process runs at priority 58 (default 31). To be confirmed in play.
+
+Confirmed in play with the installed app (the fixed build): Virtua Cop on ARMSX2 is back to
+normal: steady pointer, shots on time and where aimed, pump reload working. The 5.5-minute
+session found the border in 91% of frames at 4.5 ms mean processing, with the Backblaze upload
+still running. Lesson: macOS will starve a windowless helper under load unless it says it is
+latency-critical; do this for anything real-time.
+
+## 2026-09-25 — The border toggle is ⌃⌥B, not ⌥B
+
+⌥B never worked: with press logging added, the log showed both hot keys registered (no
+error from `RegisterEventHotKey`) and ⌃⌥⌘Q presses delivered, but no ⌥B press ever arrived.
+Since macOS 15, Carbon hot keys whose only modifiers are Option (or Option-Shift) register
+successfully yet never fire (a guard against keyloggers). The toggle is now Control-Option-B,
+still close to the vendor's Alt-B and needing no permission; keeping plain ⌥B would take a
+system-wide keyboard monitor and the Input Monitoring permission.

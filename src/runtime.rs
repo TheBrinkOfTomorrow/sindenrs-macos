@@ -265,6 +265,7 @@ pub fn run_tracker_with(
     status: &Arc<Mutex<Status>>,
     hook: &mut dyn FnMut(&Sample) -> Flow,
 ) -> Result<()> {
+    crate::activity::interactive_thread();
     let cam = Camera::open(camera, &opts.display)?;
     let (w, h) = cam.size();
     let d = &opts.display;
