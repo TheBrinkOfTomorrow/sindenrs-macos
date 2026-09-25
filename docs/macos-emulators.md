@@ -29,6 +29,10 @@ A click lands where the gun is aiming, not where the pointer was.
   camera access.
 - **⌃⌥B** shows or hides the border, from anywhere, including a full-screen game. With the
   border hidden the menu bar is visible, and so is the crosshair item.
+- **⌃⌥C** shows or hides a **reticle** (a dark red ring) where each gun is aiming, and **⌃⌥P**
+  the **camera view**: per gun, the camera feed and what the detector made of it, in the
+  bottom-left corner. Both are off at start and also in the crosshair menu. They are drawn
+  dim on purpose, so the camera does not mistake them for the border.
 - **⌃⌥⌘Q** quits, from anywhere. So does *Quit Sindenrs* in the crosshair menu, or
   `tools/macos/stop.sh`.
 - Log: `~/Library/Logs/Sindenrs.log`. Install or update the app with `tools/macos/install.sh`,
