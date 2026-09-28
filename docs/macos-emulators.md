@@ -1,7 +1,8 @@
 # Sinden Lightgun with emulators on macOS
 
 How to play light-gun games on macOS with sindenrs. Each section is an emulator that has been
-set up and checked with the gun. More will follow (Flycast, Mednafen, RPCS3).
+set up and checked with the gun: ARMSX2 (PS2) and Flycast (Dreamcast). More will follow
+(Mednafen, RPCS3).
 
 ## How it fits together
 
@@ -88,3 +89,33 @@ ARMSX2 is the Apple-silicon fork of PCSX2, so the same settings apply to PCSX2 2
 
 While binding, keep the gun aimed at the ARMSX2 window: a press elsewhere clicks there and
 takes the focus away from the binding prompt.
+
+## Flycast (Dreamcast): light gun
+
+Checked with **Confidential Mission** on Flycast 2.7: aiming and shooting work, and the pump
+reloads.
+
+1. Start sindenrs first, so the gun's controls work while you set things up.
+2. **Settings → Controls → Dreamcast Devices → Port A: Light Gun** (not *Sega Controller*).
+   The VMU slots next to it can stay. This is the step that matters: with a controller in
+   Port A the game shows a pad and Flycast grabs the mouse to steer it (the title bar says
+   *mouse capture*).
+3. **Physical Devices:** keep **Default Mouse** and **Keyboard** on **A** (the gun's aim and
+   clicks, and its keys). Move any gamepad (e.g. a DualSense) to **B** or **None** while you
+   play with the gun.
+4. **Default Mouse → Map**, pressing each control on the gun while aiming at the window:
+
+   | Dreamcast gun | Sinden control | Saved in `mappings/SDL_Default Mouse.cfg` |
+   |---------------|----------------|-------------------------------------------|
+   | A (shoot) | trigger | `2:btn_a` |
+   | Reload | pump | `1:reload` |
+   | B | front right | `3:btn_b` |
+
+   Flycast numbers mouse buttons its own way (2 = left, 1 = right, 3 = middle), so the file
+   looks swapped but is right.
+5. **Keyboard → Map:** Start → rear left (key `1`); the d-pad is the arrow keys by default.
+6. **Click Done, then restart the game**: the Dreamcast only detects a light gun at boot.
+7. Leave Flycast's crosshair off (colour 0) and use Sindenrs' **⌃⌥C** reticle if you want one.
+
+In `~/Library/Application Support/Flycast/emu.cfg` the result is `device1 = 7` (light gun) in
+`[input]`.
