@@ -406,3 +406,13 @@ the latency fix freed. The trackers feed a shared `preview::Live` from `run`'s s
 make preview images only while the camera view is on, every 4th frame (~15 per second).
 Everything is drawn dim as on the preview page. Checked at start-up: both windows up, all four
 hot keys registered.
+
+## 2026-09-28 — Flycast 2.7: Confidential Mission
+
+First attempt failed: the game's controller screen showed a pad and Flycast's title said
+*mouse capture*. `emu.cfg` had `device1 = 0` (Sega Controller) in Port A, so the mouse was
+steering a pad. With Port A set to Light Gun (`device1 = 7`) and the game restarted (the
+Dreamcast only detects peripherals at boot), aiming, shooting and pump reload work. The mouse
+mapping file reads `1:reload`, `2:btn_a`, `3:btn_b`, which looked swapped by SDL's numbering but
+is right: Flycast numbers mouse buttons 2 = left, 1 = right, 3 = middle. Setup in
+`docs/macos-emulators.md`.

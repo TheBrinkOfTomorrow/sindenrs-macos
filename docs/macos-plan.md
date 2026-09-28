@@ -25,7 +25,7 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 | 0 — Hardware check | **done** |
 | 1 — macOS backends | **done** |
 | 2 — Border overlay | **done** (per-emulator full-screen checks continue in Phase 3) |
-| 3 — Emulator setup | in progress: ARMSX2 done; Flycast, Mednafen, RPCS3 next |
+| 3 — Emulator setup | in progress: ARMSX2 and Flycast done; Mednafen, RPCS3 next |
 | 4 — Two players | optional, not started |
 
 Measurements and decisions are in `docs/macos-notes.md`.
@@ -88,7 +88,8 @@ The emulators actually in use: ARMSX2 (Apple-silicon PCSX2 fork), Flycast, Medna
 and RPCS3. Working configs go in `docs/macos-emulators.md`.
 - ARMSX2 (PS2): GunCon 2 on the pointer. **Done:** Virtua Cop Elite Edition, full screen, 4:3;
   accurate, and the border stays on top.
-- Flycast (Dreamcast / NAOMI / Atomiswave): light gun on the mouse.
+- Flycast (Dreamcast / NAOMI / Atomiswave): light gun on the mouse. **Done:** Confidential
+  Mission; Port A must be *Light Gun* and the game restarted.
 - Mednafen (Saturn): Virtua Gun / Stunner on the mouse.
 - RPCS3 (PS3): GunCon 3 on the mouse; needs the PS3 system software.
 - Supporting pieces, done: `Sindenrs.app` starts `run` when opened, with an icon, a menu bar
