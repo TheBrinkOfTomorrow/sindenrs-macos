@@ -107,6 +107,14 @@ hardware findings and the roadmap.
 Hardware notes: the gun firmware wedges if an auth command (109/110) is sent without its
 32-byte payload; recover with `sindenrs gun reset` (1200-baud bootloader touch). Hub port
 power-cycling only re-enumerates it. Never send a frame with command byte 0xAA. Vendor reference binary (Mono) can be run from the RE tree for A/B checks.
+Firmware 1.9 (2026 guns, SindenCamC camera board 16d0:1097): serial queries stop being
+answered once streaming (121) has started, and a query sent then can stop the firmware
+reading its port entirely — writes back up and closing the port blocks in the kernel. In
+that state the bootloader touch can leave the MCU off the bus (its hub shows the port as
+connect-without-enable, no Caterina either), and the MCU is powered from upstream VBUS, not
+its hub port, so `uhubctl` port power-cycling cannot cold-boot it: only replugging the cable
+recovers. So: read everything (queries 101/102/104/105/111…) before 121, never after —
+positions and events remain fine (`runtime::prepare_gun` enforces the order).
 
 ## Commits
 
