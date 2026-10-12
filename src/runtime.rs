@@ -22,6 +22,35 @@ use crate::vision::acquire::{
 use crate::vision::lens::Lens;
 use crate::vision::luma;
 
+/// Linear map from an aim in border percent to the position percent sent to the gun, whose
+/// absolute pointer the OS spreads over the whole screen: `sent = aim * scale + offset`,
+/// per axis, top-left origin. Identity when the border fills the screen; on macOS the
+/// overlay letterboxes itself to the display profile's aspect below the menu bar, and
+/// [`crate::overlay::aim_map`] says where it ended up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AimMap {
+    pub scale: [f64; 2],
+    pub offset: [f64; 2],
+}
+
+impl Default for AimMap {
+    fn default() -> Self {
+        Self {
+            scale: [1.0; 2],
+            offset: [0.0; 2],
+        }
+    }
+}
+
+impl AimMap {
+    pub fn apply(self, p: [f64; 2]) -> [f64; 2] {
+        [
+            p[0] * self.scale[0] + self.offset[0],
+            p[1] * self.scale[1] + self.offset[1],
+        ]
+    }
+}
+
 /// What one tracking loop does.
 #[derive(Clone, Debug)]
 pub struct TrackerOptions {
@@ -51,6 +80,8 @@ pub struct TrackerOptions {
     pub per_frame: bool,
     /// Report a status line every `report_every` (None = never).
     pub report_every: Option<Duration>,
+    /// Map from border percent to the screen percent sent to the gun (see [`AimMap`]).
+    pub aim_map: AimMap,
 }
 
 /// One processed frame, handed to the caller's hook.
@@ -421,7 +452,8 @@ pub fn run_tracker_with(
                 smoother.reset();
             }
             if let Some((g, _)) = gun.as_mut() {
-                if let Some([x, y]) = aim.or(last_aim) {
+                if let Some(a) = aim.or(last_aim) {
+                    let [x, y] = opts.aim_map.apply(a);
                     send_position(g, x, y, &mut position_timeouts)?;
                 }
             }
@@ -430,7 +462,8 @@ pub fn run_tracker_with(
             guard.lost();
             smoother.reset();
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
-                send_position(g, prev[0], prev[1], &mut position_timeouts)?;
+                let [x, y] = opts.aim_map.apply(prev);
+                send_position(g, x, y, &mut position_timeouts)?;
             }
         }
         if aim.is_some() {

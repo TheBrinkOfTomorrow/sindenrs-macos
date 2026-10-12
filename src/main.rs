@@ -732,7 +732,7 @@ fn main() -> Result<()> {
             let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(frac)));
             let stop = Arc::new(AtomicBool::new(false));
             on_ctrl_c(&stop)?;
-            sindenrs::overlay::run(scene, stop)
+            sindenrs::overlay::run(scene, stop, ctx.display.aspect)
         }
         Cmd::Calibrate(a) => calibrate(&ctx, *a),
         Cmd::Gun { cmd } => gun(&ctx, AnyGunCmd::User(cmd)),
@@ -2050,6 +2050,8 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         record: a.record.clone(),
         per_frame: a.per_frame,
         report_every: Some(Duration::from_secs(1)),
+        // Diagnostics: aim is reported, not steering a cursor over a letterboxed border.
+        aim_map: sindenrs::runtime::AimMap::default(),
     };
     let status = Arc::new(Mutex::new(Status::default()));
     if a.preview {
@@ -2182,7 +2184,11 @@ fn track_with_preview(
 
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_all(ctx: &Ctx, overlay: bool, control: &std::sync::Arc<sindenrs::control::Control>) -> Result<()> {
+fn run_all(
+    ctx: &Ctx,
+    overlay: bool,
+    control: &std::sync::Arc<sindenrs::control::Control>,
+) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2222,8 +2228,28 @@ fn run_all(ctx: &Ctx, overlay: bool, control: &std::sync::Arc<sindenrs::control:
     {
         let status = Arc::new(Mutex::new(Vec::new()));
         let live = Arc::new(Mutex::new(sindenrs::preview::Live::default()));
+        // Where the letterboxed overlay will sit, so positions sent to the gun (whose
+        // pointer spans the whole screen) land where the gun points. With the overlay off
+        // something else draws the border, presumably over the whole screen: identity.
+        let aim_map = if overlay {
+            sindenrs::overlay::aim_map(ctx.display.aspect)
+                .inspect(|m| {
+                    info!(
+                        "overlay letterboxed to {:.3}: {:.1}% x {:.1}% of the screen at ({:.1}%, {:.1}%)",
+                        ctx.display.aspect,
+                        m.scale[0] * 100.0,
+                        m.scale[1] * 100.0,
+                        m.offset[0],
+                        m.offset[1]
+                    );
+                })
+                .inspect_err(|e| warn!("overlay placement: {e:#}; sending positions unmapped"))
+                .unwrap_or_default()
+        } else {
+            sindenrs::runtime::AimMap::default()
+        };
         return std::thread::scope(|sc| {
-            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status), Some(&live)));
+            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status), Some(&live), aim_map));
             let menu = sindenrs::menubar::MenuBar::install(
                 stop.clone(),
                 scene.clone(),
@@ -2236,11 +2262,11 @@ fn run_all(ctx: &Ctx, overlay: bool, control: &std::sync::Arc<sindenrs::control:
             .inspect_err(|e| warn!("menu bar: {e:#}"))
             .ok();
             // Reticles and camera views, off until switched on (⌃⌥C, ⌃⌥P or the menu).
-            let hud = sindenrs::preview::hud::open(live.clone())
+            let hud = sindenrs::preview::hud::open(live.clone(), aim_map)
                 .inspect_err(|e| warn!("heads-up display: {e:#}"))
                 .ok();
             let shown = if overlay {
-                sindenrs::overlay::run_until(scene, &stop)
+                sindenrs::overlay::run_until(scene, &stop, ctx.display.aspect)
                     .inspect_err(|e| warn!("overlay: {e:#}; tracking continues without it"))
                     .is_ok()
             } else {
@@ -2262,18 +2288,19 @@ fn run_all(ctx: &Ctx, overlay: bool, control: &std::sync::Arc<sindenrs::control:
     #[cfg(not(target_os = "macos"))]
     {
         let _ = control; // the menu that uses it is macOS-only
+        let aspect = ctx.display.aspect;
         let overlay_thread = overlay.then(|| {
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("overlay".into())
                 .spawn(move || {
-                    if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
+                    if let Err(e) = sindenrs::overlay::run_until(scene, &stop, aspect) {
                         warn!("overlay: {e:#}; tracking continues without it");
                     }
                 })
         });
 
-        let r = supervise_guns(ctx, &stop, None, None);
+        let r = supervise_guns(ctx, &stop, None, None, sindenrs::runtime::AimMap::default());
         if let Some(Ok(t)) = overlay_thread {
             let _ = t.join();
         }
@@ -2291,6 +2318,7 @@ fn supervise_guns(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     status_out: Option<&std::sync::Mutex<Vec<String>>>,
     live: Option<&std::sync::Arc<std::sync::Mutex<sindenrs::preview::Live>>>,
+    aim_map: sindenrs::runtime::AimMap,
 ) -> Result<()> {
     use sindenrs::preview::Live;
     use sindenrs::runtime::{run_tracker_with, Flow, Status, TrackerOptions};
@@ -2391,6 +2419,7 @@ fn supervise_guns(
                 record: None,
                 per_frame: false,
                 report_every: None,
+                aim_map,
             };
             let status = Arc::new(Mutex::new(Status {
                 name: gc.name.clone(),
@@ -3019,6 +3048,14 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     let targets = grid_targets(a.grid);
     let port = select_port(ctx)?;
     let camera = camera_for_port(&port)?;
+    // The measurements compare aims to targets in border percent; the map only keeps the
+    // OS cursor under the gun while the letterboxed overlay is up (macOS).
+    #[cfg(target_os = "macos")]
+    let aim_map = sindenrs::overlay::aim_map(ctx.display.aspect)
+        .inspect_err(|e| warn!("overlay placement: {e:#}; sending positions unmapped"))
+        .unwrap_or_default();
+    #[cfg(not(target_os = "macos"))]
+    let aim_map = sindenrs::runtime::AimMap::default();
     let opts = TrackerOptions {
         display: ctx.display.clone(),
         threshold: None,
@@ -3035,6 +3072,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         record: a.record.clone(),
         per_frame: false,
         report_every: None,
+        aim_map,
     };
 
     let scene = Arc::new(Mutex::new(Scene {
@@ -3284,7 +3322,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         })?
     };
 
-    sindenrs::overlay::run(scene, stop)?;
+    sindenrs::overlay::run(scene, stop, ctx.display.aspect)?;
     let out = worker
         .join()
         .map_err(|_| anyhow!("the measuring thread panicked"))??;
