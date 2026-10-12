@@ -49,8 +49,12 @@ pub const GUN_PIDS: [u16; 4] = [0x0f01, 0x0f02, 0x0f38, 0x0f39];
 
 /// (vendor, product) pairs of the camera boards shipped in guns.
 /// 16d0:1097 is the "SindenCamC" board (seen in a 2026 Blue gun, firmware 1.9).
-pub const CAMERA_IDS: [(u16, u16); 4] =
-    [(0x05a3, 0x9210), (0x32e4, 0x9210), (0x16d0, 0x0109), (0x16d0, 0x1097)];
+pub const CAMERA_IDS: [(u16, u16); 4] = [
+    (0x05a3, 0x9210),
+    (0x32e4, 0x9210),
+    (0x16d0, 0x0109),
+    (0x16d0, 0x1097),
+];
 
 pub fn is_gun(vid: u16, pid: u16) -> bool {
     vid == GUN_VID && GUN_PIDS.contains(&pid)
