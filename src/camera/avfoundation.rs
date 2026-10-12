@@ -181,13 +181,24 @@ fn ensure_access() -> io::Result<()> {
     let granted = if status == AVAuthorizationStatus::Authorized {
         true
     } else if status == AVAuthorizationStatus::NotDetermined {
+        // This blocks until the user answers, which can be hours if the dialog is behind a
+        // game or on another desktop — without the log line it just looks like a hang.
+        tracing::info!(
+            "waiting for the macOS camera permission prompt — click Allow \
+             (System Settings > Privacy & Security > Camera if no dialog is on screen)"
+        );
         let (tx, rx) = mpsc::channel();
         let handler = block2::RcBlock::new(move |ok: Bool| {
             let _ = tx.send(ok.as_bool());
         });
         // SAFETY: a valid media type and a block that outlives the call (it is retained).
         unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(video, &handler) };
-        rx.recv().unwrap_or(false)
+        let ok = rx.recv().unwrap_or(false);
+        tracing::info!(
+            "camera permission {}",
+            if ok { "granted" } else { "denied" }
+        );
+        ok
     } else {
         false
     };
