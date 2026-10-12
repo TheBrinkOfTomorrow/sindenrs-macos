@@ -15,6 +15,7 @@
 pub mod activity;
 pub mod camera;
 pub mod config;
+pub mod control;
 pub mod discovery;
 pub mod firmware;
 pub mod gun;

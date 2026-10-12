@@ -16,6 +16,30 @@ use sindenrs::discovery;
 use sindenrs::gun::Gun;
 use sindenrs::protocol::{cmd, percent_to_axis};
 
+/// Make Ctrl-C set `stop`. The process may go through several phases that each bring their
+/// own flag (`run`, then a menu-launched calibration, then `run` again), but a handler can
+/// only be installed once, so the one handler targets whatever flag was registered last.
+fn on_ctrl_c(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SLOT: OnceLock<Mutex<Arc<std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    if let Some(slot) = SLOT.get() {
+        if let Ok(mut s) = slot.lock() {
+            *s = stop.clone();
+        }
+        return Ok(());
+    }
+    SLOT.set(Mutex::new(stop.clone())).ok();
+    ctrlc::set_handler(|| {
+        if let Some(slot) = SLOT.get() {
+            if let Ok(s) = slot.lock() {
+                s.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .context("installing Ctrl-C handler")
+}
+
 #[derive(Parser)]
 #[command(name = "sindenrs", version, about = "Sinden Lightgun driver")]
 struct Cli {
@@ -626,6 +650,8 @@ fn main() -> Result<()> {
     if ctx.path.exists() {
         debug!(path = %ctx.path.display(), "config loaded");
     }
+    // `run`'s Reload Settings re-reads the config with the same profile selection.
+    let profile = cli.profile.clone();
 
     match cli.cmd {
         Cmd::List { no_connect } => list(&ctx, no_connect),
@@ -634,14 +660,56 @@ fn main() -> Result<()> {
             overlay,
             no_overlay,
         } => {
-            let overlay = if overlay {
-                true
-            } else if no_overlay {
-                false
-            } else {
-                ctx.display.overlay
-            };
-            run_all(&ctx, overlay)
+            use sindenrs::control::{Control, Request};
+            let control = std::sync::Arc::new(Control::new());
+            let mut ctx = ctx;
+            loop {
+                let overlay_on = if overlay {
+                    true
+                } else if no_overlay {
+                    false
+                } else {
+                    ctx.display.overlay
+                };
+                run_all(&ctx, overlay_on, &control)?;
+                match control.take() {
+                    Request::None => break Ok(()),
+                    Request::Calibrate => {
+                        // The guns and camera are free now. Capture on trigger or a steady
+                        // hold, save without asking (there is no terminal to ask on), then
+                        // fall through to the reload and go back to running.
+                        let args = CalibrateArgs {
+                            grid: 3,
+                            capture: CaptureMode::Either,
+                            save: true,
+                            no_save: false,
+                            out: None,
+                            record: None,
+                            debug_dir: None,
+                            samples: 24,
+                            dwell_radius: 1.2,
+                            rearm_distance: 4.0,
+                            steady_tolerance: 4.0,
+                        };
+                        if let Err(e) = calibrate(&ctx, args) {
+                            warn!("calibration: {e:#}");
+                        }
+                    }
+                    Request::Reload => {}
+                }
+                // Back to `run` on fresh settings (calibration may have changed them too).
+                match sindenrs::config::Config::load_or_default(&ctx.path) {
+                    Ok(cfg) => match cfg.display_for(profile.as_deref()) {
+                        Ok(display) => {
+                            info!("configuration reloaded from {}", ctx.path.display());
+                            ctx.cfg = cfg;
+                            ctx.display = display;
+                        }
+                        Err(e) => warn!("config reload: {e:#}; keeping the old settings"),
+                    },
+                    Err(e) => warn!("config reload: {e:#}; keeping the old settings"),
+                }
+            }
         }
         Cmd::Border(a) => {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -663,11 +731,7 @@ fn main() -> Result<()> {
             }
             let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(frac)));
             let stop = Arc::new(AtomicBool::new(false));
-            {
-                let stop = stop.clone();
-                ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-                    .context("installing Ctrl-C handler")?;
-            }
+            on_ctrl_c(&stop)?;
             sindenrs::overlay::run(scene, stop)
         }
         Cmd::Calibrate(a) => calibrate(&ctx, *a),
@@ -2117,7 +2181,7 @@ fn track_with_preview(
 
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
+fn run_all(ctx: &Ctx, overlay: bool, control: &std::sync::Arc<sindenrs::control::Control>) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2139,11 +2203,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     let _activity = sindenrs::activity::begin("tracking the Sinden Lightgun");
 
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
-    }
+    on_ctrl_c(&stop)?;
 
     // The border the guns track. Its window is shaped to the border and takes no input, so
     // it can sit above a running game; if there is no display, tracking still runs (the
@@ -2169,6 +2229,8 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
                 status.clone(),
                 live.clone(),
                 overlay,
+                control.clone(),
+                ctx.path.clone(),
             )
             .inspect_err(|e| warn!("menu bar: {e:#}"))
             .ok();
@@ -2198,6 +2260,7 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     // Elsewhere the overlay has a thread of its own and the guns are supervised here.
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = control; // the menu that uses it is macOS-only
         let overlay_thread = overlay.then(|| {
             let stop = stop.clone();
             std::thread::Builder::new()
@@ -2978,11 +3041,12 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         ..Default::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
-    }
+    on_ctrl_c(&stop)?;
+    // Launched from the menu there is no terminal, so ⌃⌥⌘Q is the way out.
+    #[cfg(target_os = "macos")]
+    let _quit_key = sindenrs::menubar::QuitKey::install(stop.clone())
+        .inspect_err(|e| warn!("quit hot key: {e:#}"))
+        .ok();
 
     println!("Aim at the ringed target and pull the trigger. Escape quits.");
     println!("The overlay shows everything: the ring is the target, the dot is where the driver");
@@ -3256,6 +3320,12 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     ];
     println!("\n{} of {} targets measured", done.len(), targets.len());
     println!("error: mean {mean:.2}% of screen, max {max:.2}%");
+    // Launched from the menu there is no terminal, so the result goes to the log too.
+    info!(
+        "calibration: {} of {} targets measured, mean error {mean:.2}% of screen, max {max:.2}%",
+        done.len(),
+        targets.len()
+    );
     println!(
         "systematic bias: dx {:+.2}%, dy {:+.2}%  (cancel with display.offset_x / offset_y)",
         bias[0], bias[1]
@@ -3339,6 +3409,10 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 let mut gun = connect(&port, ctx.cfg.global.auto_recover)?;
                 gun.write_calibration(cal[0], cal[1])?;
                 println!("saved to the gun's EEPROM; run `calibrate` again to check the error drops to the spread above");
+                info!(
+                    "bore calibration x {:+.2}%, y {:+.2}% of frame saved to the gun's EEPROM",
+                    cal[0], cal[1]
+                );
                 if let Some(over) = gun_config_for(&ctx.cfg, out.gun_id.as_deref()).calibration {
                     println!(
                         "note: the config sets calibration = [{}, {}] for this gun, which overrides the saved value",

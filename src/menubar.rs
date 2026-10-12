@@ -12,6 +12,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSObject, NSObjectProtocol, NSString};
 
+use crate::control::{Control, Request};
 use crate::overlay::Scene;
 use crate::preview::Live;
 
@@ -203,6 +205,10 @@ struct TargetIvars {
     live: Arc<Mutex<Live>>,
     /// Whether this `run` draws a border at all (no Show Border item otherwise).
     overlay: bool,
+    /// Where Calibrate… and Reload Settings leave their request for `main`'s run loop.
+    control: Arc<Control>,
+    /// The configuration file Edit Settings… opens.
+    config_path: PathBuf,
 }
 
 define_class!(
@@ -245,8 +251,51 @@ define_class!(
         fn toggle_camera(&self, _sender: Option<&AnyObject>) {
             toggle_live(&self.ivars().live, false);
         }
+
+        #[unsafe(method(calibrate:))]
+        fn calibrate(&self, _sender: Option<&AnyObject>) {
+            tracing::info!("menu: calibrate requested");
+            self.ivars().control.set(Request::Calibrate);
+            self.ivars().stop.store(true, Ordering::Relaxed);
+        }
+
+        #[unsafe(method(reloadSettings:))]
+        fn reload_settings(&self, _sender: Option<&AnyObject>) {
+            tracing::info!("menu: settings reload requested");
+            self.ivars().control.set(Request::Reload);
+            self.ivars().stop.store(true, Ordering::Relaxed);
+        }
+
+        #[unsafe(method(editSettings:))]
+        fn edit_settings(&self, _sender: Option<&AnyObject>) {
+            open_settings_file(&self.ivars().config_path);
+        }
     }
 );
+
+/// Open the configuration file in the default text editor, creating it (with the commented
+/// key reference) first if it does not exist yet.
+fn open_settings_file(path: &std::path::Path) {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("could not create {}: {e}", dir.display());
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(path, crate::config::example_header()) {
+            tracing::warn!("could not create {}: {e}", path.display());
+            return;
+        }
+    }
+    if let Err(e) = std::process::Command::new("open")
+        .arg("-t")
+        .arg(path)
+        .spawn()
+    {
+        tracing::warn!("could not open {}: {e}", path.display());
+    }
+}
 
 impl Target {
     fn new(mtm: MainThreadMarker, ivars: TargetIvars) -> Retained<Self> {
@@ -329,6 +378,10 @@ impl Target {
             menu.addItem(&item);
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&self.item("Calibrate…", Some(sel!(calibrate:)), ""));
+        menu.addItem(&self.item("Edit Settings…", Some(sel!(editSettings:)), ""));
+        menu.addItem(&self.item("Reload Settings", Some(sel!(reloadSettings:)), ""));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = self.item("Quit Sindenrs", Some(sel!(quit:)), "q");
         quit.setKeyEquivalentModifierMask(
             NSEventModifierFlags::Control
@@ -354,13 +407,17 @@ impl MenuBar {
     /// Install the menu bar item and the shortcuts: ⌃⌥B (border on/off, with an overlay),
     /// ⌃⌥C (reticle), ⌃⌥P (camera view) and ⌃⌥⌘Q (quit). `status` holds one line per gun,
     /// written by the gun supervisor; `live` is the heads-up display's state; `overlay` says
-    /// whether there is a border to show or hide. Must be called on the main thread.
+    /// whether there is a border to show or hide; `control` is where Calibrate… and Reload
+    /// Settings leave their request, and `config_path` what Edit Settings… opens. Must be
+    /// called on the main thread.
     pub fn install(
         stop: Arc<AtomicBool>,
         scene: Arc<Mutex<Scene>>,
         status: Arc<Mutex<Vec<String>>>,
         live: Arc<Mutex<Live>>,
         overlay: bool,
+        control: Arc<Control>,
+        config_path: PathBuf,
     ) -> Result<Self> {
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| anyhow!("the menu bar item must be created on the main thread"))?;
@@ -380,6 +437,8 @@ impl MenuBar {
                 status,
                 live,
                 overlay,
+                control,
+                config_path,
             },
         );
         let menu = NSMenu::new(mtm);
@@ -482,6 +541,80 @@ impl Drop for MenuBar {
         }
         NSStatusBar::systemStatusBar().removeStatusItem(&self.item);
         let _ = &self.keys;
+    }
+}
+
+/// The quit hot key fired; `user` points at the `AtomicBool` inside the Arc `QuitKey` holds.
+extern "C" fn on_quit_key(_call: *mut c_void, _event: *mut c_void, user: *mut c_void) -> i32 {
+    // Only one key is registered on this handler, so there is no id to look at.
+    // SAFETY: `user` is the `AtomicBool` inside the Arc that `QuitKey` keeps alive for as
+    // long as the handler is installed; an Arc's contents never move.
+    let stop = unsafe { &*user.cast::<AtomicBool>() };
+    tracing::info!("⌃⌥⌘Q: stopping");
+    stop.store(true, Ordering::Relaxed);
+    0
+}
+
+/// ⌃⌥⌘Q on its own, for phases that run without the menu bar item (a menu-launched
+/// calibration): sets `stop`, so the phase can be abandoned without a terminal. Removed on
+/// drop.
+pub struct QuitKey {
+    hot_key: *mut c_void,
+    handler: *mut c_void,
+    /// Kept alive for the handler until it is removed.
+    stop: Arc<AtomicBool>,
+}
+
+impl QuitKey {
+    pub fn install(stop: Arc<AtomicBool>) -> Result<Self> {
+        let types = [carbon::EventTypeSpec {
+            event_class: carbon::KEYBOARD,
+            event_kind: carbon::HOT_KEY_PRESSED,
+        }];
+        let mut handler = ptr::null_mut();
+        // SAFETY: as in `MenuBar::install`: the application event target, a handler with the
+        // C signature Carbon expects, and user data kept alive, unmoved, until `drop`.
+        let hot_key = unsafe {
+            let target = carbon::GetApplicationEventTarget();
+            let st = carbon::InstallEventHandler(
+                target,
+                on_quit_key,
+                types.len(),
+                types.as_ptr(),
+                Arc::as_ptr(&stop).cast_mut().cast(),
+                &mut handler,
+            );
+            if st != 0 {
+                return Err(anyhow!("InstallEventHandler returned {st}"));
+            }
+            register(
+                carbon::KEY_Q,
+                carbon::CONTROL | carbon::OPTION | carbon::CMD,
+                QUIT,
+                target,
+                "⌃⌥⌘Q (calibration)",
+            )
+        };
+        Ok(Self {
+            hot_key,
+            handler,
+            stop,
+        })
+    }
+}
+
+impl Drop for QuitKey {
+    fn drop(&mut self) {
+        // SAFETY: refs we registered, released once; `stop` stays alive until after.
+        unsafe {
+            if !self.hot_key.is_null() {
+                carbon::UnregisterEventHotKey(self.hot_key);
+            }
+            if !self.handler.is_null() {
+                carbon::RemoveEventHandler(self.handler);
+            }
+        }
+        let _ = &self.stop;
     }
 }
 
