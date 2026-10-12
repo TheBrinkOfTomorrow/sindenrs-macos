@@ -1996,6 +1996,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     let camera = default_camera(a.settings.device.clone())?;
     let mut gun = None;
     let mut name = "track".to_owned();
+    let mut eeprom_cal = None;
     if a.send {
         let port = select_port(ctx)?;
         let mut g = connect(&port, ctx.cfg.global.auto_recover)?;
@@ -2004,7 +2005,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         if a.joystick {
             gc.joystick = true;
         }
-        sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
+        eeprom_cal = sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
         info!(
             "gun \"{}\" streaming (joystick={}, recoil={})",
             gc.name, gc.joystick, gc.recoil.enabled
@@ -2039,8 +2040,8 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         min_size: a.min_size,
         flip: a.flip.map(Into::into),
         orientation: a.orientation,
-        cal_x: a.cal_x,
-        cal_y: a.cal_y,
+        cal_x: a.cal_x.or(eeprom_cal.map(|c| c[0])),
+        cal_y: a.cal_y.or(eeprom_cal.map(|c| c[1])),
         lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
         jump_limit: ctx.display.jump_limit,
         hover_smoothing: ctx.display.hover_smoothing,
@@ -2360,11 +2361,14 @@ fn supervise_guns(
             };
             let id = gun.unique_id().ok();
             let gc = gun_config_for(&ctx.cfg, id.as_deref());
-            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
-                warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
-                retry_after.insert(key, Instant::now() + retry);
-                continue;
-            }
+            let cal = match sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
+                    retry_after.insert(key, Instant::now() + retry);
+                    continue;
+                }
+            };
             info!(
                 "[{}] {port} + {} (id {})",
                 gc.name,
@@ -2377,8 +2381,8 @@ fn supervise_guns(
                 min_size: None,
                 flip: None,
                 orientation: None,
-                cal_x: None,
-                cal_y: None,
+                cal_x: cal.map(|c| c[0]),
+                cal_y: cal.map(|c| c[1]),
                 lens_k1: ctx.cfg.global.lens_k1,
                 jump_limit: ctx.display.jump_limit,
                 hover_smoothing: ctx.display.hover_smoothing,
@@ -3087,9 +3091,17 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
             };
             let id = gun.unique_id().ok();
             let gc = gun_config_for(&cfg, id.as_deref());
-            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
-                finish(&stop);
-                return Err(e);
+            let mut opts = opts;
+            match sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
+                Ok(cal) => {
+                    // Measure with the current bore correction applied, as play would.
+                    opts.cal_x = opts.cal_x.or(cal.map(|c| c[0]));
+                    opts.cal_y = opts.cal_y.or(cal.map(|c| c[1]));
+                }
+                Err(e) => {
+                    finish(&stop);
+                    return Err(e);
+                }
             }
             // The kick would disturb the aim being measured; `run` re-sends the config.
             if let Err(e) = gun.set_recoil_enabled(false) {

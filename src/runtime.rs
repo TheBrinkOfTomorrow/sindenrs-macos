@@ -278,18 +278,11 @@ pub fn run_tracker_with(
         crate::config::Flip::Vertical => Flip::Vertical,
         crate::config::Flip::Both => Flip::Both,
     });
-    let (mut cal_x, mut cal_y) = (opts.cal_x, opts.cal_y);
-    if let Some((g, gc)) = gun.as_mut() {
-        cal_x = cal_x.or(gc.calibration.map(|c| c[0]));
-        cal_y = cal_y.or(gc.calibration.map(|c| c[1]));
-        if cal_x.is_none() {
-            cal_x = Some(g.calibration_x()?.0);
-        }
-        if cal_y.is_none() {
-            cal_y = Some(g.calibration_y()?.0);
-        }
-    }
-    let (cal_x, cal_y) = (cal_x.unwrap_or(0.0), cal_y.unwrap_or(0.0));
+    // No gun queries here: by now the gun is streaming (see `prepare_gun`, which read the
+    // EEPROM offset for the caller to pass in `opts`); the config's value is the fallback.
+    let cal = gun.as_ref().and_then(|(_, gc)| gc.calibration);
+    let cal_x = opts.cal_x.or(cal.map(|c| c[0])).unwrap_or(0.0);
+    let cal_y = opts.cal_y.or(cal.map(|c| c[1])).unwrap_or(0.0);
     // The bore offset lives in the camera's frame, so it must go through the same flip as the
     // image; otherwise it is applied backwards and every aim point carries twice the offset.
     let aim_px = flip_point(aim_pixel(w, h, cal_x, cal_y, orientation), w, h, flip);
@@ -569,11 +562,35 @@ pub fn run_tracker_with(
 }
 
 /// Bring a gun up for tracking: authenticate is the caller's job (recovery lives in the CLI);
-/// this applies config and starts streaming.
-pub fn prepare_gun(gun: &mut Gun, cfg: &GunConfig, recoil_gap: Duration) -> Result<()> {
+/// this reads the stored bore offset, applies config and starts streaming — in that order,
+/// because firmware 1.9 stops answering serial queries once streaming has started (and a
+/// query sent then can leave the firmware not reading at all, which only a replug clears).
+/// Nothing may query the gun after this returns; positions and events are fine.
+///
+/// Returns the effective calibration: the config's, else the gun's EEPROM, else none.
+pub fn prepare_gun(
+    gun: &mut Gun,
+    cfg: &GunConfig,
+    recoil_gap: Duration,
+) -> Result<Option<[f64; 2]>> {
+    let cal = if let Some(c) = cfg.calibration {
+        Some(c)
+    } else {
+        match (gun.calibration_x(), gun.calibration_y()) {
+            (Ok((x, _)), Ok((y, _))) => Some([x, y]),
+            (x, y) => {
+                warn!(
+                    "could not read the gun's stored calibration ({:?}/{:?}); aiming uncorrected",
+                    x.err(),
+                    y.err()
+                );
+                None
+            }
+        }
+    };
     gun.apply_config(cfg, recoil_gap)?;
     gun.start_streaming(Duration::from_millis(150))?;
-    Ok(())
+    Ok(cal)
 }
 
 #[cfg(test)]
