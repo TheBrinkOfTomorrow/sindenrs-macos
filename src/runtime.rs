@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::camera::source::{Camera, Next};
 use crate::config::{Display, GunConfig};
-use crate::gun::Gun;
+use crate::gun::{Gun, GunError};
 use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
     acquire, aim_pixel, flip_luma, flip_point, AcquireParams, Flip, Quad,
@@ -338,6 +338,7 @@ pub fn run_tracker_with(
     let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
+    let mut position_timeouts = 0u32;
     let mut window_start = Instant::now();
     let mut window_frames = 0u32;
     let mut fps = 0.0;
@@ -421,7 +422,7 @@ pub fn run_tracker_with(
             }
             if let Some((g, _)) = gun.as_mut() {
                 if let Some([x, y]) = aim.or(last_aim) {
-                    g.set_position(percent_to_axis(x), percent_to_axis(y))?;
+                    send_position(g, x, y, &mut position_timeouts)?;
                 }
             }
             last_quad = Some(*q);
@@ -429,7 +430,7 @@ pub fn run_tracker_with(
             guard.lost();
             smoother.reset();
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
-                g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
+                send_position(g, prev[0], prev[1], &mut position_timeouts)?;
             }
         }
         if aim.is_some() {
@@ -559,6 +560,33 @@ pub fn run_tracker_with(
         (proc_sum / n.max(1)).as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+/// Stream one position to the gun, tolerating a transient write timeout.
+///
+/// A single write timing out just means the firmware was busy for a moment (the recoil
+/// solenoid firing, a USB retry); the next frame replaces the position anyway, so dropping
+/// one is invisible, while failing the session costs a ten-second reconnect. A run of them
+/// means the firmware has stopped reading its port, which the reconnect (or a replug) is for.
+fn send_position(gun: &mut Gun, x: f64, y: f64, timeouts: &mut u32) -> crate::gun::Result<()> {
+    match gun.set_position(percent_to_axis(x), percent_to_axis(y)) {
+        Ok(()) => {
+            *timeouts = 0;
+            Ok(())
+        }
+        Err(GunError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            *timeouts += 1;
+            // Two seconds of 60 Hz positions all timing out is a dead line, not a glitch.
+            if *timeouts >= 120 {
+                return Err(GunError::Io(e));
+            }
+            if *timeouts == 1 {
+                warn!("position write timed out; dropping positions while it persists");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Bring a gun up for tracking: authenticate is the caller's job (recovery lives in the CLI);
