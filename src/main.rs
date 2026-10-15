@@ -77,6 +77,9 @@ enum Cmd {
         /// Do not draw the border; something else (MAME artwork) draws it.
         #[arg(long)]
         no_overlay: bool,
+        /// macOS: what moves the cursor (config: global.cursor).
+        #[arg(long, value_enum)]
+        cursor: Option<CursorArg>,
     },
     /// Measure and save the gun's aim calibration: shoot each target the overlay lights up.
     Calibrate(Box<CalibrateArgs>),
@@ -398,6 +401,9 @@ struct TrackArgs {
     /// With --send: put the gun in joystick mode (firmware 1.9+) instead of mouse mode.
     #[arg(long)]
     joystick: bool,
+    /// With --send on macOS: what moves the cursor (config: global.cursor).
+    #[arg(long, value_enum)]
+    cursor: Option<CursorArg>,
     /// Luma threshold for the border (default from config: display.threshold).
     #[arg(long)]
     threshold: Option<u8>,
@@ -471,6 +477,24 @@ enum FirmwareCmd {
         #[arg(long)]
         allow_id_mismatch: bool,
     },
+}
+
+/// What moves the system cursor on macOS (config: global.cursor).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CursorArg {
+    /// The driver posts Core Graphics events and synthesises the clicks (needs Accessibility).
+    Driver,
+    /// The gun's own HID mouse, as on Linux: no permission beyond the camera.
+    Gun,
+}
+
+impl From<CursorArg> for sindenrs::config::CursorDriver {
+    fn from(c: CursorArg) -> Self {
+        match c {
+            CursorArg::Driver => Self::Driver,
+            CursorArg::Gun => Self::Gun,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -659,11 +683,15 @@ fn main() -> Result<()> {
         Cmd::Run {
             overlay,
             no_overlay,
+            cursor,
         } => {
             use sindenrs::control::{Control, Request};
             let control = std::sync::Arc::new(Control::new());
             let mut ctx = ctx;
             loop {
+                if let Some(c) = cursor {
+                    ctx.cfg.global.cursor = c.into();
+                }
                 let overlay_on = if overlay {
                     true
                 } else if no_overlay {
@@ -2005,6 +2033,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     let mut gun = None;
     let mut name = "track".to_owned();
     let mut eeprom_cal = None;
+    let cursor = a.cursor.map_or(ctx.cfg.global.cursor, Into::into);
     if a.send {
         let port = select_port(ctx)?;
         let mut g = connect(&port, ctx.cfg.global.auto_recover)?;
@@ -2013,9 +2042,11 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         if a.joystick {
             gc.joystick = true;
         }
-        // See supervise_guns: on macOS the driver synthesises the trigger click itself.
+        // See supervise_guns: a synthesised macOS cursor makes the clicks itself.
         #[cfg(target_os = "macos")]
-        gc.buttons.mask_synthesised();
+        if cursor == sindenrs::config::CursorDriver::Driver {
+            gc.buttons.mask_synthesised();
+        }
         eeprom_cal = sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
         info!(
             "gun \"{}\" streaming (joystick={}, recoil={})",
@@ -2063,6 +2094,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         report_every: Some(Duration::from_secs(1)),
         // Diagnostics: aim is reported, not steering a cursor over a letterboxed border.
         aim_map: sindenrs::runtime::AimMap::default(),
+        cursor,
     };
     let status = Arc::new(Mutex::new(Status::default()));
     if a.preview {
@@ -2452,10 +2484,12 @@ fn supervise_guns(
             };
             let id = gun.unique_id().ok();
             let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
-            // macOS drives the cursor and the trigger click itself, so keep the gun's HID mouse
-            // from firing them (its stale position would snap the cursor to a corner).
+            // A synthesised macOS cursor makes the mouse clicks itself, so keep the gun's HID
+            // mouse from firing them (its stale position would snap the cursor to a corner).
             #[cfg(target_os = "macos")]
-            gc.buttons.mask_synthesised();
+            if ctx.cfg.global.cursor == sindenrs::config::CursorDriver::Driver {
+                gc.buttons.mask_synthesised();
+            }
             let cal = match sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
                 Ok(c) => c,
                 Err(e) => {
@@ -2487,6 +2521,7 @@ fn supervise_guns(
                 per_frame: false,
                 report_every: None,
                 aim_map,
+                cursor: ctx.cfg.global.cursor,
             };
             let status = Arc::new(Mutex::new(Status {
                 name: gc.name.clone(),
@@ -3140,6 +3175,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         per_frame: false,
         report_every: None,
         aim_map,
+        cursor: ctx.cfg.global.cursor,
     };
 
     let scene = Arc::new(Mutex::new(Scene {
@@ -3195,7 +3231,13 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 }
             };
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&cfg, id.as_deref());
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut gc = gun_config_for(&cfg, id.as_deref());
+            // As in `run`: a synthesised cursor makes the clicks, so the HID mouse must not.
+            #[cfg(target_os = "macos")]
+            if cfg.global.cursor == sindenrs::config::CursorDriver::Driver {
+                gc.buttons.mask_synthesised();
+            }
             let mut opts = opts;
             match sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
                 Ok(cal) => {

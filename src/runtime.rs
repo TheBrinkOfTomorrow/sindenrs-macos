@@ -13,7 +13,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use crate::camera::source::{Camera, Next};
-use crate::config::{Display, GunConfig};
+use crate::config::{CursorDriver, Display, GunConfig};
 use crate::gun::Gun;
 use crate::gun::GunError;
 use crate::protocol::percent_to_axis;
@@ -83,6 +83,8 @@ pub struct TrackerOptions {
     pub report_every: Option<Duration>,
     /// Map from border percent to the screen percent sent to the gun (see [`AimMap`]).
     pub aim_map: AimMap,
+    /// What moves the cursor on macOS (config: global.cursor); Linux always uses the gun.
+    pub cursor: CursorDriver,
 }
 
 /// One processed frame, handed to the caller's hook.
@@ -371,15 +373,22 @@ pub fn run_tracker_with(
     let mut held = 0u64;
     let mut events = 0u64;
     let mut position_timeouts = 0u32;
-    // On macOS the gun's absolute HID pointer does not move the system cursor, so the driver
-    // moves it here from the same aim; positions (command 40) are still streamed to the gun,
-    // since its firmware only emits button reports while position traffic flows. On Linux and
-    // Windows the gun's HID pointer is the cursor and this stays `None`.
+    // With `cursor = "driver"` on macOS the driver moves the system cursor itself from the same
+    // aim; positions (command 40) are still streamed to the gun, since its firmware only emits
+    // button reports while position traffic flows. With `cursor = "gun"`, and always on Linux
+    // and Windows, the gun's own HID pointer is the cursor and this stays `None`.
     #[cfg(target_os = "macos")]
-    let mut cursor = if gun.is_some() {
+    let mut cursor = if gun.is_some() && opts.cursor == CursorDriver::Driver {
         Some(crate::cursor::Cursor::new()?)
     } else {
         None
+    };
+    #[cfg(target_os = "macos")]
+    let synthesising = cursor.is_some();
+    #[cfg(not(target_os = "macos"))]
+    let synthesising = {
+        let _ = opts.cursor;
+        false
     };
     let mut window_start = Instant::now();
     let mut window_frames = 0u32;
@@ -463,23 +472,24 @@ pub fn run_tracker_with(
                 smoother.reset();
             }
             if let Some((g, _)) = gun.as_mut() {
-                // Linux holds the gun's own HID pointer at the best available aim every frame.
-                #[cfg(not(target_os = "macos"))]
-                if let Some(a) = aim.or(last_aim) {
+                if synthesising {
+                    // The synthesised cursor moves only on a fresh, confident (line-based)
+                    // aim. On a weak frame — a hull fallback or a jump the guard held — it
+                    // stays where it is instead of re-warping to the last point, so it never
+                    // fights the user's trackpad and never stutters between a strong and weak
+                    // solve. The aim is streamed to the gun as well — not for its HID pointer
+                    // (which would fight the warp) but because firmware 1.9's secondary serial
+                    // rides the position traffic: with no positions in, no button reports out.
+                    #[cfg(target_os = "macos")]
+                    if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
+                        let [x, y] = opts.aim_map.apply(a);
+                        c.move_to(x, y)?;
+                        send_position(g, x, y, &mut position_timeouts)?;
+                    }
+                } else if let Some(a) = aim.or(last_aim) {
+                    // The gun's own HID pointer is the cursor: hold it at the best available
+                    // aim every frame.
                     let [x, y] = opts.aim_map.apply(a);
-                    send_position(g, x, y, &mut position_timeouts)?;
-                }
-                // macOS warps the system cursor, but only on a fresh, confident (line-based)
-                // aim. On a weak frame — a hull fallback or a jump the guard held — it leaves
-                // the cursor where it is instead of re-warping to the last point, so it never
-                // fights the user's trackpad and never stutters between a strong and weak solve.
-                // The aim is streamed to the gun as well — not for its HID pointer (macOS
-                // ignores it) but because firmware 1.9's secondary serial rides the position
-                // traffic: with no positions coming in, it emits no button reports at all.
-                #[cfg(target_os = "macos")]
-                if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
-                    let [x, y] = opts.aim_map.apply(a);
-                    c.move_to(x, y)?;
                     send_position(g, x, y, &mut position_timeouts)?;
                 }
             }
@@ -487,30 +497,31 @@ pub fn run_tracker_with(
         } else {
             guard.lost();
             smoother.reset();
-            // The border is not in view: the gun is pointed away or set down. On macOS, stop
-            // driving the cursor entirely so the trackpad regains control — continuing to warp
-            // it to the last aim 60x/s would pin it against the user's own pointer, which reads
-            // as the cursor stuttering and the mouse being stuck. It stays put until the gun is
-            // aimed at the screen again. On Linux the gun's HID pointer holds the last position.
-            // The gun keeps receiving the last aim on both platforms: on macOS not for its HID
-            // pointer but because the firmware's button reports ride the position traffic, and
-            // the pedal is pressed exactly while the gun points away (ducking behind cover).
+            // The border is not in view: the gun is pointed away or set down. A synthesised
+            // cursor stops being driven entirely so the trackpad regains control — continuing
+            // to warp it to the last aim 60x/s would pin it against the user's own pointer,
+            // which reads as the cursor stuttering and the mouse being stuck. It stays put
+            // until the gun is aimed at the screen again. The gun's HID pointer holds the last
+            // position instead. Either way the gun keeps receiving the last aim: the
+            // firmware's button reports ride the position traffic, and the pedal is pressed
+            // exactly while the gun points away (ducking behind cover).
             #[cfg(target_os = "macos")]
             if let Some(c) = cursor.as_mut() {
                 c.release();
             }
-            // On macOS the heartbeat runs from the first frame (centre until an aim exists):
-            // firmware 1.9 needs position traffic before it reports buttons at all. On Linux
-            // positions start once there has been an aim, as before — the HID pointer is the
-            // cursor there, and parking it mid-screen unasked would be visible.
-            #[cfg(target_os = "macos")]
-            if let Some((g, _)) = gun.as_mut() {
-                let [x, y] = opts.aim_map.apply(last_aim.unwrap_or([50.0, 50.0]));
-                send_position(g, x, y, &mut position_timeouts)?;
-            }
-            #[cfg(not(target_os = "macos"))]
-            if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
-                let [x, y] = opts.aim_map.apply(prev);
+            // A synthesised cursor gets the heartbeat from the first frame (centre until an
+            // aim exists): firmware 1.9 needs position traffic before it reports buttons at
+            // all, and the synthesised clicks come from those reports. With the gun's HID
+            // pointer as the cursor, positions start once there has been an aim, as on Linux
+            // — parking the cursor mid-screen unasked would be visible, and the HID buttons
+            // click without the serial reports.
+            let heartbeat = if synthesising {
+                Some(last_aim.unwrap_or([50.0, 50.0]))
+            } else {
+                last_aim
+            };
+            if let (Some((g, _)), Some(p)) = (gun.as_mut(), heartbeat) {
+                let [x, y] = opts.aim_map.apply(p);
                 send_position(g, x, y, &mut position_timeouts)?;
             }
         }
@@ -527,10 +538,10 @@ pub fn run_tracker_with(
         if let Some((g, _)) = gun.as_mut() {
             frame_events = g.poll_events()?;
             events += frame_events.len() as u64;
-            // On macOS the gun's default mouse buttons have to become synthesised clicks (the
-            // gun's HID buttons would land wherever its ignored pointer sits). The trigger is a
-            // left click, front-left a right click and front-right a middle click; keys and the
-            // d-pad keep coming through the gun's own HID, which macOS honours.
+            // With a synthesised cursor the gun's default mouse buttons become synthesised
+            // clicks (its masked HID buttons would land wherever its stale pointer sits). The
+            // trigger is a left click, front-left a right click and front-right a middle click;
+            // keys and the d-pad keep coming through the gun's own HID, which macOS honours.
             #[cfg(target_os = "macos")]
             if let Some(c) = cursor.as_mut() {
                 use crate::cursor::SynthButton;
@@ -669,8 +680,8 @@ pub fn run_tracker_with(
 /// one is invisible, while failing the session costs a ten-second reconnect. A run of them
 /// means the firmware has stopped reading its port, which the reconnect (or a replug) is for.
 ///
-/// On macOS the cursor itself is moved by [`crate::cursor`], but positions are still streamed
-/// to the gun: firmware 1.9 emits button reports only while position traffic flows.
+/// With a synthesised macOS cursor ([`crate::cursor`]) positions are still streamed to the
+/// gun: firmware 1.9 emits button reports only while position traffic flows.
 fn send_position(gun: &mut Gun, x: f64, y: f64, timeouts: &mut u32) -> crate::gun::Result<()> {
     match gun.set_position(percent_to_axis(x), percent_to_axis(y)) {
         Ok(()) => {

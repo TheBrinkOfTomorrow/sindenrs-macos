@@ -109,6 +109,22 @@ pub struct Global {
     /// The default was fitted on one gun with `sindenrs replay --fit-lens <recorded frames>`;
     /// refit if the edges still bow in `replay --per-frame` output.
     pub lens_k1: f64,
+    /// What moves the system cursor on macOS (ignored elsewhere, where it is always the gun).
+    pub cursor: CursorDriver,
+}
+
+/// What moves the system cursor on macOS.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorDriver {
+    /// The driver posts Core Graphics mouse events from the aim and synthesises the mouse
+    /// buttons from the serial button stream (`src/cursor.rs`); the gun's own HID mouse buttons
+    /// are masked. Needs the Accessibility / PostEvent grants.
+    #[default]
+    Driver,
+    /// The gun's own absolute HID mouse, as on Linux and Windows: positions are streamed to the
+    /// gun and its HID pointer and buttons are the cursor. No permission beyond the camera.
+    Gun,
 }
 
 impl Default for Global {
@@ -119,6 +135,7 @@ impl Default for Global {
             auto_recover: true,
             recoil_gap_ms: 5,
             lens_k1: -0.178,
+            cursor: CursorDriver::Driver,
         }
     }
 }
@@ -761,7 +778,7 @@ pub fn example_header() -> &'static str {
     "# sindenrs configuration. Every key is optional; `sindenrs config show --defaults` lists\n\
      # them all with their defaults, and `sindenrs config show` prints what is in effect.\n\
      #\n\
-     # [global]    log, profile, auto_recover, recoil_gap_ms, lens_k1\n\
+     # [global]    log, profile, auto_recover, recoil_gap_ms, lens_k1, cursor (macOS: driver|gun)\n\
      # [display]   camera and tracking tuning for the screen in front of you: threshold,\n\
      #             exposure, contrast, border_thickness, aspect, overlay, offset/ratio trims\n\
      # [profiles.<name>]  any subset of [display]; pick one with --profile or global.profile\n\
