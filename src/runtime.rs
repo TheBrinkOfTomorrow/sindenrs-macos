@@ -711,6 +711,12 @@ pub fn prepare_gun(
     };
     gun.apply_config(cfg, recoil_gap)?;
     gun.start_streaming(Duration::from_millis(150))?;
+    // Firmware 1.9 only reports buttons when secondary serial is switched on after streaming
+    // has started: switched on before command 121 it stays silent (seen on a 2026 gun, where
+    // `debug monitor` — which enables it after — got reports while `run` — which enabled it
+    // only inside apply_config, before — never did). It is a write, so it is safe after 121,
+    // and older firmware accepts it in either position.
+    gun.set_secondary_serial(true)?;
     Ok(cal)
 }
 
