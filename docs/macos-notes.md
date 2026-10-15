@@ -458,3 +458,72 @@ solves with the border running off the camera frame at close range — stand bac
 the whole border fits. Capture gotcha: right after the app quits, the gun resets and its
 hub-powered camera drops off the bus for over a second, so auto-discovery finds no camera —
 pass `--device <uniqueID>` and/or wait longer.
+
+## 2026-10-15 — evening: permissions, the silent button stream, and a serial wedge cornered
+
+A long live session against the browser arcade (Time Crisis 1, the web calibration suite).
+Tracking ended the evening solid; the trigger click is still not landing, but every layer above
+the last one has been proven out, and the remaining fault is cornered to a binary question.
+
+**Permissions (solved).** The grants kept resetting because no code-signing identity existed on
+this machine — every build was ad hoc, and each reinstall produced a "new" app to TCC.
+`tools/macos/make-cert.sh` now creates the self-signed `sindenrs_macos_dev` identity from the
+command line (OpenSSL 3 needs `-legacy` for a PKCS#12 that `security import` accepts); the app's
+designated requirement is stable across rebuilds and the camera grant holds. macOS 27 folds the
+old Accessibility pane into **Privacy & Security → Device Control and Data Access**, and the
+app now prompts its way into that list (`AXIsProcessTrustedWithOptions` with the prompt option)
+and checks/requests the post-event grant separately (`CGPreflightPostEventAccess` /
+`CGRequestPostEventAccess`), logging both. Gotcha that cost an hour: TCC held **two records per
+service** (one from the ad-hoc era, one from the cert era) and the stale denied one shadowed the
+visible toggle — `tccutil reset Accessibility|PostEvent dev.sindenrs.sindenrs`, then a fresh
+grant, and the log finally read `event posting granted`. Synthesised events are now posted at
+the Session tap rather than the HID tap.
+
+**Cursor behaviour (solved).** The driver no longer warps the cursor when the border is not in
+view — warping the last aim at 60 Hz pinned the cursor against the trackpad and made the
+desktop unusable (it read as "stutter" and "the mouse is disabled"). It now drives only on a
+fresh line-based aim, releases the cursor otherwise, and hides the OS arrow while aiming
+(`CGDisplayHideCursor` after granting the connection `SetsCursorInBackground`, since the game,
+not the driver, is frontmost). Front-left and front-right are synthesised as right/middle
+clicks from their serial bits (state1 bits 1 and 3, slot order confirmed on hardware) and
+masked from the gun's HID; pump still rides the HID and snaps to the corner — its serial bit is
+still uncaptured.
+
+**For the browser games, the native overlay must be off.** The web pages draw their own 4:3
+border and `aim.js` maps the full-screen aim fraction onto the canvas box itself: the driver's
+letterboxed 16:9 overlay put a second border on screen *and* remapped aim into its own
+rectangle (`overlay = false` in the config now; identity aim map). No aspect switch belongs in
+the driver — the web layer owns the 4:3 geometry.
+
+**The silent button stream (root-caused, fix unverified).** `run` on macOS never received a
+single serial button report from this gun all day, with every grant open. The reason: firmware
+1.9's "secondary serial" rides the position traffic — no positions in, no button reports out —
+and the macOS driver had deliberately stopped streaming positions when the cursor synthesis
+went in. Positions are streamed again (the HID pointer they feed stays ignored), from the first
+frame (centre until an aim exists, then the last aim while the border is away, since the pedal
+is pressed exactly while ducking). `debug monitor` only ever saw reports because it streams a
+held position; it also needs its own `set_secondary_serial(true)` after streaming starts (added,
+with a prepare_gun re-send after 121 for good measure).
+
+**The remaining fault: serial writes wedge when the camera runs in-process.** With positions
+restored, `run`'s writes time out (~1 s in, even at a 150 ms budget, raised from 20 ms) and the
+heartbeat dies — so the button theory is still untested in `run`. Hands-free bisects:
+`debug monitor` + `debug camera capture` in a *separate process* (with the UVC exposure write):
+2700/2700 writes clean. `debug track --send` (camera *in-process*): writes wedge in 0.8 s.
+Next session's question, one replug and 40 s: full config then `monitor` (no camera) — if
+writes die it is something in `apply_config`; if clean it is in-process AVFoundation vs the
+serial stack, and the camera moves to its own process or the writes to a retry queue.
+
+**Teardown and the run lock.** A wedged gun blocks the serial `close()` in the kernel; the
+process hangs mid-exit (kill leaves a `?E` husk) still holding the run-lock flock, so
+relaunching said "already running" until a replug. The lock file now carries the holder's pid,
+and a holder whose executable no longer resolves (`proc_pidpath`) is retired by unlinking the
+file — flock is per-inode, so a fresh file locks cleanly and relaunch works. The close itself
+still needs bounding: it hung even after a session with zero position writes, so it is not
+(only) the write backlog.
+
+**To-do, in order:** finish the wedge bisect (config burst vs in-process camera); verify the
+trigger click end to end; capture pump's serial bit and synthesise it; bound the serial close;
+background-at-login (`login-item.sh install`) once a session survives; the Calibrate-menu hang;
+a native calibration/config GUI (user request — today everything above the gun lives in
+`config.toml`; the web suite covers the browser side).
