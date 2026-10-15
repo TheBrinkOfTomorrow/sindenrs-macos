@@ -5,12 +5,14 @@
 //! driver that turns an absolute-coordinate HID pointer into cursor movement — it ignores the
 //! coordinates (or treats them as relative deltas), and the cursor pegs in a corner. So on
 //! macOS the driver must move the cursor itself, which is what this module does: it posts Core
-//! Graphics mouse events at the point the tracker already computed, plus a left button driven
-//! by the gun's trigger.
+//! Graphics mouse events at the point the tracker already computed, plus the mouse buttons the
+//! gun maps by default — the trigger as a left click, front-left as a right click, front-right
+//! as a middle click — each driven by its bit in the serial button stream.
 //!
 //! Because the gun's own HID pointer would fight this, the tracker stops streaming position
-//! (command 40) to the gun on macOS; everything else (recoil, the serial button stream, keys
-//! mapped through the gun's HID keyboard) is unchanged.
+//! (command 40) to the gun on macOS, and the HID mouse buttons are masked
+//! ([`crate::config::Buttons::mask_synthesised`]) so they do not fire a second, mispositioned
+//! click. Everything else (recoil, keys mapped through the gun's HID keyboard) is unchanged.
 //!
 //! Posting events that reach another app (the browser running the game) needs the app to be
 //! granted Accessibility in System Settings > Privacy & Security. Without it the cursor still
@@ -45,9 +47,19 @@ pub struct Cursor {
     height: f64,
     /// The last point the cursor was moved to, so a click lands where the gun points.
     last: CGPoint,
-    /// Whether the synthesised left button is currently held (a held trigger turns moves into
-    /// drags, which is what a game expects while firing).
+    /// Whether each synthesised button is currently held. A held button turns moves into drags,
+    /// which is what a game expects while firing; Drop releases any still down at session end.
     left_down: bool,
+    right_down: bool,
+    middle_down: bool,
+}
+
+/// A mouse button the macOS driver synthesises from a serial button bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynthButton {
+    Left,
+    Right,
+    Middle,
 }
 
 impl Cursor {
@@ -73,6 +85,8 @@ impl Cursor {
             height: bounds.size.height,
             last: CGPoint::new(bounds.size.width / 2.0, bounds.size.height / 2.0),
             left_down: false,
+            right_down: false,
+            middle_down: false,
         })
     }
 
@@ -87,30 +101,44 @@ impl Cursor {
         // Warp first so the visible cursor tracks even without the Accessibility grant, then
         // post the move so a trusted app receives it as a real event.
         let _ = CGDisplay::warp_mouse_cursor_position(point);
-        let kind = if self.left_down {
-            CGEventType::LeftMouseDragged
+        // A move while a button is held must be posted as that button's drag, or the game sees
+        // the cursor jump without the button coming along.
+        let (kind, button) = if self.left_down {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if self.right_down {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else if self.middle_down {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
         } else {
-            CGEventType::MouseMoved
+            (CGEventType::MouseMoved, CGMouseButton::Left)
         };
-        self.post(kind, point)
+        self.post(kind, point, button)
     }
 
-    /// Press or release the synthesised left mouse button at the current point.
-    pub fn set_trigger(&mut self, down: bool) -> Result<()> {
-        if down == self.left_down {
-            return Ok(());
+    /// Press or release one synthesised mouse button at the current point. A no-op if the button
+    /// is already in that state, so repeated button reports are cheap.
+    pub fn set_button(&mut self, button: SynthButton, down: bool) -> Result<()> {
+        match button {
+            SynthButton::Left if self.left_down == down => return Ok(()),
+            SynthButton::Right if self.right_down == down => return Ok(()),
+            SynthButton::Middle if self.middle_down == down => return Ok(()),
+            SynthButton::Left => self.left_down = down,
+            SynthButton::Right => self.right_down = down,
+            SynthButton::Middle => self.middle_down = down,
         }
-        self.left_down = down;
-        let kind = if down {
-            CGEventType::LeftMouseDown
-        } else {
-            CGEventType::LeftMouseUp
+        let (kind, cg) = match (button, down) {
+            (SynthButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+            (SynthButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+            (SynthButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+            (SynthButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+            (SynthButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+            (SynthButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
         };
-        self.post(kind, self.last)
+        self.post(kind, self.last, cg)
     }
 
-    fn post(&self, kind: CGEventType, point: CGPoint) -> Result<()> {
-        let event = CGEvent::new_mouse_event(self.source.clone(), kind, point, CGMouseButton::Left)
+    fn post(&self, kind: CGEventType, point: CGPoint, button: CGMouseButton) -> Result<()> {
+        let event = CGEvent::new_mouse_event(self.source.clone(), kind, point, button)
             .map_err(|()| anyhow!("could not build a Core Graphics mouse event"))?;
         event.post(CGEventTapLocation::HID);
         Ok(())
@@ -119,9 +147,15 @@ impl Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
-        // Never leave the game thinking the trigger is held because the session ended mid-shot.
+        // Never leave the game thinking a button is held because the session ended mid-shot.
         if self.left_down {
-            let _ = self.post(CGEventType::LeftMouseUp, self.last);
+            let _ = self.post(CGEventType::LeftMouseUp, self.last, CGMouseButton::Left);
+        }
+        if self.right_down {
+            let _ = self.post(CGEventType::RightMouseUp, self.last, CGMouseButton::Right);
+        }
+        if self.middle_down {
+            let _ = self.post(CGEventType::OtherMouseUp, self.last, CGMouseButton::Center);
         }
     }
 }

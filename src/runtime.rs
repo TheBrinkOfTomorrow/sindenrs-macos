@@ -508,14 +508,22 @@ pub fn run_tracker_with(
         if let Some((g, _)) = gun.as_mut() {
             frame_events = g.poll_events()?;
             events += frame_events.len() as u64;
-            // On macOS the trigger has to become a synthesised click too (the gun's HID button
-            // would land wherever its ignored pointer sits). Bit 0 of button state 1 is the
-            // trigger; other buttons keep coming through the gun's own HID.
+            // On macOS the gun's default mouse buttons have to become synthesised clicks (the
+            // gun's HID buttons would land wherever its ignored pointer sits). The trigger is a
+            // left click, front-left a right click and front-right a middle click; keys and the
+            // d-pad keep coming through the gun's own HID, which macOS honours.
             #[cfg(target_os = "macos")]
             if let Some(c) = cursor.as_mut() {
+                use crate::cursor::SynthButton;
                 for ev in &frame_events {
                     if let Some(held) = ev.trigger_held() {
-                        c.set_trigger(held)?;
+                        c.set_button(SynthButton::Left, held)?;
+                    }
+                    if let Some(held) = ev.front_left_held() {
+                        c.set_button(SynthButton::Right, held)?;
+                    }
+                    if let Some(held) = ev.front_right_held() {
+                        c.set_button(SynthButton::Middle, held)?;
                     }
                 }
             }

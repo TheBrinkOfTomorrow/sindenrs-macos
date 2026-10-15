@@ -13,8 +13,10 @@ pub enum Event {
     /// stock driver discards (kept here as `extra`; observed to be a constant 0x96).
     ///
     /// Only sent when the gun has been asked to report buttons (command 50). Each bit is one
-    /// physical input: state1 carries at least bits 0-5 and state2 at least bits 0-3, ten in
-    /// total, matching the gun's ten controls. Bit 0 of state1 is the trigger.
+    /// physical input, in the gun's slot order. Confirmed on hardware (fw 1.9): state1 holds the
+    /// first controls — bit 0 trigger, bit 1 front-left, bit 2 rear-left, bit 3 front-right,
+    /// bit 4 rear-right, bit 5 up — and the remaining d-pad directions and pump spill into
+    /// state2. Ten controls in total.
     Buttons { state1: u8, state2: u8, extra: u8 },
     /// Byte 120: the stock driver treats this as "trigger enabled" in low-resource mode.
     TriggerEnabled,
@@ -27,6 +29,26 @@ impl Event {
     pub fn trigger_held(self) -> Option<bool> {
         match self {
             Self::Buttons { state1, .. } => Some(state1 & 1 != 0),
+            _ => None,
+        }
+    }
+
+    /// Front-left button: bit 1 of state 1. Its default action is a right click, which the macOS
+    /// driver synthesises (see [`crate::cursor`]).
+    #[cfg(target_os = "macos")]
+    pub fn front_left_held(self) -> Option<bool> {
+        match self {
+            Self::Buttons { state1, .. } => Some(state1 & 0b10 != 0),
+            _ => None,
+        }
+    }
+
+    /// Front-right button: bit 3 of state 1. Its default action is a middle click, which the
+    /// macOS driver synthesises (see [`crate::cursor`]).
+    #[cfg(target_os = "macos")]
+    pub fn front_right_held(self) -> Option<bool> {
+        match self {
+            Self::Buttons { state1, .. } => Some(state1 & 0b1000 != 0),
             _ => None,
         }
     }

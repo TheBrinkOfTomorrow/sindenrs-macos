@@ -522,12 +522,16 @@ impl Buttons {
     /// gun's own HID mouse does not fire them too. The gun's mouse reports carry a stale
     /// position (the driver stops streaming it one), so on macOS every HID mouse press snaps
     /// the cursor to a corner; the physical button still arrives over the serial event stream,
-    /// which is what the driver synthesises from. Only the trigger is synthesised so far; the
-    /// pedal and the rest keep going through the gun's HID until they are too.
+    /// which is what the driver synthesises from. This covers the default mouse buttons —
+    /// trigger (left), front-left (right) and front-right (middle); keys and the d-pad still go
+    /// through the gun's HID, which macOS honours. A gun that remaps one of these three to a key
+    /// would want this to follow the config rather than the default map, which it does not yet.
     #[cfg(target_os = "macos")]
     pub fn mask_synthesised(&mut self) {
-        self.trigger.onscreen = Action::new("none");
-        self.trigger.offscreen = Action::new("none");
+        for slot in [&mut self.trigger, &mut self.front_left, &mut self.front_right] {
+            slot.onscreen = Action::new("none");
+            slot.offscreen = Action::new("none");
+        }
     }
 }
 
