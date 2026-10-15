@@ -34,7 +34,7 @@ use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // AX trust lives in the ApplicationServices umbrella framework. The *WithOptions form, given
 // { kAXTrustedCheckOptionPrompt: true }, reports whether this process may post events into other
@@ -233,13 +233,16 @@ impl Cursor {
             (SynthButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
             (SynthButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
         };
+        debug!(?button, down, x = self.last.x, y = self.last.y, "synthesised button");
         self.post(kind, self.last, cg)
     }
 
     fn post(&self, kind: CGEventType, point: CGPoint, button: CGMouseButton) -> Result<()> {
         let event = CGEvent::new_mouse_event(self.source.clone(), kind, point, button)
             .map_err(|()| anyhow!("could not build a Core Graphics mouse event"))?;
-        event.post(CGEventTapLocation::HID);
+        // Session tap, not HID: the session level is where synthetic input is sanctioned to
+        // enter, and newer macOS has been seen to drop granted events posted at the HID tap.
+        event.post(CGEventTapLocation::Session);
         Ok(())
     }
 }

@@ -2189,6 +2189,21 @@ fn track_with_preview(
     bail!("--preview is only available on macOS so far")
 }
 
+/// Whether `pid` is a live process with a resolvable executable. A process that is gone, or a
+/// husk stuck mid-exit on a kernel call (a wedged serial close), has no path any more — and a
+/// husk can never release the locks it holds.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn process_alive(pid: i32) -> bool {
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let mut buf = [0u8; 4096];
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: a libproc call with a buffer we own; it returns the path length, <= 0 on failure.
+    unsafe { proc_pidpath(pid, buf.as_mut_ptr(), len) > 0 }
+}
+
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_all(
@@ -2200,17 +2215,54 @@ fn run_all(
     use std::sync::{Arc, Mutex};
 
     // One `run` per user on macOS: opening Sindenrs.app again (or a second `run`) would fight
-    // the first for the cameras and draw a second border. The lock goes with the process.
+    // the first for the cameras and draw a second border. The lock goes with the process —
+    // except when a wedged gun blocks the holder's serial close in the kernel: the process
+    // hangs mid-exit holding the flock, and every relaunch would fail until a replug. So the
+    // holder's pid is written into the file, and a holder that no longer resolves to a live
+    // executable (gone, or a husk stuck exiting) is retired by unlinking the file — flock is
+    // per inode, so a fresh file locks cleanly while the husk keeps its orphaned inode.
     #[cfg(target_os = "macos")]
     let _single = {
+        use std::io::Write as _;
         let path = std::env::temp_dir().join("sindenrs-run.lock");
-        let f =
-            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        if f.try_lock().is_err() {
-            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
-            return Ok(());
-        }
-        f
+        let lock = |path: &std::path::Path| -> Result<Option<std::fs::File>> {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            if f.try_lock().is_err() {
+                return Ok(None);
+            }
+            f.set_len(0)?;
+            write!(f, "{}", std::process::id())?;
+            Ok(Some(f))
+        };
+        let held = match lock(&path)? {
+            Some(f) => f,
+            None => {
+                let holder = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                if holder.is_none_or(|pid| !process_alive(pid)) {
+                    warn!("a previous sindenrs is gone or stuck exiting; retiring its run lock");
+                    let _ = std::fs::remove_file(&path);
+                    match lock(&path)? {
+                        Some(f) => f,
+                        None => {
+                            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+                    return Ok(());
+                }
+            }
+        };
+        held
     };
     // Keep the trackers responsive while a game loads the machine (no App Nap, no timer
     // coalescing): see `activity`.
