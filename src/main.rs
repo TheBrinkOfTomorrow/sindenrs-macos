@@ -2374,6 +2374,11 @@ fn run_all(
             }
             drop(hud);
             drop(menu);
+            // Turn the event loop while the guns wind down, so the windows just dropped
+            // actually leave the screen instead of freezing there behind the join.
+            if let Err(e) = sindenrs::menubar::pump_while(|| !guns.is_finished()) {
+                warn!("event loop: {e:#}");
+            }
             guns.join()
                 .map_err(|_| anyhow!("the gun supervisor panicked"))?
         });

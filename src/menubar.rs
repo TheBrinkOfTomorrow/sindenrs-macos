@@ -643,3 +643,30 @@ pub fn pump_until(stop: &AtomicBool) -> Result<()> {
     }
     Ok(())
 }
+
+/// Keep AppKit's events flowing on the main thread while `busy` holds, for `run`'s teardown:
+/// the border, heads-up and menu windows it has just ordered out only leave the screen once
+/// the event loop turns again, so waiting for the guns with a cold join froze them in place
+/// (the "hung" border after Calibrate) for as long as a gun took to let go.
+pub fn pump_while(busy: impl Fn() -> bool) -> Result<()> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| anyhow!("must run on the main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: a framework constant.
+    let mode = unsafe { NSDefaultRunLoopMode };
+    while busy() {
+        let until = NSDate::dateWithTimeIntervalSinceNow(Duration::from_millis(50).as_secs_f64());
+        while let Some(ev) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+            NSEventMask::Any,
+            Some(&until),
+            mode,
+            true,
+        ) {
+            app.sendEvent(&ev);
+            if !busy() {
+                break;
+            }
+        }
+        app.updateWindows();
+    }
+    Ok(())
+}
