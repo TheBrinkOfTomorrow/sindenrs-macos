@@ -493,6 +493,10 @@ pub fn run_tracker_with(
             // it to the last aim 60x/s would pin it against the user's own pointer, which reads
             // as the cursor stuttering and the mouse being stuck. It stays put until the gun is
             // aimed at the screen again. On Linux the gun's HID pointer holds the last position.
+            #[cfg(target_os = "macos")]
+            if let Some(c) = cursor.as_mut() {
+                c.release();
+            }
             #[cfg(not(target_os = "macos"))]
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 let [x, y] = opts.aim_map.apply(prev);

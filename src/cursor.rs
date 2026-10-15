@@ -27,6 +27,7 @@ use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
+use core_foundation_sys::base::CFTypeRef;
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 use core_graphics::display::CGDisplay;
@@ -43,6 +44,36 @@ use tracing::{info, warn};
 extern "C" {
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+}
+
+// Cursor hiding. CGDisplayHideCursor only takes effect while the calling app is frontmost, but
+// this is a background (LSUIElement) agent and the game is frontmost — so we first ask the window
+// server to let this connection control the cursor in the background (a long-stable private
+// CoreGraphics property), then hide the cursor while actively aiming so the OS arrow does not sit
+// over the game.
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(cid: i32, target: i32, key: CFStringRef, value: CFTypeRef) -> i32;
+}
+
+/// Ask the window server to let this background process control the cursor, so hiding it works
+/// while the game (not us) is the active app. Best-effort: on failure the cursor just stays shown.
+fn enable_background_cursor_control() {
+    let key = CFString::new("SetsCursorInBackground");
+    // SAFETY: private but long-stable CoreGraphics calls; the result is advisory and ignored.
+    unsafe {
+        let cid = _CGSDefaultConnection();
+        CGSSetConnectionProperty(
+            cid,
+            cid,
+            key.as_concrete_TypeRef(),
+            CFBoolean::true_value().as_CFTypeRef(),
+        );
+    }
 }
 
 /// Whether this process may post events into other apps. When it may not, this also shows the
@@ -72,6 +103,9 @@ pub struct Cursor {
     left_down: bool,
     right_down: bool,
     middle_down: bool,
+    /// Whether the system cursor is currently hidden (while actively aiming), so hide/show stay
+    /// balanced — CGDisplayHideCursor/ShowCursor are reference counted.
+    hidden: bool,
 }
 
 /// A mouse button the macOS driver synthesises from a serial button bit.
@@ -89,6 +123,7 @@ impl Cursor {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|()| anyhow!("could not create a Core Graphics event source"))?;
         let bounds = CGDisplay::main().bounds();
+        enable_background_cursor_control();
         if accessibility_trusted() {
             info!("Accessibility granted; driving the macOS cursor from the gun");
         } else {
@@ -106,6 +141,7 @@ impl Cursor {
             left_down: false,
             right_down: false,
             middle_down: false,
+            hidden: false,
         })
     }
 
@@ -131,7 +167,38 @@ impl Cursor {
         } else {
             (CGEventType::MouseMoved, CGMouseButton::Left)
         };
-        self.post(kind, point, button)
+        self.post(kind, point, button)?;
+        // Actively aiming now: hide the OS arrow so it does not sit over the game.
+        self.hide_cursor();
+        Ok(())
+    }
+
+    /// Stop driving the cursor and show it again, so the user's trackpad has a visible pointer
+    /// when the gun is not aimed at the screen. Called when the border leaves view.
+    pub fn release(&mut self) {
+        self.show_cursor();
+    }
+
+    fn hide_cursor(&mut self) {
+        if self.hidden {
+            return;
+        }
+        self.hidden = true;
+        // SAFETY: a system framework call for the main display.
+        unsafe {
+            CGDisplayHideCursor(CGMainDisplayID());
+        }
+    }
+
+    fn show_cursor(&mut self) {
+        if !self.hidden {
+            return;
+        }
+        self.hidden = false;
+        // SAFETY: a system framework call for the main display.
+        unsafe {
+            CGDisplayShowCursor(CGMainDisplayID());
+        }
     }
 
     /// Press or release one synthesised mouse button at the current point. A no-op if the button
@@ -166,6 +233,8 @@ impl Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
+        // Never leave the cursor invisible after the session ends.
+        self.show_cursor();
         // Never leave the game thinking a button is held because the session ended mid-shot.
         if self.left_down {
             let _ = self.post(CGEventType::LeftMouseUp, self.last, CGMouseButton::Left);
