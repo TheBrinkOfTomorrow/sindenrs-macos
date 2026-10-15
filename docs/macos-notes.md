@@ -527,3 +527,36 @@ trigger click end to end; capture pump's serial bit and synthesise it; bound the
 background-at-login (`login-item.sh install`) once a session survives; the Calibrate-menu hang;
 a native calibration/config GUI (user request — today everything above the gun lives in
 `config.toml`; the web suite covers the browser side).
+
+## 2026-10-16 (00:10) — the gun's HID pointer works on macOS after all
+
+The decisive experiment, right at the end of the night: `debug monitor` now applies the gun's
+real configuration first (17103f8), and with the full config + streamed positions and **no
+camera, no synthesised events, no Core Graphics at all**, the system cursor locked to the held
+(50%, 50%) — the gun's own absolute HID pointer moved the macOS cursor — and the trigger
+clicked, as plain hardware input needing no permission.
+
+So the founding 2026-10-15 diagnosis ("macOS ignores an absolute-coordinate HID pointer") was
+at least partly wrong: the pointer works once the configuration burst has been applied and the
+positions actually reach the gun. The original pegged-at-0,0 cursor is now best explained by
+the old 20 ms port timeout silently dropping nearly every position write on macOS (the budget
+is 150 ms since ebec748), possibly together with a missing/incomplete configuration. The whole
+Core Graphics cursor-synthesis layer, the Accessibility/PostEvent hunt and the click
+synthesis may therefore be unnecessary — the Linux model (stream positions, let the gun's HID
+do pointer and buttons) may simply work. Plan for next session:
+
+1. Reproduce HID tracking in `run`: disable the cursor machinery (a `--no-cursor`/config
+   switch) so the warp and posted events cannot fight the now-live HID pointer — quite
+   possibly the remaining "writes wedge ~1 s into tracking" is exactly that fight, since
+   monitor (no cursor machinery) streams clean for minutes and `track --send` (with it)
+   wedges in under a second. Unmask the HID buttons (drop mask_synthesised) for the test.
+2. If HID tracking holds: retire the synthesis path to a fallback, keep the hover smoothing
+   on the driver side (positions sent to the gun are already smoothed), and the permission
+   story collapses to Camera only.
+3. The post-configuration close hang is real and separate: `debug setup` (config, no
+   streaming, no camera) completes its work in 57 ms and then hangs closing the port, and the
+   configured `monitor` hung the same way after its loop — reproduced twice on a fresh gun.
+   Bound the close (or find which configuration command leaves the CDC device undrainable).
+4. Beware stdout block-buffering in captured debug sessions: a killed process loses its
+   buffered `println!` lines (the monitor's button-report evidence died that way — tracing's
+   stderr survives). Flush or log through tracing for bench tools.
