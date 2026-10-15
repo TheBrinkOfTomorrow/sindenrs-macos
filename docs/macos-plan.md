@@ -34,9 +34,15 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 
 Update 2026-10-15: on a 2026 gun the HID pointer does not move the macOS cursor; the driver now
 synthesises the cursor with Core Graphics (`src/cursor.rs`). Cursor tracking confirmed live on
-the browser arcade. Open: synthesise the pedal/middle-click too (needs their serial button
-bits), the Accessibility grant for synthesised clicks, and the Calibrate-from-menu hang. See
-`docs/macos-notes.md`, 2026-10-15.
+the browser arcade; the cursor releases to the trackpad when the border leaves view and the OS
+arrow hides while aiming. Permissions are permanent (`tools/macos/make-cert.sh`; macOS 27 lists
+the grant under Device Control and Data Access) and `event posting granted` confirmed. Still
+open before the trigger click lands: firmware 1.9 only reports buttons while position traffic
+flows, and in-process camera + serial writes wedge within a second (bisect cornered to the
+apply_config burst vs in-process AVFoundation — one experiment left); then pump's serial bit,
+a bounded serial close (a wedged gun hangs exit; the run lock now survives that),
+background-at-login, the Calibrate-from-menu hang, and a native config/calibration GUI. See
+`docs/macos-notes.md`, 2026-10-15 (evening).
 
 Measurements and decisions are in `docs/macos-notes.md`.
 
