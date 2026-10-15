@@ -8,8 +8,12 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 - The gun is two USB devices behind its own hub: the camera, and an ATmega32U4 (Arduino
   Leonardo bootloader) with a CDC serial port and its own HID mouse, keyboard and joystick.
 - Host software's job: read camera frames -> detect the white coded border -> compute aim ->
-  write the position to the gun over serial. The gun then reports the aim through its own
-  absolute USB mouse. **No kernel driver / DriverKit extension should be needed.**
+  drive the pointer. On Windows/Linux the gun reports the aim through its own absolute USB
+  mouse, so the driver just writes the position to the gun over serial. **On macOS that does
+  NOT work** (2026-10-15): macOS ignores an absolute-coordinate HID pointer, so the gun's mouse
+  cannot move the system cursor — it pegs in a corner. The macOS driver instead moves the
+  cursor itself by posting Core Graphics mouse events (`src/cursor.rs`); see `macos-notes.md`,
+  2026-10-15. **No kernel driver / DriverKit extension is needed either way.**
 - Base to build on: https://github.com/schlarpc/sindenrs (MIT, Rust, clean-room).
   - Done: protocol (handshake, auth hashes, events), tracking at 60 fps, coded border,
     calibration, recoil/button TOML config, firmware backup/flash, hotplug, two guns.
@@ -27,6 +31,12 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 | 2 — Border overlay | **done** (per-emulator full-screen checks continue in Phase 3) |
 | 3 — Emulator setup | in progress: ARMSX2 and Flycast done; Mednafen, RPCS3 next |
 | 4 — Two players | optional, not started |
+
+Update 2026-10-15: on a 2026 gun the HID pointer does not move the macOS cursor; the driver now
+synthesises the cursor with Core Graphics (`src/cursor.rs`). Cursor tracking confirmed live on
+the browser arcade. Open: synthesise the pedal/middle-click too (needs their serial button
+bits), the Accessibility grant for synthesised clicks, and the Calibrate-from-menu hang. See
+`docs/macos-notes.md`, 2026-10-15.
 
 Measurements and decisions are in `docs/macos-notes.md`.
 

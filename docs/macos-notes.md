@@ -416,3 +416,45 @@ Dreamcast only detects peripherals at boot), aiming, shooting and pump reload wo
 mapping file reads `1:reload`, `2:btn_a`, `3:btn_b`, which looked swapped by SDL's numbering but
 is right: Flycast numbers mouse buttons 2 = left, 1 = right, 3 = middle. Setup in
 `docs/macos-emulators.md`.
+
+## 2026-10-15 — macOS does not honour the gun's absolute HID pointer; the driver moves the cursor itself
+
+The port's founding assumption (see `macos-plan.md`, "host software's job") was that once the
+driver writes a position to the gun over serial, the gun's own absolute HID mouse moves the
+system cursor, exactly as on Windows and Linux. On a new 2026 gun (firmware 1.9, SindenCamC
+camera board) that is false: the cursor sat pinned in the top-left corner while the camera
+tracked perfectly. macOS has no path that turns an absolute-coordinate HID pointer into cursor
+movement — it ignores the coordinates (or reads them as relative deltas), so the pointer pegs
+in a corner. The emulator work earlier in this log worked because those games read the gun's
+HID *mouse* device directly; the browser arcade pages (github.com/TheTomBritton/arcade-webport) read the OS cursor,
+which never moved. The driver's own HUD reticle moves from the same aim, so it is easy to
+mistake a working reticle for a working cursor.
+
+Fix (`src/cursor.rs`, macOS only, `core-graphics` dependency): the driver moves the system
+cursor itself from the aim it already computes, posting Core Graphics mouse events —
+`CGWarpMouseCursorPosition` for the visible move (works without any grant) plus a posted
+`MouseMoved`/`LeftMouseDragged` so a trusted app receives it. The trigger becomes a posted
+`LeftMouseDown`/`Up`, driven by the gun's trigger bit over the serial event stream. On macOS
+the tracker no longer streams position (command 40) to the gun, so its HID pointer cannot fight
+the synthesised cursor (`runtime::run_tracker_with`, cfg-gated). Confirmed live: the cursor
+tracks the gun. Posting clicks into another app needs the Accessibility grant; the cursor still
+*moves* without it (the warp does not need it).
+
+Trigger pulled the cursor to the top-left even after that: the gun still fired its *own* HID
+left-click on each trigger pull, and since the driver stopped streaming it a position, that HID
+report carried a stale corner position — so macOS snapped the cursor to 0,0 while the
+synthesised click still registered (proof that macOS does read the gun's HID mouse on button
+events). `Buttons::mask_synthesised()` (macOS) now blanks the trigger's HID action so only the
+synthesised click drives it; the physical trigger still arrives over serial (raw bits,
+independent of the action map) and recoil is unaffected (gated by `recoil.on_trigger`). The
+pedal and middle-click still ride the gun's HID and will need the same treatment once their
+serial bits are mapped (only the trigger, state1 bit 0, is known for certain).
+
+Jitter tuning: with a new camera board, `lens_k1` was refit from a 5632-frame recording
+(`debug track --preview --record <dir>`, then `debug replay --fit-lens`): best **-0.1489**
+(rms 1.18 px) versus the old module's -0.178, which over-corrected and warped aim with distance.
+`display.hover_smoothing` lowered 0.5 → 0.3. The fit also showed ~8% hull-only (unreliable)
+solves with the border running off the camera frame at close range — stand back far enough that
+the whole border fits. Capture gotcha: right after the app quits, the gun resets and its
+hub-powered camera drops off the bus for over a second, so auto-discovery finds no camera —
+pass `--device <uniqueID>` and/or wait longer.
