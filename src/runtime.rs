@@ -499,6 +499,16 @@ pub fn run_tracker_with(
             if let Some(c) = cursor.as_mut() {
                 c.release();
             }
+            // On macOS the heartbeat runs from the first frame (centre until an aim exists):
+            // firmware 1.9 needs position traffic before it reports buttons at all. On Linux
+            // positions start once there has been an aim, as before — the HID pointer is the
+            // cursor there, and parking it mid-screen unasked would be visible.
+            #[cfg(target_os = "macos")]
+            if let Some((g, _)) = gun.as_mut() {
+                let [x, y] = opts.aim_map.apply(last_aim.unwrap_or([50.0, 50.0]));
+                send_position(g, x, y, &mut position_timeouts)?;
+            }
+            #[cfg(not(target_os = "macos"))]
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 let [x, y] = opts.aim_map.apply(prev);
                 send_position(g, x, y, &mut position_timeouts)?;
