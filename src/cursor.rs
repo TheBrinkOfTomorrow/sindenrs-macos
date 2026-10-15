@@ -44,6 +44,11 @@ use tracing::{info, warn};
 extern "C" {
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+    // The permission actually consulted when a process posts events (TCC "PostEvent"). It is
+    // granted together with Accessibility on older macOS, but newer releases surface it
+    // separately, so check and request it in its own right.
+    fn CGPreflightPostEventAccess() -> u8;
+    fn CGRequestPostEventAccess() -> u8;
 }
 
 // Cursor hiding. CGDisplayHideCursor only takes effect while the calling app is frontmost, but
@@ -124,13 +129,21 @@ impl Cursor {
             .map_err(|()| anyhow!("could not create a Core Graphics event source"))?;
         let bounds = CGDisplay::main().bounds();
         enable_background_cursor_control();
-        if accessibility_trusted() {
-            info!("Accessibility granted; driving the macOS cursor from the gun");
+        let ax = accessibility_trusted();
+        // SAFETY: parameterless framework calls. Preflight reports the post-event permission;
+        // when missing, the request shows the system prompt for it (and registers the app in
+        // the right Settings pane), which on recent macOS is distinct from the AX check above.
+        let post = unsafe { CGPreflightPostEventAccess() != 0 }
+            || unsafe { CGRequestPostEventAccess() != 0 };
+        if ax && post {
+            info!("event posting granted (accessibility + post-event); driving the macOS cursor from the gun");
         } else {
             warn!(
-                "not trusted for Accessibility yet — a system prompt has been shown and Sindenrs \
-                 added to System Settings > Privacy & Security > Accessibility; switch it on so \
-                 synthesised clicks reach the game (the cursor itself already moves without it)"
+                accessibility = ax,
+                post_event = post,
+                "synthesised clicks may not reach the game until both grants are on — enable \
+                 Sindenrs under System Settings > Privacy & Security (macOS 27 lists it under \
+                 'Device Control and Data Access'); the cursor itself moves without them"
             );
         }
         Ok(Self {
