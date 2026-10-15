@@ -1919,8 +1919,12 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
             rate,
         } => {
             let mut gun = connect(&port, recover)?;
+            // Apply the real configuration first, as `run` does, so the firmware sits in the
+            // same state the driver uses — firmware 1.9's button reporting depends on it.
+            let id = gun.unique_id().ok();
+            let gc = gun_config_for(&ctx.cfg, id.as_deref());
+            gun.apply_config(&gc, ctx.cfg.recoil_gap())?;
             gun.start_streaming(Duration::from_millis(150))?;
-            gun.set_offscreen_reload(false)?;
             gun.set_calibration_mode_enabled(false)?;
             gun.set_recoil_enabled(false)?;
             // Button reports (`FE s1 s2 96`) are gated by the gun's secondary serial output;
