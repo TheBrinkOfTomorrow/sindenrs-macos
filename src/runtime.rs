@@ -14,7 +14,10 @@ use tracing::{info, warn};
 
 use crate::camera::source::{Camera, Next};
 use crate::config::{Display, GunConfig};
-use crate::gun::{Gun, GunError};
+use crate::gun::Gun;
+#[cfg(not(target_os = "macos"))]
+use crate::gun::GunError;
+#[cfg(not(target_os = "macos"))]
 use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
     acquire, aim_pixel, flip_luma, flip_point, AcquireParams, Flip, Quad,
@@ -369,7 +372,17 @@ pub fn run_tracker_with(
     let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
+    #[cfg(not(target_os = "macos"))]
     let mut position_timeouts = 0u32;
+    // On macOS the gun's absolute HID pointer does not move the system cursor, so the driver
+    // moves it here from the same aim; the gun is not streamed positions (command 40). On
+    // Linux and Windows the gun's HID pointer is the cursor and this stays `None`.
+    #[cfg(target_os = "macos")]
+    let mut cursor = if gun.is_some() {
+        Some(crate::cursor::Cursor::new()?)
+    } else {
+        None
+    };
     let mut window_start = Instant::now();
     let mut window_frames = 0u32;
     let mut fps = 0.0;
@@ -454,6 +467,14 @@ pub fn run_tracker_with(
             if let Some((g, _)) = gun.as_mut() {
                 if let Some(a) = aim.or(last_aim) {
                     let [x, y] = opts.aim_map.apply(a);
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = &g;
+                        if let Some(c) = cursor.as_mut() {
+                            c.move_to(x, y)?;
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     send_position(g, x, y, &mut position_timeouts)?;
                 }
             }
@@ -463,6 +484,14 @@ pub fn run_tracker_with(
             smoother.reset();
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 let [x, y] = opts.aim_map.apply(prev);
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = &g;
+                    if let Some(c) = cursor.as_mut() {
+                        c.move_to(x, y)?;
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
                 send_position(g, x, y, &mut position_timeouts)?;
             }
         }
@@ -479,6 +508,17 @@ pub fn run_tracker_with(
         if let Some((g, _)) = gun.as_mut() {
             frame_events = g.poll_events()?;
             events += frame_events.len() as u64;
+            // On macOS the trigger has to become a synthesised click too (the gun's HID button
+            // would land wherever its ignored pointer sits). Bit 0 of button state 1 is the
+            // trigger; other buttons keep coming through the gun's own HID.
+            #[cfg(target_os = "macos")]
+            if let Some(c) = cursor.as_mut() {
+                for ev in &frame_events {
+                    if let Some(held) = ev.trigger_held() {
+                        c.set_trigger(held)?;
+                    }
+                }
+            }
         }
         if let Some(f) = csv.as_mut() {
             let (c, clipped, tabs) = quad.map_or(([[f64::NAN; 2]; 4], false, 0), |q| {
@@ -601,6 +641,10 @@ pub fn run_tracker_with(
 /// solenoid firing, a USB retry); the next frame replaces the position anyway, so dropping
 /// one is invisible, while failing the session costs a ten-second reconnect. A run of them
 /// means the firmware has stopped reading its port, which the reconnect (or a replug) is for.
+///
+/// macOS never streams positions (the cursor is moved by [`crate::cursor`] instead), so this
+/// is compiled only where the gun's HID pointer is the cursor.
+#[cfg(not(target_os = "macos"))]
 fn send_position(gun: &mut Gun, x: f64, y: f64, timeouts: &mut u32) -> crate::gun::Result<()> {
     match gun.set_position(percent_to_axis(x), percent_to_axis(y)) {
         Ok(()) => {
