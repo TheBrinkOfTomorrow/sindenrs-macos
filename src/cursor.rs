@@ -23,18 +23,38 @@
 #![allow(unsafe_code)]
 
 use anyhow::{anyhow, Result};
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
+use core_foundation_sys::dictionary::CFDictionaryRef;
+use core_foundation_sys::string::CFStringRef;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use tracing::{info, warn};
 
-// AXIsProcessTrusted lives in the ApplicationServices umbrella framework. It reports whether
-// this process may post events into other apps; it returns a Core Foundation `Boolean`
-// (an unsigned char), so we take it as a byte and test for non-zero.
+// AX trust lives in the ApplicationServices umbrella framework. The *WithOptions form, given
+// { kAXTrustedCheckOptionPrompt: true }, reports whether this process may post events into other
+// apps and, when it may not, shows the system prompt and adds the app to the Accessibility list
+// so the user can grant it. It returns a Core Foundation `Boolean` (an unsigned char).
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
+}
+
+/// Whether this process may post events into other apps. When it may not, this also shows the
+/// system Accessibility prompt and lists Sindenrs there, so one launch is enough to let the user
+/// grant it — the app otherwise never appears in that list and there is nothing to switch on.
+fn accessibility_trusted() -> bool {
+    // SAFETY: a static CFStringRef from the framework; we wrap it without taking ownership.
+    let key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
+    let options =
+        CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
+    // SAFETY: a framework call with a valid CF dictionary we own for the duration of the call.
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
 }
 
 /// Moves the macOS system cursor and drives its left button, in the screen's global
@@ -69,15 +89,14 @@ impl Cursor {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|()| anyhow!("could not create a Core Graphics event source"))?;
         let bounds = CGDisplay::main().bounds();
-        // SAFETY: a parameterless C call into a system framework.
-        if unsafe { AXIsProcessTrusted() } == 0 {
-            warn!(
-                "this app is not trusted for Accessibility, so synthesised clicks may not reach \
-                 the game — grant it under System Settings > Privacy & Security > Accessibility \
-                 (the cursor itself will still move)"
-            );
-        } else {
+        if accessibility_trusted() {
             info!("Accessibility granted; driving the macOS cursor from the gun");
+        } else {
+            warn!(
+                "not trusted for Accessibility yet — a system prompt has been shown and Sindenrs \
+                 added to System Settings > Privacy & Security > Accessibility; switch it on so \
+                 synthesised clicks reach the game (the cursor itself already moves without it)"
+            );
         }
         Ok(Self {
             source,
