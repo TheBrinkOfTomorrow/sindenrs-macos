@@ -15,9 +15,7 @@ use tracing::{info, warn};
 use crate::camera::source::{Camera, Next};
 use crate::config::{Display, GunConfig};
 use crate::gun::Gun;
-#[cfg(not(target_os = "macos"))]
 use crate::gun::GunError;
-#[cfg(not(target_os = "macos"))]
 use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
     acquire, aim_pixel, flip_luma, flip_point, AcquireParams, Flip, Quad,
@@ -372,11 +370,11 @@ pub fn run_tracker_with(
     let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
-    #[cfg(not(target_os = "macos"))]
     let mut position_timeouts = 0u32;
     // On macOS the gun's absolute HID pointer does not move the system cursor, so the driver
-    // moves it here from the same aim; the gun is not streamed positions (command 40). On
-    // Linux and Windows the gun's HID pointer is the cursor and this stays `None`.
+    // moves it here from the same aim; positions (command 40) are still streamed to the gun,
+    // since its firmware only emits button reports while position traffic flows. On Linux and
+    // Windows the gun's HID pointer is the cursor and this stays `None`.
     #[cfg(target_os = "macos")]
     let mut cursor = if gun.is_some() {
         Some(crate::cursor::Cursor::new()?)
@@ -475,13 +473,14 @@ pub fn run_tracker_with(
                 // aim. On a weak frame — a hull fallback or a jump the guard held — it leaves
                 // the cursor where it is instead of re-warping to the last point, so it never
                 // fights the user's trackpad and never stutters between a strong and weak solve.
+                // The aim is streamed to the gun as well — not for its HID pointer (macOS
+                // ignores it) but because firmware 1.9's secondary serial rides the position
+                // traffic: with no positions coming in, it emits no button reports at all.
                 #[cfg(target_os = "macos")]
-                {
-                    let _ = &g;
-                    if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
-                        let [x, y] = opts.aim_map.apply(a);
-                        c.move_to(x, y)?;
-                    }
+                if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
+                    let [x, y] = opts.aim_map.apply(a);
+                    c.move_to(x, y)?;
+                    send_position(g, x, y, &mut position_timeouts)?;
                 }
             }
             last_quad = Some(*q);
@@ -493,11 +492,13 @@ pub fn run_tracker_with(
             // it to the last aim 60x/s would pin it against the user's own pointer, which reads
             // as the cursor stuttering and the mouse being stuck. It stays put until the gun is
             // aimed at the screen again. On Linux the gun's HID pointer holds the last position.
+            // The gun keeps receiving the last aim on both platforms: on macOS not for its HID
+            // pointer but because the firmware's button reports ride the position traffic, and
+            // the pedal is pressed exactly while the gun points away (ducking behind cover).
             #[cfg(target_os = "macos")]
             if let Some(c) = cursor.as_mut() {
                 c.release();
             }
-            #[cfg(not(target_os = "macos"))]
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 let [x, y] = opts.aim_map.apply(prev);
                 send_position(g, x, y, &mut position_timeouts)?;
@@ -658,9 +659,8 @@ pub fn run_tracker_with(
 /// one is invisible, while failing the session costs a ten-second reconnect. A run of them
 /// means the firmware has stopped reading its port, which the reconnect (or a replug) is for.
 ///
-/// macOS never streams positions (the cursor is moved by [`crate::cursor`] instead), so this
-/// is compiled only where the gun's HID pointer is the cursor.
-#[cfg(not(target_os = "macos"))]
+/// On macOS the cursor itself is moved by [`crate::cursor`], but positions are still streamed
+/// to the gun: firmware 1.9 emits button reports only while position traffic flows.
 fn send_position(gun: &mut Gun, x: f64, y: f64, timeouts: &mut u32) -> crate::gun::Result<()> {
     match gun.set_position(percent_to_axis(x), percent_to_axis(y)) {
         Ok(()) => {
