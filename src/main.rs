@@ -2005,6 +2005,9 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         if a.joystick {
             gc.joystick = true;
         }
+        // See supervise_guns: on macOS the driver synthesises the trigger click itself.
+        #[cfg(target_os = "macos")]
+        gc.buttons.mask_synthesised();
         eeprom_cal = sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
         info!(
             "gun \"{}\" streaming (joystick={}, recoil={})",
@@ -2388,7 +2391,11 @@ fn supervise_guns(
                 }
             };
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&ctx.cfg, id.as_deref());
+            let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
+            // macOS drives the cursor and the trigger click itself, so keep the gun's HID mouse
+            // from firing them (its stale position would snap the cursor to a corner).
+            #[cfg(target_os = "macos")]
+            gc.buttons.mask_synthesised();
             let cal = match sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
                 Ok(c) => c,
                 Err(e) => {

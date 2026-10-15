@@ -517,6 +517,18 @@ impl Buttons {
         out.push(button_map(140, self.pedal.wire_value()?));
         Ok(out)
     }
+
+    /// Blank the HID actions the macOS driver synthesises itself through Core Graphics, so the
+    /// gun's own HID mouse does not fire them too. The gun's mouse reports carry a stale
+    /// position (the driver stops streaming it one), so on macOS every HID mouse press snaps
+    /// the cursor to a corner; the physical button still arrives over the serial event stream,
+    /// which is what the driver synthesises from. Only the trigger is synthesised so far; the
+    /// pedal and the rest keep going through the gun's HID until they are too.
+    #[cfg(target_os = "macos")]
+    pub fn mask_synthesised(&mut self) {
+        self.trigger.onscreen = Action::new("none");
+        self.trigger.offscreen = Action::new("none");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
