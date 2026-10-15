@@ -465,33 +465,37 @@ pub fn run_tracker_with(
                 smoother.reset();
             }
             if let Some((g, _)) = gun.as_mut() {
+                // Linux holds the gun's own HID pointer at the best available aim every frame.
+                #[cfg(not(target_os = "macos"))]
                 if let Some(a) = aim.or(last_aim) {
                     let [x, y] = opts.aim_map.apply(a);
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = &g;
-                        if let Some(c) = cursor.as_mut() {
-                            c.move_to(x, y)?;
-                        }
-                    }
-                    #[cfg(not(target_os = "macos"))]
                     send_position(g, x, y, &mut position_timeouts)?;
+                }
+                // macOS warps the system cursor, but only on a fresh, confident (line-based)
+                // aim. On a weak frame — a hull fallback or a jump the guard held — it leaves
+                // the cursor where it is instead of re-warping to the last point, so it never
+                // fights the user's trackpad and never stutters between a strong and weak solve.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = &g;
+                    if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
+                        let [x, y] = opts.aim_map.apply(a);
+                        c.move_to(x, y)?;
+                    }
                 }
             }
             last_quad = Some(*q);
         } else {
             guard.lost();
             smoother.reset();
+            // The border is not in view: the gun is pointed away or set down. On macOS, stop
+            // driving the cursor entirely so the trackpad regains control — continuing to warp
+            // it to the last aim 60x/s would pin it against the user's own pointer, which reads
+            // as the cursor stuttering and the mouse being stuck. It stays put until the gun is
+            // aimed at the screen again. On Linux the gun's HID pointer holds the last position.
+            #[cfg(not(target_os = "macos"))]
             if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
                 let [x, y] = opts.aim_map.apply(prev);
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = &g;
-                    if let Some(c) = cursor.as_mut() {
-                        c.move_to(x, y)?;
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
                 send_position(g, x, y, &mut position_timeouts)?;
             }
         }
