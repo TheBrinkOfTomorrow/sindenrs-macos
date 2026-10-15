@@ -1923,6 +1923,10 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
             gun.set_offscreen_reload(false)?;
             gun.set_calibration_mode_enabled(false)?;
             gun.set_recoil_enabled(false)?;
+            // Button reports (`FE s1 s2 96`) are gated by the gun's secondary serial output;
+            // without this the event stream stays empty. `run`/`calibrate` turn it on in
+            // apply_config, but monitor skips that, so enable it here for the capture.
+            gun.set_secondary_serial(true)?;
             info!("streaming; holding ({x}%, {y}%) at {rate} Hz for {seconds}s — pull the trigger and press buttons");
             let (ax, ay) = (percent_to_axis(x), percent_to_axis(y));
             let period = Duration::from_secs_f64(1.0 / rate);
