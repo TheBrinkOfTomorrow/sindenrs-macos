@@ -76,7 +76,17 @@ impl Gun {
             .parity(Parity::None)
             .stop_bits(StopBits::One)
             .flow_control(FlowControl::None)
-            .timeout(Duration::from_millis(20))
+            // 20 ms suits Linux, whose cdc-acm buffers writes and returns at once. macOS
+            // completes writes against the device, and with the gun's camera streaming through
+            // the same hub a write can wait tens of milliseconds — at 20 ms every position
+            // write timed out the moment tracking started. Reads are unaffected either way:
+            // the tracking loop only reads bytes already reported available, and queries carry
+            // their own deadlines.
+            .timeout(Duration::from_millis(if cfg!(target_os = "macos") {
+                150
+            } else {
+                20
+            }))
             .open()?;
         port.write_data_terminal_ready(true)?;
         port.write_request_to_send(true)?;
