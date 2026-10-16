@@ -412,6 +412,9 @@ struct TrackArgs {
     /// the driver moves the cursor). For bisecting the serial-write wedge.
     #[arg(long, hide = true)]
     mask_buttons: Option<bool>,
+    /// With --send: leave recoil disabled on the gun (as `debug monitor` does), for bisecting.
+    #[arg(long, hide = true)]
+    no_recoil: bool,
     /// Luma threshold for the border (default from config: display.threshold).
     #[arg(long)]
     threshold: Option<u8>,
@@ -2049,6 +2052,9 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
         if a.joystick {
             gc.joystick = true;
+        }
+        if a.no_recoil {
+            gc.recoil.enabled = false;
         }
         // See supervise_guns: a synthesised macOS cursor makes the clicks itself.
         #[cfg(target_os = "macos")]

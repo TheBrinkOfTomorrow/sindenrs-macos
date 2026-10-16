@@ -601,12 +601,17 @@ takes at most about a second per gun.
 **Bench knobs.** Hidden `debug track --heartbeat` streams the centre from the first frame in any
 cursor mode (without it a hands-free `--cursor gun` run sends nothing and would pass trivially),
 and hidden `--mask-buttons true|false` decouples the HID-button masking from the cursor mode.
-`tools/macos/bench-wedge.sh gun|driver [masked|unmasked]` runs the 900-frame hands-free test,
+`tools/macos/bench-wedge.sh gun|driver [masked|unmasked] [norecoil]` runs the 900-frame
+hands-free test (hidden `--no-recoil` leaves recoil off, as `debug monitor` does),
 waits for the summary rather than the process exit, and prints CLEAN/WEDGED and how the close
 went. Differences between the clean `debug monitor` and the wedging `track --send`: the
 camera running in-process (a camera in a separate process was clean, but the in-process one has
 never run without the rest), the Core Graphics cursor, the masked button map, recoil left
-enabled (monitor disables it), and writes paced by camera frames rather than a timer.
+enabled (monitor disables it), and writes paced by camera frames rather than a timer. Note that
+a hands-free run never warps the cursor — with no border in view there is no aim, and the
+synthesised cursor only moves on one — so the hands-free wedge cannot be the warp fighting the
+HID pointer, as the 00:10 entry guessed; at most it is something `Cursor::new` sets up
+(Accessibility/PostEvent checks, background cursor control).
 
 **Two corrections.** Rust's stdout is line-buffered even into a file (a SIGKILLed test program
 kept every `println!` line), so the lost monitor output was not buffering: `run-bundled.sh`
@@ -620,12 +625,13 @@ now.
 `tools/macos/stop.sh`; it is stuck in the close, so expect a husk — then **replug the gun**, and
 `cargo build`):
 
-1. `tools/macos/bench-wedge.sh gun` — no Core Graphics, unmasked buttons. CLEAN would make the
-   HID model the answer; also read the `close:` line (fast = the non-blocking close works).
-2. If 1 is CLEAN: replug only if it said so, then `bench-wedge.sh driver unmasked` and
-   `bench-wedge.sh gun masked` (replug after any WEDGED) to tell the cursor machinery from the
-   button map. If 1 is WEDGED, the cursor machinery is cleared and the in-process camera (or the
-   frame-paced writes) is next: the camera to its own process, or writes on a timer thread.
+1. `tools/macos/bench-wedge.sh gun` — no Core Graphics, unmasked buttons, recoil on. Also read
+   the `close:` line (fast = the non-blocking close works). Replug after any WEDGED run.
+2. If 1 is CLEAN: `bench-wedge.sh gun masked` (the masked button map) and
+   `bench-wedge.sh driver unmasked` (the `Cursor::new` setup) — whichever wedges is the culprit.
+   If 1 is WEDGED: `bench-wedge.sh gun norecoil` — clean means recoil-on is the poison; wedged
+   leaves the in-process camera or the frame-paced writes (next: the camera in its own process,
+   or the writes on a timer thread with a latest-position slot).
 3. Then the real thing: `tools/macos/run-bundled.sh -- run --cursor gun` with a game page up —
    aim, trigger, pedal, coin; quit from the menu (the border should vanish at once).
 4. If the HID model holds, make `gun` the default and retire the synthesis to a fallback; the

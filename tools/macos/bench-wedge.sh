@@ -3,12 +3,14 @@
 # frames (~15 s), the centre position streamed from the first frame. Prints CLEAN or WEDGED,
 # then how the port close went.
 #
-#   tools/macos/bench-wedge.sh gun|driver [masked|unmasked]
+#   tools/macos/bench-wedge.sh gun|driver [masked|unmasked] [norecoil]
 #
 #   gun     the gun's own HID pointer is the cursor (no Core Graphics, no permissions)
-#   driver  the driver warps the cursor and synthesises clicks (today's default)
+#   driver  the driver sets up its Core Graphics cursor (today's default); hands-free it never
+#           warps (there is no aim), so this tests the setup, not the warp
 #   masked / unmasked   override whether the gun's HID mouse buttons are masked (default:
-#           masked for driver, unmasked for gun), to separate the two differences
+#           masked for driver, unmasked for gun)
+#   norecoil  leave recoil disabled on the gun, as `debug monitor` (which streams clean) does
 #
 # The gun can lie on the desk; no border is needed. Build first (cargo build). Replug the gun
 # after any WEDGED run before the next one: a wedged gun stays wedged. SINDEN_CAMERA=<uniqueID>
@@ -17,21 +19,27 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-usage="usage: bench-wedge.sh gun|driver [masked|unmasked]"
+usage="usage: bench-wedge.sh gun|driver [masked|unmasked] [norecoil]"
 cursor=${1:?$usage}
 case "$cursor" in gun|driver) ;; *) echo "$usage" >&2; exit 2;; esac
-mask=${2:-}
-set -- debug track --send --heartbeat --frames 900 --cursor "$cursor"
-case "$mask" in
-    masked) set -- "$@" --mask-buttons true ;;
-    unmasked) set -- "$@" --mask-buttons false ;;
-    "") ;;
-    *) echo "$usage" >&2; exit 2 ;;
-esac
+shift
+flags=""
+tag=$cursor
+for opt in "$@"; do
+    case "$opt" in
+        masked) flags="$flags --mask-buttons true" ;;
+        unmasked) flags="$flags --mask-buttons false" ;;
+        norecoil) flags="$flags --no-recoil" ;;
+        *) echo "$usage" >&2; exit 2 ;;
+    esac
+    tag="$tag-$opt"
+done
+# shellcheck disable=SC2086 # $flags is a list of plain words
+set -- debug track --send --heartbeat --frames 900 --cursor "$cursor" $flags
 if [ -n "${SINDEN_CAMERA:-}" ]; then set -- "$@" --device "$SINDEN_CAMERA"; fi
 
 mkdir -p "$root/target/macos/logs"
-log="$root/target/macos/logs/bench-$cursor${mask:+-$mask}-$(date +%Y%m%d-%H%M%S).log"
+log="$root/target/macos/logs/bench-$tag-$(date +%Y%m%d-%H%M%S).log"
 echo "bench: $* (log: $log)"
 SINDENRS_LOG=$log "$here/run-bundled.sh" -- "$@" > /dev/null 2>&1 &
 runner=$!

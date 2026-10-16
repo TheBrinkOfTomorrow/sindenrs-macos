@@ -33,7 +33,7 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 - `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
   the camera from an agent or IDE session); pass absolute paths. Each run keeps its own log in
   `target/macos/logs/` (`target/macos/sindenrs.log` links to the latest).
-- `tools/macos/bench-wedge.sh gun|driver [masked|unmasked]` — hands-free serial-write wedge
+- `tools/macos/bench-wedge.sh gun|driver [masked|unmasked] [norecoil]` — hands-free write-wedge
   test (900 frames, centre heartbeat); prints CLEAN/WEDGED and the port-close timing.
 - `[global] cursor = "driver" | "gun"` (or `--cursor` on `run` / `debug track`): on macOS, the
   driver moves the cursor with Core Graphics (default) or the gun's own HID pointer does.
