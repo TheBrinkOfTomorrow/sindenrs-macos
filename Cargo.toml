@@ -35,8 +35,8 @@ wayland-client = "0.31"
 # IOKit registry access for discovery; both already come in through serialport on macOS.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-# macOS ignores the gun's absolute HID pointer, so the driver moves the system cursor itself
-# by posting Core Graphics mouse events (see src/cursor.rs).
+# `cursor = "driver"`: the driver moves the system cursor itself by posting Core Graphics mouse
+# events (see src/cursor.rs).
 core-graphics = "0.24"
 io-kit-sys = "0.4"
 # fcntl, to close the gun's serial port without the tty drain (src/gun.rs).

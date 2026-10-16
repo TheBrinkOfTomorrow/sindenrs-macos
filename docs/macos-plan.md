@@ -9,11 +9,14 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
   Leonardo bootloader) with a CDC serial port and its own HID mouse, keyboard and joystick.
 - Host software's job: read camera frames -> detect the white coded border -> compute aim ->
   drive the pointer. On Windows/Linux the gun reports the aim through its own absolute USB
-  mouse, so the driver just writes the position to the gun over serial. **On macOS that does
-  NOT work** (2026-10-15): macOS ignores an absolute-coordinate HID pointer, so the gun's mouse
-  cannot move the system cursor — it pegs in a corner. The macOS driver instead moves the
-  cursor itself by posting Core Graphics mouse events (`src/cursor.rs`); see `macos-notes.md`,
-  2026-10-15. **No kernel driver / DriverKit extension is needed either way.**
+  mouse, so the driver just writes the position to the gun over serial. On 2026-10-15 that was
+  judged not to work on macOS (the cursor pegged in a corner) and the driver grew Core Graphics
+  cursor synthesis (`src/cursor.rs`); on 2026-10-16 a bench run with the full configuration and
+  positions actually reaching the gun moved the cursor through the gun's own HID pointer after
+  all — the corner was most likely the old 20 ms write timeout dropping the positions.
+  `[global] cursor = "driver" | "gun"` picks either; which becomes the default waits on the
+  hardware (`macos-notes.md`, 2026-10-16 overnight). **No kernel driver / DriverKit extension
+  is needed either way.**
 - Base to build on: https://github.com/schlarpc/sindenrs (MIT, Rust, clean-room).
   - Done: protocol (handshake, auth hashes, events), tracking at 60 fps, coded border,
     calibration, recoil/button TOML config, firmware backup/flash, hotplug, two guns.
@@ -43,6 +46,13 @@ apply_config burst vs in-process AVFoundation — one experiment left); then pum
 a bounded serial close (a wedged gun hangs exit; the run lock now survives that),
 background-at-login, the Calibrate-from-menu hang, and a native config/calibration GUI. See
 `docs/macos-notes.md`, 2026-10-15 (evening).
+
+Update 2026-10-16 (overnight, not yet on hardware): `cursor = "gun"` (the HID-pointer model,
+no permissions beyond the camera) beside the Core Graphics `driver`; a bounded, non-draining
+serial close (a wedged gun no longer takes the tracker, `run`'s teardown or the Calibrate flow
+down with it); AppKit keeps turning during teardown (the frozen border); and
+`tools/macos/bench-wedge.sh` to bisect the write wedge hands-free. Next: the bench sequence at
+the end of that day's `macos-notes.md` entry.
 
 Measurements and decisions are in `docs/macos-notes.md`.
 

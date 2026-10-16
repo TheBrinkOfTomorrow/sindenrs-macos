@@ -31,7 +31,12 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
   `dir`). Opening Sindenrs.app with no arguments runs `sindenrs run`, logging to
   `~/Library/Logs/Sindenrs.log`; a second `run` exits (one per user).
 - `tools/macos/run-bundled.sh [--bin path] -- <args>` — run sindenrs from the app (needed for
-  the camera from an agent or IDE session); pass absolute paths.
+  the camera from an agent or IDE session); pass absolute paths. Each run keeps its own log in
+  `target/macos/logs/` (`target/macos/sindenrs.log` links to the latest).
+- `tools/macos/bench-wedge.sh gun|driver [masked|unmasked]` — hands-free serial-write wedge
+  test (900 frames, centre heartbeat); prints CLEAN/WEDGED and the port-close timing.
+- `[global] cursor = "driver" | "gun"` (or `--cursor` on `run` / `debug track`): on macOS, the
+  driver moves the cursor with Core Graphics (default) or the gun's own HID pointer does.
 - `run` on macOS has a menu bar item (gun status, Show Border / Reticle / Camera View, Quit)
   and global shortcuts: ⌃⌥B border, ⌃⌥C reticle at each gun's aim, ⌃⌥P camera view (feed +
   detector view), ⌃⌥⌘Q quits; `tools/macos/stop.sh` also quits from a shell (quitting is

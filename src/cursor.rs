@@ -1,16 +1,16 @@
-//! Moving the macOS system cursor from the gun's aim.
+//! Moving the macOS system cursor from the gun's aim (`[global] cursor = "driver"`).
 //!
 //! On Windows and Linux the gun presents an *absolute* HID mouse: the driver streams it a
-//! position (command 40) and the OS moves the system cursor to match, for free. macOS has no
-//! driver that turns an absolute-coordinate HID pointer into cursor movement — it ignores the
-//! coordinates (or treats them as relative deltas), and the cursor pegs in a corner. So on
-//! macOS the driver must move the cursor itself, which is what this module does: it posts Core
-//! Graphics mouse events at the point the tracker already computed, plus the mouse buttons the
-//! gun maps by default — the trigger as a left click, front-left as a right click, front-right
-//! as a middle click — each driven by its bit in the serial button stream.
+//! position (command 40) and the OS moves the system cursor to match, for free. On 2026-10-15
+//! that looked broken on macOS (the cursor pegged in a corner), so this module moves the cursor
+//! itself: it posts Core Graphics mouse events at the point the tracker already computed, plus
+//! the mouse buttons the gun maps by default — the trigger as a left click, front-left as a
+//! right click, front-right as a middle click — each driven by its bit in the serial button
+//! stream. A 2026-10-16 bench run then saw the gun's HID pointer move the macOS cursor after all
+//! once positions actually reached the gun, so `cursor = "gun"` skips this module entirely.
 //!
-//! Because the gun's own HID pointer would fight this, the tracker stops streaming position
-//! (command 40) to the gun on macOS, and the HID mouse buttons are masked
+//! Positions are still streamed to the gun in this mode (firmware 1.9 reports buttons only while
+//! position traffic flows), and the HID mouse buttons are masked
 //! ([`crate::config::Buttons::mask_synthesised`]) so they do not fire a second, mispositioned
 //! click. Everything else (recoil, keys mapped through the gun's HID keyboard) is unchanged.
 //!

@@ -560,3 +560,73 @@ do pointer and buttons) may simply work. Plan for next session:
 4. Beware stdout block-buffering in captured debug sessions: a killed process loses its
    buffered `println!` lines (the monitor's button-report evidence died that way — tracing's
    stderr survives). Flush or log through tracing for bench tools.
+
+## 2026-10-16 (overnight) — a cursor switch, a bounded close, and the bench for the morning
+
+Work done without the hardware (the gun was left plugged in; nothing below touched it), so
+everything here builds, lints and passes the tests but is **not yet verified on the gun**.
+
+**A live capture of the close hang.** The `run` started at 00:13 was still up at 01:00. Its
+log stops at a single "position write timed out" a second into tracking, and `sample` showed
+why: the tracker thread had left its loop (120 consecutive write timeouts, ~18 s at the 150 ms
+budget) and had sat in `close()` on the gun's port ever since, inside `Gun`'s drop at the end of
+`run_tracker_with` — 45 minutes and counting. The supervisor was asleep waiting for it, AppKit
+still turned (main thread in `mach_msg`), and no error was ever logged because the error is
+returned after the drop. The same night's `debug track` log shows the write stall's other face:
+every report line says `proc=158 ms`, which is the 150 ms write timeout plus ~8 ms of real work
+(`proc` is measured after the position write), so the loop ran at ~6 Hz while the camera kept
+delivering 60. A wedged gun means every write waits out its full budget.
+
+**`[global] cursor = "driver" | "gun"`** (and `--cursor` on `run` and `debug track`) chooses
+what moves the macOS cursor. `driver` is the behaviour so far and stays the default. `gun`
+behaves as on Linux: no `Cursor` (so no Accessibility or PostEvent prompt), the gun's HID mouse
+buttons stay mapped, positions stream at the best aim every frame once there has been one, and
+no centre heartbeat before the first aim. Calibrate now masks the HID mouse buttons in driver
+mode too, as `run` and `track` already did.
+
+**Bounded serial close.** `Gun`'s drop now (1) marks the descriptor `O_NONBLOCK` — the BSD tty
+close drains the output queue unless the file is non-blocking, and flushes it instead when it is
+— and (2) closes on a thread of its own with a 1 s budget. Past the budget the thread is left to
+finish whenever it can and the port is held as closing; reopening it (or the bootloader touch)
+waits up to 2 s for that close, then fails with "unplug the gun and plug it back in" instead of
+queueing behind it. The close logs its duration at debug level. A process that exits with a close
+still stuck still hangs on its way out (the run lock copes with that husk), but the tracker
+thread, `run`'s supervisor and its UI no longer go down with it.
+
+**`run`'s teardown keeps AppKit turning** until the gun supervisor has finished, then joins it
+(`menubar::pump_while`): the border's `orderOut` only lands when the event loop turns, which is
+why the border froze on screen after the Calibrate menu item. With the bounded close the wind-down
+takes at most about a second per gun.
+
+**Bench knobs.** Hidden `debug track --heartbeat` streams the centre from the first frame in any
+cursor mode (without it a hands-free `--cursor gun` run sends nothing and would pass trivially),
+and hidden `--mask-buttons true|false` decouples the HID-button masking from the cursor mode.
+`tools/macos/bench-wedge.sh gun|driver [masked|unmasked]` runs the 900-frame hands-free test,
+waits for the summary rather than the process exit, and prints CLEAN/WEDGED and how the close
+went. Differences between the clean `debug monitor` and the wedging `track --send`: the
+camera running in-process (a camera in a separate process was clean, but the in-process one has
+never run without the rest), the Core Graphics cursor, the masked button map, recoil left
+enabled (monitor disables it), and writes paced by camera frames rather than a timer.
+
+**Two corrections.** Rust's stdout is line-buffered even into a file (a SIGKILLed test program
+kept every `println!` line), so the lost monitor output was not buffering: `run-bundled.sh`
+deleted the previous run's log at the start of the next, and only printed a log once its run
+exited. Each run now keeps its own log under `target/macos/logs/` (`sindenrs.log` links to the
+latest). And `bundle.sh` copied the new binary over the bundle's in place, which kills a
+still-running copy of the app (its code signature goes invalid under it); it replaces the file
+now.
+
+**Morning test, in order** (quit the running app first — menu bar item, or
+`tools/macos/stop.sh`; it is stuck in the close, so expect a husk — then **replug the gun**, and
+`cargo build`):
+
+1. `tools/macos/bench-wedge.sh gun` — no Core Graphics, unmasked buttons. CLEAN would make the
+   HID model the answer; also read the `close:` line (fast = the non-blocking close works).
+2. If 1 is CLEAN: replug only if it said so, then `bench-wedge.sh driver unmasked` and
+   `bench-wedge.sh gun masked` (replug after any WEDGED) to tell the cursor machinery from the
+   button map. If 1 is WEDGED, the cursor machinery is cleared and the in-process camera (or the
+   frame-paced writes) is next: the camera to its own process, or writes on a timer thread.
+3. Then the real thing: `tools/macos/run-bundled.sh -- run --cursor gun` with a game page up —
+   aim, trigger, pedal, coin; quit from the menu (the border should vanish at once).
+4. If the HID model holds, make `gun` the default and retire the synthesis to a fallback; the
+   permission story becomes Camera only.
