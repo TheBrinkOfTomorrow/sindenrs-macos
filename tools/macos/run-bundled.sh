@@ -7,9 +7,10 @@
 #
 # LaunchServices starts the app with / as its working directory: pass absolute paths.
 #
-# Each run logs to its own file under target/macos/logs/, and target/macos/sindenrs.log links
-# to the latest. Earlier runs' logs are kept: a run that hung or was killed (so this script
-# never got to print it) still has its output on disk after the next run starts.
+# Each run logs to its own file under target/macos/logs/ ($SINDENRS_LOG names it instead), and
+# target/macos/sindenrs.log links to the latest. Earlier runs' logs are kept: a run that hung or
+# was killed (so this script never got to print it) still has its output on disk after the next
+# run starts.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -24,7 +25,7 @@ mkdir -p "$logs"
 if [ -f "$latest" ] && [ ! -L "$latest" ]; then
     mv "$latest" "$logs/sindenrs-$(stat -f %Sm -t %Y%m%d-%H%M%S "$latest").log"
 fi
-log="$logs/sindenrs-$(date +%Y%m%d-%H%M%S)-$$.log"
+log=${SINDENRS_LOG:-"$logs/sindenrs-$(date +%Y%m%d-%H%M%S)-$$.log"}
 : > "$log"
 ln -sfn "$log" "$latest"
 echo "log: $log" >&2
