@@ -21,6 +21,10 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 sed "s/@VERSION@/$version/g" "$here/Sindenrs-Info.plist" > "$app/Contents/Info.plist"
 # The icon is drawn by make-icon.swift; rerun that to change it.
 cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+# Replace the binary rather than overwrite it: a copy over the file a running Sindenrs.app was
+# started from rewrites its pages under it, and macOS kills it for an invalid code signature.
+# A new file leaves the running one its own.
+rm -f "$app/Contents/MacOS/sindenrs"
 cp "$bin" "$app/Contents/MacOS/sindenrs"
 
 # Self-signed certificates are not "valid" (untrusted) but sign fine, so look them up in the
