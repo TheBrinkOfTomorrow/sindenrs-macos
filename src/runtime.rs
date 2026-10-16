@@ -376,7 +376,7 @@ pub fn run_tracker_with(
     let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
-    let mut position_timeouts = 0u32;
+    let mut writes = Writes::default();
     // With `cursor = "driver"` on macOS the driver moves the system cursor itself from the same
     // aim; positions (command 40) are still streamed to the gun, since its firmware only emits
     // button reports while position traffic flows. With `cursor = "gun"`, and always on Linux
@@ -435,6 +435,7 @@ pub fn run_tracker_with(
         let t0 = Instant::now()
             .checked_sub(frame.decode)
             .unwrap_or_else(Instant::now);
+        writes.frame = Duration::ZERO;
         let l = frame.luma;
         flip_luma(l, w, flip);
         let quad = acquire(l, w, h, &params);
@@ -488,13 +489,13 @@ pub fn run_tracker_with(
                     if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
                         let [x, y] = opts.aim_map.apply(a);
                         c.move_to(x, y)?;
-                        send_position(g, x, y, &mut position_timeouts)?;
+                        send_position(g, x, y, &mut writes)?;
                     }
                 } else if let Some(a) = aim.or(last_aim) {
                     // The gun's own HID pointer is the cursor: hold it at the best available
                     // aim every frame.
                     let [x, y] = opts.aim_map.apply(a);
-                    send_position(g, x, y, &mut position_timeouts)?;
+                    send_position(g, x, y, &mut writes)?;
                 }
             }
             last_quad = Some(*q);
@@ -526,7 +527,7 @@ pub fn run_tracker_with(
             };
             if let (Some((g, _)), Some(p)) = (gun.as_mut(), heartbeat) {
                 let [x, y] = opts.aim_map.apply(p);
-                send_position(g, x, y, &mut position_timeouts)?;
+                send_position(g, x, y, &mut writes)?;
             }
         }
         if aim.is_some() {
@@ -605,9 +606,15 @@ pub fn run_tracker_with(
                 .is_some_and(|e| last_report.elapsed() >= e);
         if report {
             last_report = Instant::now();
+            // `proc` includes the position writes; a stalled port shows up here on its own.
+            let write = if gun.is_some() {
+                format!(" write={:.2}ms", writes.frame.as_secs_f64() * 1000.0)
+            } else {
+                String::new()
+            };
             match (&quad, aim) {
                 (Some(q), Some(am)) => println!(
-                    "[{name}] {:>7.2}s seq={:<6} aim=({:6.2}%, {:6.2}%) TL({:.0},{:.0}) TR({:.0},{:.0}) BR({:.0},{:.0}) BL({:.0},{:.0}){} proc={:.2}ms age={:.1}ms",
+                    "[{name}] {:>7.2}s seq={:<6} aim=({:6.2}%, {:6.2}%) TL({:.0},{:.0}) TR({:.0},{:.0}) BR({:.0},{:.0}) BL({:.0},{:.0}){} proc={:.2}ms{write} age={:.1}ms",
                     start.elapsed().as_secs_f64(), frame.sequence, am[0], am[1],
                     q.corners[0][0], q.corners[0][1], q.corners[1][0], q.corners[1][1],
                     q.corners[2][0], q.corners[2][1], q.corners[3][0], q.corners[3][1],
@@ -620,7 +627,7 @@ pub fn run_tracker_with(
                 ),
                 _ => {
                     let (mean, max) = luma::luma_stats(l);
-                    println!("[{name}] {:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={:.2}ms", start.elapsed().as_secs_f64(), frame.sequence, mean, max, proc.as_secs_f64() * 1000.0);
+                    println!("[{name}] {:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={:.2}ms{write}", start.elapsed().as_secs_f64(), frame.sequence, mean, max, proc.as_secs_f64() * 1000.0);
                 }
             }
         }
@@ -677,6 +684,15 @@ pub fn run_tracker_with(
     Ok(())
 }
 
+/// Position-write bookkeeping for one tracker.
+#[derive(Default)]
+struct Writes {
+    /// Consecutive writes that timed out.
+    timeouts: u32,
+    /// Time spent writing positions for the current frame.
+    frame: Duration,
+}
+
 /// Stream one position to the gun, tolerating a transient write timeout.
 ///
 /// A single write timing out just means the firmware was busy for a moment (the recoil
@@ -686,19 +702,22 @@ pub fn run_tracker_with(
 ///
 /// With a synthesised macOS cursor ([`crate::cursor`]) positions are still streamed to the
 /// gun: firmware 1.9 emits button reports only while position traffic flows.
-fn send_position(gun: &mut Gun, x: f64, y: f64, timeouts: &mut u32) -> crate::gun::Result<()> {
-    match gun.set_position(percent_to_axis(x), percent_to_axis(y)) {
+fn send_position(gun: &mut Gun, x: f64, y: f64, writes: &mut Writes) -> crate::gun::Result<()> {
+    let t = Instant::now();
+    let r = gun.set_position(percent_to_axis(x), percent_to_axis(y));
+    writes.frame += t.elapsed();
+    match r {
         Ok(()) => {
-            *timeouts = 0;
+            writes.timeouts = 0;
             Ok(())
         }
         Err(GunError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
-            *timeouts += 1;
+            writes.timeouts += 1;
             // Two seconds of 60 Hz positions all timing out is a dead line, not a glitch.
-            if *timeouts >= 120 {
+            if writes.timeouts >= 120 {
                 return Err(GunError::Io(e));
             }
-            if *timeouts == 1 {
+            if writes.timeouts == 1 {
                 warn!("position write timed out; dropping positions while it persists");
             }
             Ok(())
