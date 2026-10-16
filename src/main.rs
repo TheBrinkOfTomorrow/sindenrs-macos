@@ -2654,7 +2654,11 @@ fn supervise_guns(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn run_all(_ctx: &Ctx, _overlay: bool) -> Result<()> {
+fn run_all(
+    _ctx: &Ctx,
+    _overlay: bool,
+    _control: &std::sync::Arc<sindenrs::control::Control>,
+) -> Result<()> {
     bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
 
