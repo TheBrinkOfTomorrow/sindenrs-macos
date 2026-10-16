@@ -85,6 +85,10 @@ pub struct TrackerOptions {
     pub aim_map: AimMap,
     /// What moves the cursor on macOS (config: global.cursor); Linux always uses the gun.
     pub cursor: CursorDriver,
+    /// Stream positions from the first frame (the centre until there is an aim) whatever
+    /// moves the cursor — a synthesised cursor always does. For bench runs, so a hands-free
+    /// session exercises the serial writes the way `run` does with the gun in use.
+    pub heartbeat: bool,
 }
 
 /// One processed frame, handed to the caller's hook.
@@ -515,7 +519,7 @@ pub fn run_tracker_with(
             // pointer as the cursor, positions start once there has been an aim, as on Linux
             // — parking the cursor mid-screen unasked would be visible, and the HID buttons
             // click without the serial reports.
-            let heartbeat = if synthesising {
+            let heartbeat = if synthesising || opts.heartbeat {
                 Some(last_aim.unwrap_or([50.0, 50.0]))
             } else {
                 last_aim

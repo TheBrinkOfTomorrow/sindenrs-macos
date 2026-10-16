@@ -404,6 +404,14 @@ struct TrackArgs {
     /// With --send on macOS: what moves the cursor (config: global.cursor).
     #[arg(long, value_enum)]
     cursor: Option<CursorArg>,
+    /// With --send: stream the centre from the first frame until there is an aim, whatever
+    /// moves the cursor, so a hands-free bench run exercises the serial writes.
+    #[arg(long, hide = true)]
+    heartbeat: bool,
+    /// With --send on macOS: mask the gun's HID mouse buttons or not (default: masked when
+    /// the driver moves the cursor). For bisecting the serial-write wedge.
+    #[arg(long, hide = true)]
+    mask_buttons: Option<bool>,
     /// Luma threshold for the border (default from config: display.threshold).
     #[arg(long)]
     threshold: Option<u8>,
@@ -2044,7 +2052,9 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         }
         // See supervise_guns: a synthesised macOS cursor makes the clicks itself.
         #[cfg(target_os = "macos")]
-        if cursor == sindenrs::config::CursorDriver::Driver {
+        if a.mask_buttons
+            .unwrap_or(cursor == sindenrs::config::CursorDriver::Driver)
+        {
             gc.buttons.mask_synthesised();
         }
         eeprom_cal = sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
@@ -2095,6 +2105,7 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         // Diagnostics: aim is reported, not steering a cursor over a letterboxed border.
         aim_map: sindenrs::runtime::AimMap::default(),
         cursor,
+        heartbeat: a.heartbeat,
     };
     let status = Arc::new(Mutex::new(Status::default()));
     if a.preview {
@@ -2527,6 +2538,7 @@ fn supervise_guns(
                 report_every: None,
                 aim_map,
                 cursor: ctx.cfg.global.cursor,
+                heartbeat: false,
             };
             let status = Arc::new(Mutex::new(Status {
                 name: gc.name.clone(),
@@ -3181,6 +3193,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         report_every: None,
         aim_map,
         cursor: ctx.cfg.global.cursor,
+        heartbeat: false,
     };
 
     let scene = Arc::new(Mutex::new(Scene {
