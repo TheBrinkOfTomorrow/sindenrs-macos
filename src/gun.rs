@@ -4,12 +4,15 @@
 //! query reports how long the gun took to answer so the startup budget can be measured
 //! rather than assumed.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::protocol::event::{Event, EventParser};
 use crate::protocol::{auth, calibration_decode, cmd, Frame};
@@ -34,6 +37,8 @@ pub enum GunError {
     GunAuthFailed,
     #[error("gun rejected our authentication: replied {0:?} instead of \"true\"")]
     HostAuthRejected(String),
+    #[error("the last session's close of {0} is still stuck in the kernel (the gun's firmware has wedged); unplug the gun and plug it back in")]
+    CloseStuck(String),
 }
 
 pub type Result<T> = std::result::Result<T, GunError>;
@@ -61,8 +66,62 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 /// queued after this long, the firmware has stopped reading.
 pub const NOT_READING_AFTER: Duration = Duration::from_millis(300);
 
+/// How long closing a session's port may take before it is left to finish on its own thread.
+/// A healthy close takes milliseconds; a wedged gun's can block in the kernel until the gun is
+/// unplugged, and must not take the tracker thread (and with it `run`'s teardown) down too.
+pub const CLOSE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Ports whose close has not finished. Opening one of them again would queue behind the stuck
+/// close in the kernel (or fight it), so [`Gun::open`] refuses until it is done.
+static CLOSING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// How long reopening a port waits for its previous close to finish before giving up: a close
+/// that is merely slow (the recovery path reopens right after dropping a misbehaving session)
+/// still gets through, a stuck one fails with [`GunError::CloseStuck`] instead of hanging.
+const REOPEN_WAIT: Duration = Duration::from_secs(2);
+
+fn closing(path: &str) -> bool {
+    CLOSING.lock().is_ok_and(|c| c.contains(path))
+}
+
+/// Wait up to `wait` for any close of `path` still in progress to finish.
+fn await_close(path: &str, wait: Duration) -> Result<()> {
+    let deadline = Instant::now() + wait;
+    while closing(path) {
+        if Instant::now() >= deadline {
+            return Err(GunError::CloseStuck(path.to_owned()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// The session's port: open from [`Gun::open`] until [`Gun`]'s drop hands it to
+/// [`close_bounded`].
+struct Port(Option<Box<dyn SerialPort>>);
+
+impl Deref for Port {
+    type Target = Box<dyn SerialPort>;
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("the port stays open until the session drops")
+    }
+}
+
+impl DerefMut for Port {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("the port stays open until the session drops")
+    }
+}
+
 pub struct Gun {
-    port: Box<dyn SerialPort>,
+    port: Port,
+    /// The port's descriptor, for the non-blocking close (see [`skip_close_drain`]).
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
     path: String,
     events: EventParser,
     last_auth: Option<AuthReport>,
@@ -71,18 +130,38 @@ pub struct Gun {
 impl Gun {
     /// Open the gun's CDC-ACM port: 115200 8N1, no flow control, DTR and RTS asserted.
     pub fn open(path: &str) -> Result<Self> {
-        let mut port = serialport::new(path, crate::protocol::BAUD)
+        await_close(path, REOPEN_WAIT)?;
+        let builder = serialport::new(path, crate::protocol::BAUD)
             .data_bits(DataBits::Eight)
             .parity(Parity::None)
             .stop_bits(StopBits::One)
             .flow_control(FlowControl::None)
-            .timeout(Duration::from_millis(20))
-            .open()?;
+            // 20 ms suits Linux, whose cdc-acm buffers writes and returns at once. macOS
+            // completes writes against the device, and with the gun's camera streaming through
+            // the same hub a write can wait tens of milliseconds — at 20 ms every position
+            // write timed out the moment tracking started. Reads are unaffected either way:
+            // the tracking loop only reads bytes already reported available, and queries carry
+            // their own deadlines.
+            .timeout(Duration::from_millis(if cfg!(target_os = "macos") {
+                150
+            } else {
+                20
+            }));
+        #[cfg(unix)]
+        let (mut port, fd) = {
+            let p = builder.open_native()?;
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&p);
+            (Box::new(p) as Box<dyn SerialPort>, fd)
+        };
+        #[cfg(not(unix))]
+        let mut port = builder.open()?;
         port.write_data_terminal_ready(true)?;
         port.write_request_to_send(true)?;
         debug!(path, "opened gun serial port");
         Ok(Self {
-            port,
+            port: Port(Some(port)),
+            #[cfg(unix)]
+            fd,
             path: path.to_owned(),
             events: EventParser::new(),
             last_auth: None,
@@ -502,6 +581,7 @@ impl Gun {
 /// disconnects, shows up as the Caterina bootloader (`2341:0036`) for a few seconds, then
 /// re-enumerates as itself.
 pub fn bootloader_touch(path: &str) -> Result<()> {
+    await_close(path, REOPEN_WAIT)?;
     let mut port = serialport::new(path, 1200)
         .dtr_on_open(false)
         .timeout(Duration::from_millis(100))
@@ -515,8 +595,105 @@ pub fn bootloader_touch(path: &str) -> Result<()> {
 
 impl Drop for Gun {
     fn drop(&mut self) {
-        // A healthy gun has consumed everything within a millisecond; a wedged one never will,
-        // and without this the close blocks for the kernel's closing_wait.
-        let _ = self.port.clear(ClearBuffer::Output);
+        if let Some(port) = self.port.0.take() {
+            #[cfg(unix)]
+            skip_close_drain(self.fd);
+            close_bounded(&self.path, port, CLOSE_BUDGET);
+        }
+    }
+}
+
+/// Mark the descriptor non-blocking just before it is closed. The BSD tty close
+/// (`ttylclose`, which macOS's serial driver goes through) waits for the output queue to
+/// drain unless the file is non-blocking, in which case it flushes it instead — and a gun
+/// that has stopped reading never drains. Nothing reads or writes the port after this.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn skip_close_drain(fd: std::os::fd::RawFd) {
+    // SAFETY: fcntl on a descriptor this session still owns; it is closed right after.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Close `port`, waiting at most `budget`. Throws away unsent output first: a healthy gun
+/// has consumed everything within a millisecond, a wedged one never will, and cdc-acm would
+/// otherwise wait out its `closing_wait` (30 s on Linux). The close itself runs on a thread of
+/// its own: on macOS a gun whose firmware has wedged can block it in the kernel until the gun
+/// is unplugged, and past the budget that thread is left to finish whenever it can, with the
+/// path held in [`CLOSING`] so nothing reopens it meanwhile. (A process exiting with a close
+/// still stuck stays stuck too — the run lock in `main` copes with that husk.)
+fn close_bounded(path: &str, port: Box<dyn SerialPort>, budget: Duration) {
+    let _ = port.clear(ClearBuffer::Output);
+    finish_close(path, budget, move || drop(port));
+}
+
+/// The bounded part of [`close_bounded`], over any closing action (the tests use a sleep).
+fn finish_close(path: &str, budget: Duration, close: impl FnOnce() + Send + 'static) {
+    if let Ok(mut c) = CLOSING.lock() {
+        c.insert(path.to_owned());
+    }
+    let start = Instant::now();
+    let (done_tx, done_rx) = mpsc::channel();
+    let owned = path.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("serial-close".into())
+        .spawn(move || {
+            close();
+            if let Ok(mut c) = CLOSING.lock() {
+                c.remove(&owned);
+            }
+            let _ = done_tx.send(());
+        });
+    if spawned.is_err() {
+        // No thread to spare: the closure (and the port in it) was dropped inline by the
+        // failed spawn, so the close has already happened here.
+        if let Ok(mut c) = CLOSING.lock() {
+            c.remove(path);
+        }
+        return;
+    }
+    match done_rx.recv_timeout(budget) {
+        Ok(()) => debug!(path, took = ?start.elapsed(), "closed gun serial port"),
+        Err(_) => warn!(
+            path,
+            "closing the gun's serial port is stuck in the kernel after {budget:?} (its firmware has wedged); leaving it to finish in the background — unplug and replug the gun"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quick_close_finishes_inside_the_budget() {
+        let path = "/dev/test-quick-close";
+        let t = Instant::now();
+        finish_close(path, Duration::from_secs(5), || {});
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(!closing(path));
+    }
+
+    #[test]
+    fn a_stuck_close_is_left_behind_and_blocks_reopening_until_done() {
+        let path = "/dev/test-stuck-close";
+        let t = Instant::now();
+        finish_close(path, Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let waited = t.elapsed();
+        assert!(waited < Duration::from_millis(300), "waited {waited:?}");
+        // A reopen that cannot wait long enough is refused rather than left hanging...
+        assert!(matches!(
+            await_close(path, Duration::from_millis(10)),
+            Err(GunError::CloseStuck(p)) if p == path
+        ));
+        // ...and one that can goes ahead once the close finally returns.
+        assert!(await_close(path, Duration::from_secs(5)).is_ok());
+        assert!(!closing(path));
     }
 }

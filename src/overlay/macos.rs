@@ -1,7 +1,11 @@
-//! The overlay on macOS: a borderless AppKit window covering the main screen, above other
-//! apps' windows (screen-saver level) and present on every Space including full-screen ones,
-//! that ignores the mouse and never becomes key, so the game underneath keeps focus and
-//! input. Pixels outside the opaque rectangles are transparent, as on the other backends.
+//! The overlay on macOS: a borderless AppKit window holding the largest rectangle of the
+//! display profile's aspect ratio that fits in the main screen's visible frame (below the
+//! menu bar, beside the Dock), centred — so on an ultrawide the tracked border is the same
+//! 16:9 rectangle the detector models and the game sits in, not the whole screen. It sits
+//! above other apps' windows (screen-saver level) and is present on every Space including
+//! full-screen ones, ignores the mouse and never becomes key, so the game underneath keeps
+//! focus and input. Pixels outside the opaque rectangles are transparent, as on the other
+//! backends. [`aim_map`] reports where the window sits, for mapping aim to gun positions.
 //!
 //! AppKit windows belong to the main thread, so this backend must be opened and pumped there;
 //! [`Backend::pump`] runs the AppKit event loop by hand for up to its timeout. Callers that
@@ -25,6 +29,7 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize};
 
 use super::draw::{self, Rect};
 use super::{Backend, Event};
+use crate::runtime::AimMap;
 
 /// Which pixels of an image are see-through.
 #[derive(Clone, Copy)]
@@ -138,8 +143,62 @@ struct MacOverlay {
     size: NSSize,
 }
 
-/// Open the overlay window. Must be called on the main thread.
-pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
+/// The largest `aspect` (width over height) rectangle that fits in `within`, centred, on
+/// whole points. A degenerate aspect returns `within` itself.
+fn fitted(within: NSRect, aspect: f64) -> NSRect {
+    let (w, h) = (within.size.width, within.size.height);
+    if !(aspect.is_finite() && aspect > 0.0 && w > 0.0 && h > 0.0) {
+        return within;
+    }
+    let (fw, fh) = if w / h > aspect {
+        (h * aspect, h)
+    } else {
+        (w, w / aspect)
+    };
+    NSRect::new(
+        NSPoint::new(
+            (within.origin.x + (w - fw) / 2.0).round(),
+            (within.origin.y + (h - fh) / 2.0).round(),
+        ),
+        NSSize::new(fw.round(), fh.round()),
+    )
+}
+
+/// The map from percent of `rect` to percent of `frame`, both in top-left-origin
+/// coordinates (AppKit rects count from the bottom left; the gun's pointer, like the
+/// cursor, counts from the top).
+fn map_between(frame: NSRect, rect: NSRect) -> AimMap {
+    AimMap {
+        scale: [
+            rect.size.width / frame.size.width,
+            rect.size.height / frame.size.height,
+        ],
+        offset: [
+            (rect.origin.x - frame.origin.x) / frame.size.width * 100.0,
+            ((frame.origin.y + frame.size.height) - (rect.origin.y + rect.size.height))
+                / frame.size.height
+                * 100.0,
+        ],
+    }
+}
+
+/// Where the overlay window for `aspect` sits on the main screen, as the map from border
+/// percent to the screen percent the gun's absolute pointer spans: apply it to an aim
+/// before sending the position, and the cursor lands where the gun points even though the
+/// border covers only part of the screen. Must be called on the main thread.
+pub fn aim_map(aspect: f64) -> Result<AimMap> {
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| anyhow!("the overlay placement must be read on the main thread"))?;
+    let screen = NSScreen::mainScreen(mtm).ok_or_else(|| anyhow!("no screen"))?;
+    Ok(map_between(
+        screen.frame(),
+        fitted(screen.visibleFrame(), aspect),
+    ))
+}
+
+/// Open the overlay window, letterboxed to `aspect` within the main screen's visible
+/// frame. Must be called on the main thread.
+pub fn open(_title: &str, aspect: f64) -> Result<Box<dyn Backend>> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the macOS overlay must run on the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -148,7 +207,7 @@ pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
     app.finishLaunching();
 
     let screen = NSScreen::mainScreen(mtm).ok_or_else(|| anyhow!("no screen"))?;
-    let frame = screen.frame();
+    let frame = fitted(screen.visibleFrame(), aspect);
     // SAFETY: NSWindow's designated initializer with valid arguments.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -186,7 +245,7 @@ pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
 }
 
 impl Backend for MacOverlay {
-    /// The screen in points; the scene is drawn at that size and AppKit scales it to the
+    /// The window in points; the scene is drawn at that size and AppKit scales it to the
     /// display's backing pixels.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn size(&self) -> (u32, u32) {
@@ -237,9 +296,59 @@ impl Drop for MacOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::inside;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    use super::{fitted, inside, map_between};
     use crate::overlay::draw::{self, border_rects, BLACK, WHITE};
     use crate::overlay::Scene;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// An ultrawide visible frame is height-limited: a 16:9 window pillarboxed in its
+    /// middle; a 5:4 screen is width-limited: letterboxed. A junk aspect changes nothing.
+    #[test]
+    fn fitted_letterboxes_to_the_aspect() {
+        let f = fitted(rect(0.0, 40.0, 3440.0, 1400.0), 2.0);
+        assert_eq!(
+            (f.origin.x, f.origin.y, f.size.width, f.size.height),
+            (320.0, 40.0, 2800.0, 1400.0)
+        );
+        let f = fitted(rect(0.0, 0.0, 1280.0, 1024.0), 16.0 / 9.0);
+        assert_eq!(
+            (f.origin.x, f.origin.y, f.size.width, f.size.height),
+            (0.0, 152.0, 1280.0, 720.0)
+        );
+        let within = rect(3.0, 7.0, 100.0, 50.0);
+        assert_eq!(fitted(within, 0.0), within);
+        assert_eq!(fitted(within, f64::NAN), within);
+    }
+
+    /// The map must send the window's corners to its screen position in top-left-origin
+    /// percent: AppKit's bottom-left y has to flip.
+    #[test]
+    fn map_between_flips_y_and_scales() {
+        // A 2800x1400 window at (320, 40) on a 3440x1440 screen: 40 points of menu bar
+        // left above it (bottom-left y 0..40 is below, 1440-40-1400 = 0 above). Make the
+        // gap asymmetric to catch a flip: window at bottom-left y 15, so 25 points above.
+        let m = map_between(
+            rect(0.0, 0.0, 3440.0, 1440.0),
+            rect(320.0, 15.0, 2800.0, 1400.0),
+        );
+        let close =
+            |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
+        // Top-left of the border (0%, 0%) sits 320 points in and 25 points down.
+        assert!(close(
+            m.apply([0.0, 0.0]),
+            [320.0 / 3440.0 * 100.0, 25.0 / 1440.0 * 100.0]
+        ));
+        // Bottom-right (100%, 100%) sits at 3120 points across, 1425 points down.
+        assert!(close(
+            m.apply([100.0, 100.0]),
+            [3120.0 / 3440.0 * 100.0, 1425.0 / 1440.0 * 100.0]
+        ));
+    }
 
     /// A border-only scene still paints the calibration status panel; only the border's
     /// rectangles may show, as on the shaped Linux windows.

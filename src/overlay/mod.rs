@@ -28,6 +28,8 @@ use anyhow::bail;
 use anyhow::Result;
 
 pub use draw::Rect;
+#[cfg(target_os = "macos")]
+pub use macos::aim_map;
 pub use scene::{Quality, Scene, SolveInfo};
 
 /// What a backend's event pump reports.
@@ -55,9 +57,10 @@ pub trait Backend {
 
 /// Open a window on whatever window system the environment names: Wayland first (a
 /// Wayland session usually offers X11 through XWayland too, but the layer shell is the
-/// only way to stay above a fullscreen game there), then X11.
+/// only way to stay above a fullscreen game there), then X11. Both cover the whole
+/// output; `_aspect` is macOS-only for now.
 #[cfg(target_os = "linux")]
-pub fn open(title: &str) -> Result<Box<dyn Backend>> {
+pub fn open(title: &str, _aspect: f64) -> Result<Box<dyn Backend>> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         match wayland::open(title) {
             Ok(b) => return Ok(b),
@@ -73,35 +76,37 @@ pub fn open(title: &str) -> Result<Box<dyn Backend>> {
     bail!("no display: neither WAYLAND_DISPLAY nor DISPLAY is set")
 }
 
-/// Open the overlay window. On macOS this must be called on the main thread.
+/// Open the overlay window, letterboxed to `aspect` (the display profile's, so the border
+/// matches what the detector models) within the screen's visible frame. Must be called on
+/// the main thread.
 #[cfg(target_os = "macos")]
-pub fn open(title: &str) -> Result<Box<dyn Backend>> {
-    macos::open(title)
+pub fn open(title: &str, aspect: f64) -> Result<Box<dyn Backend>> {
+    macos::open(title, aspect)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn open(_title: &str) -> Result<Box<dyn Backend>> {
+pub fn open(_title: &str, _aspect: f64) -> Result<Box<dyn Backend>> {
     bail!("the overlay is not implemented on this platform yet")
 }
 
 /// Show `scene` until `stop` is set or the window goes away, and set `stop` when the
 /// window goes away, so a calibration whose overlay vanished ends instead of measuring
 /// blind. Redraws only when the scene changes (or the window asks), so a static border
-/// costs nothing while a game runs.
-pub fn run(scene: Arc<Mutex<Scene>>, stop: Arc<AtomicBool>) -> Result<()> {
-    let r = run_inner(&scene, &stop);
+/// costs nothing while a game runs. `aspect` letterboxes the window (macOS).
+pub fn run(scene: Arc<Mutex<Scene>>, stop: Arc<AtomicBool>, aspect: f64) -> Result<()> {
+    let r = run_inner(&scene, &stop, aspect);
     stop.store(true, Ordering::Relaxed);
     r
 }
 
 /// Like [`run`], but losing the window does not stop anything else: the guns keep
 /// tracking whether or not the border is on screen.
-pub fn run_until(scene: Arc<Mutex<Scene>>, stop: &AtomicBool) -> Result<()> {
-    run_inner(&scene, stop)
+pub fn run_until(scene: Arc<Mutex<Scene>>, stop: &AtomicBool, aspect: f64) -> Result<()> {
+    run_inner(&scene, stop, aspect)
 }
 
-fn run_inner(scene: &Mutex<Scene>, stop: &AtomicBool) -> Result<()> {
-    let mut win = open("sindenrs")?;
+fn run_inner(scene: &Mutex<Scene>, stop: &AtomicBool, aspect: f64) -> Result<()> {
+    let mut win = open("sindenrs", aspect)?;
     let mut px: Vec<u32> = Vec::new();
     let mut last: Option<(Scene, (u32, u32))> = None;
     while !stop.load(Ordering::Relaxed) {

@@ -341,24 +341,27 @@ impl super::Backend for WaylandBackend {
     }
 }
 
-/// Convert `0x00RRGGBB` pixels into the surface's ARGB8888 buffer: black becomes fully
-/// transparent, everything else fully opaque, and everything outside `opaque` (when given) is
-/// transparent whatever its colour, so only the rectangles the caller named exist on screen.
+/// Convert `0x00RRGGBB` pixels into the surface's ARGB8888 buffer. With `opaque` given, only
+/// those rectangles exist on screen: black inside them is transparent, everything else in
+/// them opaque, and everything outside them transparent whatever its colour. Without it the
+/// whole surface is opaque, black included (the calibration backdrop): the opaque region
+/// then claims every pixel, and a transparent pixel under that claim shows whatever the
+/// compositor last left there, so old frames smear across the screen.
 fn write_argb(canvas: &mut [u8], px: &[u32], w: u32, h: u32, opaque: Option<&[Rect]>) {
     canvas.fill(0);
     let (w, h) = (w as usize, h as usize);
-    let mut row = |y: usize, x0: usize, x1: usize| {
+    let mut row = |y: usize, x0: usize, x1: usize, black: u32| {
         let src = &px[y * w + x0..y * w + x1];
         let dst = &mut canvas[(y * w + x0) * 4..(y * w + x1) * 4];
         for (p, c) in src.iter().zip(dst.chunks_exact_mut(4)) {
-            let argb = if *p == 0 { 0 } else { 0xFF00_0000 | *p };
+            let argb = if *p == 0 { black } else { 0xFF00_0000 | *p };
             c.copy_from_slice(&argb.to_le_bytes());
         }
     };
     match opaque {
         None => {
             for y in 0..h {
-                row(y, 0, w);
+                row(y, 0, w, 0xFF00_0000);
             }
         }
         Some(rects) => {
@@ -371,7 +374,7 @@ fn write_argb(canvas: &mut [u8], px: &[u32], w: u32, h: u32, opaque: Option<&[Re
                 let x1 = (x0 + r.w as usize).min(w);
                 let y1 = (y0 + r.h as usize).min(h);
                 for y in y0..y1 {
-                    row(y, x0, x1);
+                    row(y, x0, x1, 0);
                 }
             }
         }
@@ -482,3 +485,32 @@ delegate_output!(State);
 delegate_shm!(State);
 delegate_layer!(State);
 delegate_registry!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::{write_argb, Rect};
+
+    fn alpha(canvas: &[u8], i: usize) -> u8 {
+        canvas[i * 4 + 3]
+    }
+
+    /// With the whole surface claimed opaque, black must be opaque too, or the compositor
+    /// shows stale content through it.
+    #[test]
+    fn opaque_surface_keeps_black_opaque() {
+        let px = [0, 0x00FF_FFFF, 0, 0];
+        let mut canvas = [0u8; 16];
+        write_argb(&mut canvas, &px, 2, 2, None);
+        assert!((0..4).all(|i| alpha(&canvas, i) == 0xFF));
+    }
+
+    /// With named rectangles only their non-black pixels exist.
+    #[test]
+    fn border_rects_leave_black_and_outside_transparent() {
+        let px = [0x00FF_FFFF, 0, 0x00FF_FFFF, 0x00FF_FFFF];
+        let mut canvas = [0u8; 16];
+        let rects = [Rect { x: 0, y: 0, w: 2, h: 1 }];
+        write_argb(&mut canvas, &px, 2, 2, Some(&rects));
+        assert_eq!([0, 1, 2, 3].map(|i| alpha(&canvas, i)), [0xFF, 0, 0, 0]);
+    }
+}

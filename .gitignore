@@ -44,3 +44,6 @@ corpus/
 
 # Vendor firmware images (not ours to redistribute; supply locally)
 firmware/
+
+# Local Claude Code workflow commands (keep out of the public fork)
+.claude/

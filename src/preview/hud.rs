@@ -26,6 +26,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSTimer};
 
 use super::{aim_marker, Live};
 use crate::overlay::macos::{ns_image, Clear};
+use crate::runtime::AimMap;
 
 /// Guns the display has room for: panels stack up from the bottom-left corner.
 const MAX_GUNS: usize = 4;
@@ -60,8 +61,11 @@ fn image_view(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSImageView> {
     v
 }
 
-/// Open the display over the main screen. Must be called on the main thread.
-pub fn open(live: Arc<Mutex<Live>>) -> Result<Hud> {
+/// Open the display over the main screen. Aim points arrive in border percent, so `aim`
+/// (the overlay's placement) turns them into screen percent for the reticle, the same map
+/// the tracker applies to the positions it sends the gun. Must be called on the main
+/// thread.
+pub fn open(live: Arc<Mutex<Live>>, aim: AimMap) -> Result<Hud> {
     let mtm =
         MainThreadMarker::new().ok_or_else(|| anyhow!("the HUD must run on the main thread"))?;
     let screen = NSScreen::mainScreen(mtm).ok_or_else(|| anyhow!("no screen"))?;
@@ -150,7 +154,8 @@ pub fn open(live: Arc<Mutex<Live>>) -> Result<Hud> {
         for slot in slots.iter_mut() {
             let gun = guns.next();
             match gun.and_then(|g| g.aim).filter(|_| l.reticle) {
-                Some([x, y]) => {
+                Some(a) => {
+                    let [x, y] = aim.apply(a);
                     slot.reticle.setFrameOrigin(NSPoint::new(
                         x / 100.0 * sw - marker_size / 2.0,
                         (1.0 - y / 100.0) * sh - marker_size / 2.0,

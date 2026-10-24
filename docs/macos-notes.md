@@ -416,3 +416,223 @@ Dreamcast only detects peripherals at boot), aiming, shooting and pump reload wo
 mapping file reads `1:reload`, `2:btn_a`, `3:btn_b`, which looked swapped by SDL's numbering but
 is right: Flycast numbers mouse buttons 2 = left, 1 = right, 3 = middle. Setup in
 `docs/macos-emulators.md`.
+
+## 2026-10-15 — macOS does not honour the gun's absolute HID pointer; the driver moves the cursor itself
+
+The port's founding assumption (see `macos-plan.md`, "host software's job") was that once the
+driver writes a position to the gun over serial, the gun's own absolute HID mouse moves the
+system cursor, exactly as on Windows and Linux. On a new 2026 gun (firmware 1.9, SindenCamC
+camera board) that is false: the cursor sat pinned in the top-left corner while the camera
+tracked perfectly. macOS has no path that turns an absolute-coordinate HID pointer into cursor
+movement — it ignores the coordinates (or reads them as relative deltas), so the pointer pegs
+in a corner. The emulator work earlier in this log worked because those games read the gun's
+HID *mouse* device directly; the browser arcade pages (github.com/TheTomBritton/arcade-webport) read the OS cursor,
+which never moved. The driver's own HUD reticle moves from the same aim, so it is easy to
+mistake a working reticle for a working cursor.
+
+Fix (`src/cursor.rs`, macOS only, `core-graphics` dependency): the driver moves the system
+cursor itself from the aim it already computes, posting Core Graphics mouse events —
+`CGWarpMouseCursorPosition` for the visible move (works without any grant) plus a posted
+`MouseMoved`/`LeftMouseDragged` so a trusted app receives it. The trigger becomes a posted
+`LeftMouseDown`/`Up`, driven by the gun's trigger bit over the serial event stream. On macOS
+the tracker no longer streams position (command 40) to the gun, so its HID pointer cannot fight
+the synthesised cursor (`runtime::run_tracker_with`, cfg-gated). Confirmed live: the cursor
+tracks the gun. Posting clicks into another app needs the Accessibility grant; the cursor still
+*moves* without it (the warp does not need it).
+
+Trigger pulled the cursor to the top-left even after that: the gun still fired its *own* HID
+left-click on each trigger pull, and since the driver stopped streaming it a position, that HID
+report carried a stale corner position — so macOS snapped the cursor to 0,0 while the
+synthesised click still registered (proof that macOS does read the gun's HID mouse on button
+events). `Buttons::mask_synthesised()` (macOS) now blanks the trigger's HID action so only the
+synthesised click drives it; the physical trigger still arrives over serial (raw bits,
+independent of the action map) and recoil is unaffected (gated by `recoil.on_trigger`). The
+pedal and middle-click still ride the gun's HID and will need the same treatment once their
+serial bits are mapped (only the trigger, state1 bit 0, is known for certain).
+
+Jitter tuning: with a new camera board, `lens_k1` was refit from a 5632-frame recording
+(`debug track --preview --record <dir>`, then `debug replay --fit-lens`): best **-0.1489**
+(rms 1.18 px) versus the old module's -0.178, which over-corrected and warped aim with distance.
+`display.hover_smoothing` lowered 0.5 → 0.3. The fit also showed ~8% hull-only (unreliable)
+solves with the border running off the camera frame at close range — stand back far enough that
+the whole border fits. Capture gotcha: right after the app quits, the gun resets and its
+hub-powered camera drops off the bus for over a second, so auto-discovery finds no camera —
+pass `--device <uniqueID>` and/or wait longer.
+
+## 2026-10-15 — evening: permissions, the silent button stream, and a serial wedge cornered
+
+A long live session against the browser arcade (Time Crisis 1, the web calibration suite).
+Tracking ended the evening solid; the trigger click is still not landing, but every layer above
+the last one has been proven out, and the remaining fault is cornered to a binary question.
+
+**Permissions (solved).** The grants kept resetting because no code-signing identity existed on
+this machine — every build was ad hoc, and each reinstall produced a "new" app to TCC.
+`tools/macos/make-cert.sh` now creates the self-signed `sindenrs_macos_dev` identity from the
+command line (OpenSSL 3 needs `-legacy` for a PKCS#12 that `security import` accepts); the app's
+designated requirement is stable across rebuilds and the camera grant holds. macOS 27 folds the
+old Accessibility pane into **Privacy & Security → Device Control and Data Access**, and the
+app now prompts its way into that list (`AXIsProcessTrustedWithOptions` with the prompt option)
+and checks/requests the post-event grant separately (`CGPreflightPostEventAccess` /
+`CGRequestPostEventAccess`), logging both. Gotcha that cost an hour: TCC held **two records per
+service** (one from the ad-hoc era, one from the cert era) and the stale denied one shadowed the
+visible toggle — `tccutil reset Accessibility|PostEvent dev.sindenrs.sindenrs`, then a fresh
+grant, and the log finally read `event posting granted`. Synthesised events are now posted at
+the Session tap rather than the HID tap.
+
+**Cursor behaviour (solved).** The driver no longer warps the cursor when the border is not in
+view — warping the last aim at 60 Hz pinned the cursor against the trackpad and made the
+desktop unusable (it read as "stutter" and "the mouse is disabled"). It now drives only on a
+fresh line-based aim, releases the cursor otherwise, and hides the OS arrow while aiming
+(`CGDisplayHideCursor` after granting the connection `SetsCursorInBackground`, since the game,
+not the driver, is frontmost). Front-left and front-right are synthesised as right/middle
+clicks from their serial bits (state1 bits 1 and 3, slot order confirmed on hardware) and
+masked from the gun's HID; pump still rides the HID and snaps to the corner — its serial bit is
+still uncaptured.
+
+**For the browser games, the native overlay must be off.** The web pages draw their own 4:3
+border and `aim.js` maps the full-screen aim fraction onto the canvas box itself: the driver's
+letterboxed 16:9 overlay put a second border on screen *and* remapped aim into its own
+rectangle (`overlay = false` in the config now; identity aim map). No aspect switch belongs in
+the driver — the web layer owns the 4:3 geometry.
+
+**The silent button stream (root-caused, fix unverified).** `run` on macOS never received a
+single serial button report from this gun all day, with every grant open. The reason: firmware
+1.9's "secondary serial" rides the position traffic — no positions in, no button reports out —
+and the macOS driver had deliberately stopped streaming positions when the cursor synthesis
+went in. Positions are streamed again (the HID pointer they feed stays ignored), from the first
+frame (centre until an aim exists, then the last aim while the border is away, since the pedal
+is pressed exactly while ducking). `debug monitor` only ever saw reports because it streams a
+held position; it also needs its own `set_secondary_serial(true)` after streaming starts (added,
+with a prepare_gun re-send after 121 for good measure).
+
+**The remaining fault: serial writes wedge when the camera runs in-process.** With positions
+restored, `run`'s writes time out (~1 s in, even at a 150 ms budget, raised from 20 ms) and the
+heartbeat dies — so the button theory is still untested in `run`. Hands-free bisects:
+`debug monitor` + `debug camera capture` in a *separate process* (with the UVC exposure write):
+2700/2700 writes clean. `debug track --send` (camera *in-process*): writes wedge in 0.8 s.
+Next session's question, one replug and 40 s: full config then `monitor` (no camera) — if
+writes die it is something in `apply_config`; if clean it is in-process AVFoundation vs the
+serial stack, and the camera moves to its own process or the writes to a retry queue.
+
+**Teardown and the run lock.** A wedged gun blocks the serial `close()` in the kernel; the
+process hangs mid-exit (kill leaves a `?E` husk) still holding the run-lock flock, so
+relaunching said "already running" until a replug. The lock file now carries the holder's pid,
+and a holder whose executable no longer resolves (`proc_pidpath`) is retired by unlinking the
+file — flock is per-inode, so a fresh file locks cleanly and relaunch works. The close itself
+still needs bounding: it hung even after a session with zero position writes, so it is not
+(only) the write backlog.
+
+**To-do, in order:** finish the wedge bisect (config burst vs in-process camera); verify the
+trigger click end to end; capture pump's serial bit and synthesise it; bound the serial close;
+background-at-login (`login-item.sh install`) once a session survives; the Calibrate-menu hang;
+a native calibration/config GUI (user request — today everything above the gun lives in
+`config.toml`; the web suite covers the browser side).
+
+## 2026-10-16 (00:10) — the gun's HID pointer works on macOS after all
+
+The decisive experiment, right at the end of the night: `debug monitor` now applies the gun's
+real configuration first (17103f8), and with the full config + streamed positions and **no
+camera, no synthesised events, no Core Graphics at all**, the system cursor locked to the held
+(50%, 50%) — the gun's own absolute HID pointer moved the macOS cursor — and the trigger
+clicked, as plain hardware input needing no permission.
+
+So the founding 2026-10-15 diagnosis ("macOS ignores an absolute-coordinate HID pointer") was
+at least partly wrong: the pointer works once the configuration burst has been applied and the
+positions actually reach the gun. The original pegged-at-0,0 cursor is now best explained by
+the old 20 ms port timeout silently dropping nearly every position write on macOS (the budget
+is 150 ms since ebec748), possibly together with a missing/incomplete configuration. The whole
+Core Graphics cursor-synthesis layer, the Accessibility/PostEvent hunt and the click
+synthesis may therefore be unnecessary — the Linux model (stream positions, let the gun's HID
+do pointer and buttons) may simply work. Plan for next session:
+
+1. Reproduce HID tracking in `run`: disable the cursor machinery (a `--no-cursor`/config
+   switch) so the warp and posted events cannot fight the now-live HID pointer — quite
+   possibly the remaining "writes wedge ~1 s into tracking" is exactly that fight, since
+   monitor (no cursor machinery) streams clean for minutes and `track --send` (with it)
+   wedges in under a second. Unmask the HID buttons (drop mask_synthesised) for the test.
+2. If HID tracking holds: retire the synthesis path to a fallback, keep the hover smoothing
+   on the driver side (positions sent to the gun are already smoothed), and the permission
+   story collapses to Camera only.
+3. The post-configuration close hang is real and separate: `debug setup` (config, no
+   streaming, no camera) completes its work in 57 ms and then hangs closing the port, and the
+   configured `monitor` hung the same way after its loop — reproduced twice on a fresh gun.
+   Bound the close (or find which configuration command leaves the CDC device undrainable).
+4. Beware stdout block-buffering in captured debug sessions: a killed process loses its
+   buffered `println!` lines (the monitor's button-report evidence died that way — tracing's
+   stderr survives). Flush or log through tracing for bench tools.
+
+## 2026-10-16 (overnight) — a cursor switch, a bounded close, and the bench for the morning
+
+Work done without the hardware (the gun was left plugged in; nothing below touched it), so
+everything here builds, lints and passes the tests but is **not yet verified on the gun**.
+
+**A live capture of the close hang.** The `run` started at 00:13 was still up at 01:00. Its
+log stops at a single "position write timed out" a second into tracking, and `sample` showed
+why: the tracker thread had left its loop (120 consecutive write timeouts, ~18 s at the 150 ms
+budget) and had sat in `close()` on the gun's port ever since, inside `Gun`'s drop at the end of
+`run_tracker_with` — 45 minutes and counting. The supervisor was asleep waiting for it, AppKit
+still turned (main thread in `mach_msg`), and no error was ever logged because the error is
+returned after the drop. The same night's `debug track` log shows the write stall's other face:
+every report line says `proc=158 ms`, which is the 150 ms write timeout plus ~8 ms of real work
+(`proc` is measured after the position write), so the loop ran at ~6 Hz while the camera kept
+delivering 60. A wedged gun means every write waits out its full budget.
+
+**`[global] cursor = "driver" | "gun"`** (and `--cursor` on `run` and `debug track`) chooses
+what moves the macOS cursor. `driver` is the behaviour so far and stays the default. `gun`
+behaves as on Linux: no `Cursor` (so no Accessibility or PostEvent prompt), the gun's HID mouse
+buttons stay mapped, positions stream at the best aim every frame once there has been one, and
+no centre heartbeat before the first aim. Calibrate now masks the HID mouse buttons in driver
+mode too, as `run` and `track` already did.
+
+**Bounded serial close.** `Gun`'s drop now (1) marks the descriptor `O_NONBLOCK` — the BSD tty
+close drains the output queue unless the file is non-blocking, and flushes it instead when it is
+— and (2) closes on a thread of its own with a 1 s budget. Past the budget the thread is left to
+finish whenever it can and the port is held as closing; reopening it (or the bootloader touch)
+waits up to 2 s for that close, then fails with "unplug the gun and plug it back in" instead of
+queueing behind it. The close logs its duration at debug level. A process that exits with a close
+still stuck still hangs on its way out (the run lock copes with that husk), but the tracker
+thread, `run`'s supervisor and its UI no longer go down with it.
+
+**`run`'s teardown keeps AppKit turning** until the gun supervisor has finished, then joins it
+(`menubar::pump_while`): the border's `orderOut` only lands when the event loop turns, which is
+why the border froze on screen after the Calibrate menu item. With the bounded close the wind-down
+takes at most about a second per gun.
+
+**Bench knobs.** Hidden `debug track --heartbeat` streams the centre from the first frame in any
+cursor mode (without it a hands-free `--cursor gun` run sends nothing and would pass trivially),
+and hidden `--mask-buttons true|false` decouples the HID-button masking from the cursor mode.
+`tools/macos/bench-wedge.sh gun|driver [masked|unmasked] [norecoil]` runs the 900-frame
+hands-free test (hidden `--no-recoil` leaves recoil off, as `debug monitor` does),
+waits for the summary rather than the process exit, and prints CLEAN/WEDGED and how the close
+went. Differences between the clean `debug monitor` and the wedging `track --send`: the
+camera running in-process (a camera in a separate process was clean, but the in-process one has
+never run without the rest), the Core Graphics cursor, the masked button map, recoil left
+enabled (monitor disables it), and writes paced by camera frames rather than a timer. Note that
+a hands-free run never warps the cursor — with no border in view there is no aim, and the
+synthesised cursor only moves on one — so the hands-free wedge cannot be the warp fighting the
+HID pointer, as the 00:10 entry guessed; at most it is something `Cursor::new` sets up
+(Accessibility/PostEvent checks, background cursor control).
+
+**Two corrections.** Rust's stdout is line-buffered even into a file (a SIGKILLed test program
+kept every `println!` line), so the lost monitor output was not buffering: `run-bundled.sh`
+deleted the previous run's log at the start of the next, and only printed a log once its run
+exited. Each run now keeps its own log under `target/macos/logs/` (`sindenrs.log` links to the
+latest). And `bundle.sh` copied the new binary over the bundle's in place, which kills a
+still-running copy of the app (its code signature goes invalid under it); it replaces the file
+now.
+
+**Morning test, in order** (quit the running app first — menu bar item, or
+`tools/macos/stop.sh`; it is stuck in the close, so expect a husk — then **replug the gun**, and
+`cargo build`):
+
+1. `tools/macos/bench-wedge.sh gun` — no Core Graphics, unmasked buttons, recoil on. Also read
+   the `close:` line (fast = the non-blocking close works). Replug after any WEDGED run.
+2. If 1 is CLEAN: `bench-wedge.sh gun masked` (the masked button map) and
+   `bench-wedge.sh driver unmasked` (the `Cursor::new` setup) — whichever wedges is the culprit.
+   If 1 is WEDGED: `bench-wedge.sh gun norecoil` — clean means recoil-on is the poison; wedged
+   leaves the in-process camera or the frame-paced writes (next: the camera in its own process,
+   or the writes on a timer thread with a latest-position slot).
+3. Then the real thing: `tools/macos/run-bundled.sh -- run --cursor gun` with a game page up —
+   aim, trigger, pedal, coin; quit from the menu (the border should vanish at once).
+4. If the HID model holds, make `gun` the default and retire the synthesis to a fallback; the
+   permission story becomes Camera only.

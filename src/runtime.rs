@@ -13,14 +13,44 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use crate::camera::source::{Camera, Next};
-use crate::config::{Display, GunConfig};
+use crate::config::{CursorDriver, Display, GunConfig};
 use crate::gun::Gun;
+use crate::gun::GunError;
 use crate::protocol::percent_to_axis;
 use crate::vision::acquire::{
     acquire, aim_pixel, flip_luma, flip_point, AcquireParams, Flip, Quad,
 };
 use crate::vision::lens::Lens;
 use crate::vision::luma;
+
+/// Linear map from an aim in border percent to the position percent sent to the gun, whose
+/// absolute pointer the OS spreads over the whole screen: `sent = aim * scale + offset`,
+/// per axis, top-left origin. Identity when the border fills the screen; on macOS the
+/// overlay letterboxes itself to the display profile's aspect below the menu bar, and
+/// [`crate::overlay::aim_map`] says where it ended up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AimMap {
+    pub scale: [f64; 2],
+    pub offset: [f64; 2],
+}
+
+impl Default for AimMap {
+    fn default() -> Self {
+        Self {
+            scale: [1.0; 2],
+            offset: [0.0; 2],
+        }
+    }
+}
+
+impl AimMap {
+    pub fn apply(self, p: [f64; 2]) -> [f64; 2] {
+        [
+            p[0] * self.scale[0] + self.offset[0],
+            p[1] * self.scale[1] + self.offset[1],
+        ]
+    }
+}
 
 /// What one tracking loop does.
 #[derive(Clone, Debug)]
@@ -51,6 +81,14 @@ pub struct TrackerOptions {
     pub per_frame: bool,
     /// Report a status line every `report_every` (None = never).
     pub report_every: Option<Duration>,
+    /// Map from border percent to the screen percent sent to the gun (see [`AimMap`]).
+    pub aim_map: AimMap,
+    /// What moves the cursor on macOS (config: global.cursor); Linux always uses the gun.
+    pub cursor: CursorDriver,
+    /// Stream positions from the first frame (the centre until there is an aim) whatever
+    /// moves the cursor — a synthesised cursor always does. For bench runs, so a hands-free
+    /// session exercises the serial writes the way `run` does with the gun in use.
+    pub heartbeat: bool,
 }
 
 /// One processed frame, handed to the caller's hook.
@@ -278,18 +316,11 @@ pub fn run_tracker_with(
         crate::config::Flip::Vertical => Flip::Vertical,
         crate::config::Flip::Both => Flip::Both,
     });
-    let (mut cal_x, mut cal_y) = (opts.cal_x, opts.cal_y);
-    if let Some((g, gc)) = gun.as_mut() {
-        cal_x = cal_x.or(gc.calibration.map(|c| c[0]));
-        cal_y = cal_y.or(gc.calibration.map(|c| c[1]));
-        if cal_x.is_none() {
-            cal_x = Some(g.calibration_x()?.0);
-        }
-        if cal_y.is_none() {
-            cal_y = Some(g.calibration_y()?.0);
-        }
-    }
-    let (cal_x, cal_y) = (cal_x.unwrap_or(0.0), cal_y.unwrap_or(0.0));
+    // No gun queries here: by now the gun is streaming (see `prepare_gun`, which read the
+    // EEPROM offset for the caller to pass in `opts`); the config's value is the fallback.
+    let cal = gun.as_ref().and_then(|(_, gc)| gc.calibration);
+    let cal_x = opts.cal_x.or(cal.map(|c| c[0])).unwrap_or(0.0);
+    let cal_y = opts.cal_y.or(cal.map(|c| c[1])).unwrap_or(0.0);
     // The bore offset lives in the camera's frame, so it must go through the same flip as the
     // image; otherwise it is applied backwards and every aim point carries twice the offset.
     let aim_px = flip_point(aim_pixel(w, h, cal_x, cal_y, orientation), w, h, flip);
@@ -345,6 +376,24 @@ pub fn run_tracker_with(
     let mut smoother = HoverSmoother::new(4.0, opts.hover_smoothing);
     let mut held = 0u64;
     let mut events = 0u64;
+    let mut writes = Writes::default();
+    // With `cursor = "driver"` on macOS the driver moves the system cursor itself from the same
+    // aim; positions (command 40) are still streamed to the gun, since its firmware only emits
+    // button reports while position traffic flows. With `cursor = "gun"`, and always on Linux
+    // and Windows, the gun's own HID pointer is the cursor and this stays `None`.
+    #[cfg(target_os = "macos")]
+    let mut cursor = if gun.is_some() && opts.cursor == CursorDriver::Driver {
+        Some(crate::cursor::Cursor::new()?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let synthesising = cursor.is_some();
+    #[cfg(not(target_os = "macos"))]
+    let synthesising = {
+        let _ = opts.cursor;
+        false
+    };
     let mut window_start = Instant::now();
     let mut window_frames = 0u32;
     let mut fps = 0.0;
@@ -386,6 +435,7 @@ pub fn run_tracker_with(
         let t0 = Instant::now()
             .checked_sub(frame.decode)
             .unwrap_or_else(Instant::now);
+        writes.frame = Duration::ZERO;
         let l = frame.luma;
         flip_luma(l, w, flip);
         let quad = acquire(l, w, h, &params);
@@ -427,16 +477,57 @@ pub fn run_tracker_with(
                 smoother.reset();
             }
             if let Some((g, _)) = gun.as_mut() {
-                if let Some([x, y]) = aim.or(last_aim) {
-                    g.set_position(percent_to_axis(x), percent_to_axis(y))?;
+                if synthesising {
+                    // The synthesised cursor moves only on a fresh, confident (line-based)
+                    // aim. On a weak frame — a hull fallback or a jump the guard held — it
+                    // stays where it is instead of re-warping to the last point, so it never
+                    // fights the user's trackpad and never stutters between a strong and weak
+                    // solve. The aim is streamed to the gun as well — not for its HID pointer
+                    // (which would fight the warp) but because firmware 1.9's secondary serial
+                    // rides the position traffic: with no positions in, no button reports out.
+                    #[cfg(target_os = "macos")]
+                    if let (Some(a), Some(c)) = (aim, cursor.as_mut()) {
+                        let [x, y] = opts.aim_map.apply(a);
+                        c.move_to(x, y)?;
+                        send_position(g, x, y, &mut writes)?;
+                    }
+                } else if let Some(a) = aim.or(last_aim) {
+                    // The gun's own HID pointer is the cursor: hold it at the best available
+                    // aim every frame.
+                    let [x, y] = opts.aim_map.apply(a);
+                    send_position(g, x, y, &mut writes)?;
                 }
             }
             last_quad = Some(*q);
         } else {
             guard.lost();
             smoother.reset();
-            if let (Some((g, _)), Some(prev)) = (gun.as_mut(), last_aim) {
-                g.set_position(percent_to_axis(prev[0]), percent_to_axis(prev[1]))?;
+            // The border is not in view: the gun is pointed away or set down. A synthesised
+            // cursor stops being driven entirely so the trackpad regains control — continuing
+            // to warp it to the last aim 60x/s would pin it against the user's own pointer,
+            // which reads as the cursor stuttering and the mouse being stuck. It stays put
+            // until the gun is aimed at the screen again. The gun's HID pointer holds the last
+            // position instead. Either way the gun keeps receiving the last aim: the
+            // firmware's button reports ride the position traffic, and the pedal is pressed
+            // exactly while the gun points away (ducking behind cover).
+            #[cfg(target_os = "macos")]
+            if let Some(c) = cursor.as_mut() {
+                c.release();
+            }
+            // A synthesised cursor gets the heartbeat from the first frame (centre until an
+            // aim exists): firmware 1.9 needs position traffic before it reports buttons at
+            // all, and the synthesised clicks come from those reports. With the gun's HID
+            // pointer as the cursor, positions start once there has been an aim, as on Linux
+            // — parking the cursor mid-screen unasked would be visible, and the HID buttons
+            // click without the serial reports.
+            let heartbeat = if synthesising || opts.heartbeat {
+                Some(last_aim.unwrap_or([50.0, 50.0]))
+            } else {
+                last_aim
+            };
+            if let (Some((g, _)), Some(p)) = (gun.as_mut(), heartbeat) {
+                let [x, y] = opts.aim_map.apply(p);
+                send_position(g, x, y, &mut writes)?;
             }
         }
         if aim.is_some() {
@@ -452,6 +543,25 @@ pub fn run_tracker_with(
         if let Some((g, _)) = gun.as_mut() {
             frame_events = g.poll_events()?;
             events += frame_events.len() as u64;
+            // With a synthesised cursor the gun's default mouse buttons become synthesised
+            // clicks (its masked HID buttons would land wherever its stale pointer sits). The
+            // trigger is a left click, front-left a right click and front-right a middle click;
+            // keys and the d-pad keep coming through the gun's own HID, which macOS honours.
+            #[cfg(target_os = "macos")]
+            if let Some(c) = cursor.as_mut() {
+                use crate::cursor::SynthButton;
+                for ev in &frame_events {
+                    if let Some(held) = ev.trigger_held() {
+                        c.set_button(SynthButton::Left, held)?;
+                    }
+                    if let Some(held) = ev.front_left_held() {
+                        c.set_button(SynthButton::Right, held)?;
+                    }
+                    if let Some(held) = ev.front_right_held() {
+                        c.set_button(SynthButton::Middle, held)?;
+                    }
+                }
+            }
         }
         if let Some(f) = csv.as_mut() {
             let (c, clipped, tabs) = quad.map_or(([[f64::NAN; 2]; 4], false, 0), |q| {
@@ -496,9 +606,15 @@ pub fn run_tracker_with(
                 .is_some_and(|e| last_report.elapsed() >= e);
         if report {
             last_report = Instant::now();
+            // `proc` includes the position writes; a stalled port shows up here on its own.
+            let write = if gun.is_some() {
+                format!(" write={:.2}ms", writes.frame.as_secs_f64() * 1000.0)
+            } else {
+                String::new()
+            };
             match (&quad, aim) {
                 (Some(q), Some(am)) => println!(
-                    "[{name}] {:>7.2}s seq={:<6} aim=({:6.2}%, {:6.2}%) TL({:.0},{:.0}) TR({:.0},{:.0}) BR({:.0},{:.0}) BL({:.0},{:.0}){} proc={:.2}ms age={:.1}ms",
+                    "[{name}] {:>7.2}s seq={:<6} aim=({:6.2}%, {:6.2}%) TL({:.0},{:.0}) TR({:.0},{:.0}) BR({:.0},{:.0}) BL({:.0},{:.0}){} proc={:.2}ms{write} age={:.1}ms",
                     start.elapsed().as_secs_f64(), frame.sequence, am[0], am[1],
                     q.corners[0][0], q.corners[0][1], q.corners[1][0], q.corners[1][1],
                     q.corners[2][0], q.corners[2][1], q.corners[3][0], q.corners[3][1],
@@ -511,7 +627,7 @@ pub fn run_tracker_with(
                 ),
                 _ => {
                     let (mean, max) = luma::luma_stats(l);
-                    println!("[{name}] {:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={:.2}ms", start.elapsed().as_secs_f64(), frame.sequence, mean, max, proc.as_secs_f64() * 1000.0);
+                    println!("[{name}] {:>7.2}s seq={:<6} no border (luma mean {:.1} max {}) proc={:.2}ms{write}", start.elapsed().as_secs_f64(), frame.sequence, mean, max, proc.as_secs_f64() * 1000.0);
                 }
             }
         }
@@ -568,12 +684,84 @@ pub fn run_tracker_with(
     Ok(())
 }
 
+/// Position-write bookkeeping for one tracker.
+#[derive(Default)]
+struct Writes {
+    /// Consecutive writes that timed out.
+    timeouts: u32,
+    /// Time spent writing positions for the current frame.
+    frame: Duration,
+}
+
+/// Stream one position to the gun, tolerating a transient write timeout.
+///
+/// A single write timing out just means the firmware was busy for a moment (the recoil
+/// solenoid firing, a USB retry); the next frame replaces the position anyway, so dropping
+/// one is invisible, while failing the session costs a ten-second reconnect. A run of them
+/// means the firmware has stopped reading its port, which the reconnect (or a replug) is for.
+///
+/// With a synthesised macOS cursor ([`crate::cursor`]) positions are still streamed to the
+/// gun: firmware 1.9 emits button reports only while position traffic flows.
+fn send_position(gun: &mut Gun, x: f64, y: f64, writes: &mut Writes) -> crate::gun::Result<()> {
+    let t = Instant::now();
+    let r = gun.set_position(percent_to_axis(x), percent_to_axis(y));
+    writes.frame += t.elapsed();
+    match r {
+        Ok(()) => {
+            writes.timeouts = 0;
+            Ok(())
+        }
+        Err(GunError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            writes.timeouts += 1;
+            // Two seconds of 60 Hz positions all timing out is a dead line, not a glitch.
+            if writes.timeouts >= 120 {
+                return Err(GunError::Io(e));
+            }
+            if writes.timeouts == 1 {
+                warn!("position write timed out; dropping positions while it persists");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Bring a gun up for tracking: authenticate is the caller's job (recovery lives in the CLI);
-/// this applies config and starts streaming.
-pub fn prepare_gun(gun: &mut Gun, cfg: &GunConfig, recoil_gap: Duration) -> Result<()> {
+/// this reads the stored bore offset, applies config and starts streaming — in that order,
+/// because firmware 1.9 stops answering serial queries once streaming has started (and a
+/// query sent then can leave the firmware not reading at all, which only a replug clears).
+/// Nothing may query the gun after this returns; positions and events are fine.
+///
+/// Returns the effective calibration: the config's, else the gun's EEPROM, else none.
+pub fn prepare_gun(
+    gun: &mut Gun,
+    cfg: &GunConfig,
+    recoil_gap: Duration,
+) -> Result<Option<[f64; 2]>> {
+    let cal = if let Some(c) = cfg.calibration {
+        Some(c)
+    } else {
+        match (gun.calibration_x(), gun.calibration_y()) {
+            (Ok((x, _)), Ok((y, _))) => Some([x, y]),
+            (x, y) => {
+                warn!(
+                    "could not read the gun's stored calibration ({:?}/{:?}); aiming uncorrected",
+                    x.err(),
+                    y.err()
+                );
+                None
+            }
+        }
+    };
     gun.apply_config(cfg, recoil_gap)?;
     gun.start_streaming(Duration::from_millis(150))?;
-    Ok(())
+    // Firmware 1.9 only reports buttons when secondary serial is switched on after streaming
+    // has started: switched on before command 121 it stays silent (seen on a 2026 gun, where
+    // `debug monitor` — which enables it after — got reports while `run` — which enabled it
+    // only inside apply_config, before — never did). It is a write, so it is safe after 121,
+    // and older firmware accepts it in either position.
+    gun.set_secondary_serial(true)?;
+    Ok(cal)
 }
 
 #[cfg(test)]

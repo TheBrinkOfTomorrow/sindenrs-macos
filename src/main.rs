@@ -16,6 +16,30 @@ use sindenrs::discovery;
 use sindenrs::gun::Gun;
 use sindenrs::protocol::{cmd, percent_to_axis};
 
+/// Make Ctrl-C set `stop`. The process may go through several phases that each bring their
+/// own flag (`run`, then a menu-launched calibration, then `run` again), but a handler can
+/// only be installed once, so the one handler targets whatever flag was registered last.
+fn on_ctrl_c(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SLOT: OnceLock<Mutex<Arc<std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    if let Some(slot) = SLOT.get() {
+        if let Ok(mut s) = slot.lock() {
+            *s = stop.clone();
+        }
+        return Ok(());
+    }
+    SLOT.set(Mutex::new(stop.clone())).ok();
+    ctrlc::set_handler(|| {
+        if let Some(slot) = SLOT.get() {
+            if let Ok(s) = slot.lock() {
+                s.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .context("installing Ctrl-C handler")
+}
+
 #[derive(Parser)]
 #[command(name = "sindenrs", version, about = "Sinden Lightgun driver")]
 struct Cli {
@@ -53,6 +77,9 @@ enum Cmd {
         /// Do not draw the border; something else (MAME artwork) draws it.
         #[arg(long)]
         no_overlay: bool,
+        /// macOS: what moves the cursor (config: global.cursor).
+        #[arg(long, value_enum)]
+        cursor: Option<CursorArg>,
     },
     /// Measure and save the gun's aim calibration: shoot each target the overlay lights up.
     Calibrate(Box<CalibrateArgs>),
@@ -374,6 +401,20 @@ struct TrackArgs {
     /// With --send: put the gun in joystick mode (firmware 1.9+) instead of mouse mode.
     #[arg(long)]
     joystick: bool,
+    /// With --send on macOS: what moves the cursor (config: global.cursor).
+    #[arg(long, value_enum)]
+    cursor: Option<CursorArg>,
+    /// With --send: stream the centre from the first frame until there is an aim, whatever
+    /// moves the cursor, so a hands-free bench run exercises the serial writes.
+    #[arg(long, hide = true)]
+    heartbeat: bool,
+    /// With --send on macOS: mask the gun's HID mouse buttons or not (default: masked when
+    /// the driver moves the cursor). For bisecting the serial-write wedge.
+    #[arg(long, hide = true)]
+    mask_buttons: Option<bool>,
+    /// With --send: leave recoil disabled on the gun (as `debug monitor` does), for bisecting.
+    #[arg(long, hide = true)]
+    no_recoil: bool,
     /// Luma threshold for the border (default from config: display.threshold).
     #[arg(long)]
     threshold: Option<u8>,
@@ -447,6 +488,24 @@ enum FirmwareCmd {
         #[arg(long)]
         allow_id_mismatch: bool,
     },
+}
+
+/// What moves the system cursor on macOS (config: global.cursor).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CursorArg {
+    /// The driver posts Core Graphics events and synthesises the clicks (needs Accessibility).
+    Driver,
+    /// The gun's own HID mouse, as on Linux: no permission beyond the camera.
+    Gun,
+}
+
+impl From<CursorArg> for sindenrs::config::CursorDriver {
+    fn from(c: CursorArg) -> Self {
+        match c {
+            CursorArg::Driver => Self::Driver,
+            CursorArg::Gun => Self::Gun,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -626,6 +685,8 @@ fn main() -> Result<()> {
     if ctx.path.exists() {
         debug!(path = %ctx.path.display(), "config loaded");
     }
+    // `run`'s Reload Settings re-reads the config with the same profile selection.
+    let profile = cli.profile.clone();
 
     match cli.cmd {
         Cmd::List { no_connect } => list(&ctx, no_connect),
@@ -633,15 +694,61 @@ fn main() -> Result<()> {
         Cmd::Run {
             overlay,
             no_overlay,
+            cursor,
         } => {
-            let overlay = if overlay {
-                true
-            } else if no_overlay {
-                false
-            } else {
-                ctx.display.overlay
-            };
-            run_all(&ctx, overlay)
+            use sindenrs::control::{Control, Request};
+            let control = std::sync::Arc::new(Control::new());
+            let mut ctx = ctx;
+            loop {
+                if let Some(c) = cursor {
+                    ctx.cfg.global.cursor = c.into();
+                }
+                let overlay_on = if overlay {
+                    true
+                } else if no_overlay {
+                    false
+                } else {
+                    ctx.display.overlay
+                };
+                run_all(&ctx, overlay_on, &control)?;
+                match control.take() {
+                    Request::None => break Ok(()),
+                    Request::Calibrate => {
+                        // The guns and camera are free now. Capture on trigger or a steady
+                        // hold, save without asking (there is no terminal to ask on), then
+                        // fall through to the reload and go back to running.
+                        let args = CalibrateArgs {
+                            grid: 3,
+                            capture: CaptureMode::Either,
+                            save: true,
+                            no_save: false,
+                            out: None,
+                            record: None,
+                            debug_dir: None,
+                            samples: 24,
+                            dwell_radius: 1.2,
+                            rearm_distance: 4.0,
+                            steady_tolerance: 4.0,
+                        };
+                        if let Err(e) = calibrate(&ctx, args) {
+                            warn!("calibration: {e:#}");
+                        }
+                    }
+                    Request::Reload => {}
+                }
+                // Back to `run` on fresh settings (calibration may have changed them too).
+                match sindenrs::config::Config::load_or_default(&ctx.path) {
+                    Ok(cfg) => match cfg.display_for(profile.as_deref()) {
+                        Ok(display) => {
+                            info!("configuration reloaded from {}", ctx.path.display());
+                            ctx.cfg = cfg;
+                            ctx.display = display;
+                        }
+                        Err(e) => warn!("config reload: {e:#}; keeping the old settings"),
+                    },
+                    Err(e) => warn!("config reload: {e:#}; keeping the old settings"),
+                }
+            }
         }
         Cmd::Border(a) => {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -663,12 +770,8 @@ fn main() -> Result<()> {
             }
             let scene = Arc::new(Mutex::new(sindenrs::overlay::Scene::border_only(frac)));
             let stop = Arc::new(AtomicBool::new(false));
-            {
-                let stop = stop.clone();
-                ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-                    .context("installing Ctrl-C handler")?;
-            }
-            sindenrs::overlay::run(scene, stop)
+            on_ctrl_c(&stop)?;
+            sindenrs::overlay::run(scene, stop, ctx.display.aspect)
         }
         Cmd::Calibrate(a) => calibrate(&ctx, *a),
         Cmd::Gun { cmd } => gun(&ctx, AnyGunCmd::User(cmd)),
@@ -1855,10 +1958,18 @@ fn gun(ctx: &Ctx, cmd: AnyGunCmd) -> Result<()> {
             rate,
         } => {
             let mut gun = connect(&port, recover)?;
+            // Apply the real configuration first, as `run` does, so the firmware sits in the
+            // same state the driver uses — firmware 1.9's button reporting depends on it.
+            let id = gun.unique_id().ok();
+            let gc = gun_config_for(&ctx.cfg, id.as_deref());
+            gun.apply_config(&gc, ctx.cfg.recoil_gap())?;
             gun.start_streaming(Duration::from_millis(150))?;
-            gun.set_offscreen_reload(false)?;
             gun.set_calibration_mode_enabled(false)?;
             gun.set_recoil_enabled(false)?;
+            // Button reports (`FE s1 s2 96`) are gated by the gun's secondary serial output;
+            // without this the event stream stays empty. `run`/`calibrate` turn it on in
+            // apply_config, but monitor skips that, so enable it here for the capture.
+            gun.set_secondary_serial(true)?;
             info!("streaming; holding ({x}%, {y}%) at {rate} Hz for {seconds}s — pull the trigger and press buttons");
             let (ax, ay) = (percent_to_axis(x), percent_to_axis(y));
             let period = Duration::from_secs_f64(1.0 / rate);
@@ -1932,6 +2043,8 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
     let camera = default_camera(a.settings.device.clone())?;
     let mut gun = None;
     let mut name = "track".to_owned();
+    let mut eeprom_cal = None;
+    let cursor = a.cursor.map_or(ctx.cfg.global.cursor, Into::into);
     if a.send {
         let port = select_port(ctx)?;
         let mut g = connect(&port, ctx.cfg.global.auto_recover)?;
@@ -1940,7 +2053,17 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         if a.joystick {
             gc.joystick = true;
         }
-        sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
+        if a.no_recoil {
+            gc.recoil.enabled = false;
+        }
+        // See supervise_guns: a synthesised macOS cursor makes the clicks itself.
+        #[cfg(target_os = "macos")]
+        if a.mask_buttons
+            .unwrap_or(cursor == sindenrs::config::CursorDriver::Driver)
+        {
+            gc.buttons.mask_synthesised();
+        }
+        eeprom_cal = sindenrs::runtime::prepare_gun(&mut g, &gc, ctx.cfg.recoil_gap())?;
         info!(
             "gun \"{}\" streaming (joystick={}, recoil={})",
             gc.name, gc.joystick, gc.recoil.enabled
@@ -1975,8 +2098,8 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         min_size: a.min_size,
         flip: a.flip.map(Into::into),
         orientation: a.orientation,
-        cal_x: a.cal_x,
-        cal_y: a.cal_y,
+        cal_x: a.cal_x.or(eeprom_cal.map(|c| c[0])),
+        cal_y: a.cal_y.or(eeprom_cal.map(|c| c[1])),
         lens_k1: a.lens_k1.unwrap_or(ctx.cfg.global.lens_k1),
         jump_limit: ctx.display.jump_limit,
         hover_smoothing: ctx.display.hover_smoothing,
@@ -1985,6 +2108,10 @@ fn track(ctx: &Ctx, a: TrackArgs) -> Result<()> {
         record: a.record.clone(),
         per_frame: a.per_frame,
         report_every: Some(Duration::from_secs(1)),
+        // Diagnostics: aim is reported, not steering a cursor over a letterboxed border.
+        aim_map: sindenrs::runtime::AimMap::default(),
+        cursor,
+        heartbeat: a.heartbeat,
     };
     let status = Arc::new(Mutex::new(Status::default()));
     if a.preview {
@@ -2115,35 +2242,87 @@ fn track_with_preview(
     bail!("--preview is only available on macOS so far")
 }
 
+/// Whether `pid` is a live process with a resolvable executable. A process that is gone, or a
+/// husk stuck mid-exit on a kernel call (a wedged serial close), has no path any more — and a
+/// husk can never release the locks it holds.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn process_alive(pid: i32) -> bool {
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let mut buf = [0u8; 4096];
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: a libproc call with a buffer we own; it returns the path length, <= 0 on failure.
+    unsafe { proc_pidpath(pid, buf.as_mut_ptr(), len) > 0 }
+}
+
 /// Run every attached gun that has a config entry, each on its own thread, until Ctrl-C.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
+fn run_all(
+    ctx: &Ctx,
+    overlay: bool,
+    control: &std::sync::Arc<sindenrs::control::Control>,
+) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     // One `run` per user on macOS: opening Sindenrs.app again (or a second `run`) would fight
-    // the first for the cameras and draw a second border. The lock goes with the process.
+    // the first for the cameras and draw a second border. The lock goes with the process —
+    // except when a wedged gun blocks the holder's serial close in the kernel: the process
+    // hangs mid-exit holding the flock, and every relaunch would fail until a replug. So the
+    // holder's pid is written into the file, and a holder that no longer resolves to a live
+    // executable (gone, or a husk stuck exiting) is retired by unlinking the file — flock is
+    // per inode, so a fresh file locks cleanly while the husk keeps its orphaned inode.
     #[cfg(target_os = "macos")]
     let _single = {
+        use std::io::Write as _;
         let path = std::env::temp_dir().join("sindenrs-run.lock");
-        let f =
-            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        if f.try_lock().is_err() {
-            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
-            return Ok(());
-        }
-        f
+        let lock = |path: &std::path::Path| -> Result<Option<std::fs::File>> {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            if f.try_lock().is_err() {
+                return Ok(None);
+            }
+            f.set_len(0)?;
+            write!(f, "{}", std::process::id())?;
+            Ok(Some(f))
+        };
+        let held = match lock(&path)? {
+            Some(f) => f,
+            None => {
+                let holder = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                if holder.is_none_or(|pid| !process_alive(pid)) {
+                    warn!("a previous sindenrs is gone or stuck exiting; retiring its run lock");
+                    let _ = std::fs::remove_file(&path);
+                    match lock(&path)? {
+                        Some(f) => f,
+                        None => {
+                            info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    info!("sindenrs is already running; quit it from its menu bar item or with ⌃⌥⌘Q");
+                    return Ok(());
+                }
+            }
+        };
+        held
     };
     // Keep the trackers responsive while a game loads the machine (no App Nap, no timer
     // coalescing): see `activity`.
     let _activity = sindenrs::activity::begin("tracking the Sinden Lightgun");
 
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
-    }
+    on_ctrl_c(&stop)?;
 
     // The border the guns track. Its window is shaped to the border and takes no input, so
     // it can sit above a running game; if there is no display, tracking still runs (the
@@ -2161,23 +2340,45 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     {
         let status = Arc::new(Mutex::new(Vec::new()));
         let live = Arc::new(Mutex::new(sindenrs::preview::Live::default()));
+        // Where the letterboxed overlay will sit, so positions sent to the gun (whose
+        // pointer spans the whole screen) land where the gun points. With the overlay off
+        // something else draws the border, presumably over the whole screen: identity.
+        let aim_map = if overlay {
+            sindenrs::overlay::aim_map(ctx.display.aspect)
+                .inspect(|m| {
+                    info!(
+                        "overlay letterboxed to {:.3}: {:.1}% x {:.1}% of the screen at ({:.1}%, {:.1}%)",
+                        ctx.display.aspect,
+                        m.scale[0] * 100.0,
+                        m.scale[1] * 100.0,
+                        m.offset[0],
+                        m.offset[1]
+                    );
+                })
+                .inspect_err(|e| warn!("overlay placement: {e:#}; sending positions unmapped"))
+                .unwrap_or_default()
+        } else {
+            sindenrs::runtime::AimMap::default()
+        };
         return std::thread::scope(|sc| {
-            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status), Some(&live)));
+            let guns = sc.spawn(|| supervise_guns(ctx, &stop, Some(&status), Some(&live), aim_map));
             let menu = sindenrs::menubar::MenuBar::install(
                 stop.clone(),
                 scene.clone(),
                 status.clone(),
                 live.clone(),
                 overlay,
+                control.clone(),
+                ctx.path.clone(),
             )
             .inspect_err(|e| warn!("menu bar: {e:#}"))
             .ok();
             // Reticles and camera views, off until switched on (⌃⌥C, ⌃⌥P or the menu).
-            let hud = sindenrs::preview::hud::open(live.clone())
+            let hud = sindenrs::preview::hud::open(live.clone(), aim_map)
                 .inspect_err(|e| warn!("heads-up display: {e:#}"))
                 .ok();
             let shown = if overlay {
-                sindenrs::overlay::run_until(scene, &stop)
+                sindenrs::overlay::run_until(scene, &stop, ctx.display.aspect)
                     .inspect_err(|e| warn!("overlay: {e:#}; tracking continues without it"))
                     .is_ok()
             } else {
@@ -2190,6 +2391,11 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
             }
             drop(hud);
             drop(menu);
+            // Turn the event loop while the guns wind down, so the windows just dropped
+            // actually leave the screen instead of freezing there behind the join.
+            if let Err(e) = sindenrs::menubar::pump_while(|| !guns.is_finished()) {
+                warn!("event loop: {e:#}");
+            }
             guns.join()
                 .map_err(|_| anyhow!("the gun supervisor panicked"))?
         });
@@ -2198,18 +2404,20 @@ fn run_all(ctx: &Ctx, overlay: bool) -> Result<()> {
     // Elsewhere the overlay has a thread of its own and the guns are supervised here.
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = control; // the menu that uses it is macOS-only
+        let aspect = ctx.display.aspect;
         let overlay_thread = overlay.then(|| {
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("overlay".into())
                 .spawn(move || {
-                    if let Err(e) = sindenrs::overlay::run_until(scene, &stop) {
+                    if let Err(e) = sindenrs::overlay::run_until(scene, &stop, aspect) {
                         warn!("overlay: {e:#}; tracking continues without it");
                     }
                 })
         });
 
-        let r = supervise_guns(ctx, &stop, None, None);
+        let r = supervise_guns(ctx, &stop, None, None, sindenrs::runtime::AimMap::default());
         if let Some(Ok(t)) = overlay_thread {
             let _ = t.join();
         }
@@ -2227,6 +2435,7 @@ fn supervise_guns(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     status_out: Option<&std::sync::Mutex<Vec<String>>>,
     live: Option<&std::sync::Arc<std::sync::Mutex<sindenrs::preview::Live>>>,
+    aim_map: sindenrs::runtime::AimMap,
 ) -> Result<()> {
     use sindenrs::preview::Live;
     use sindenrs::runtime::{run_tracker_with, Flow, Status, TrackerOptions};
@@ -2296,12 +2505,21 @@ fn supervise_guns(
                 }
             };
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&ctx.cfg, id.as_deref());
-            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
-                warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
-                retry_after.insert(key, Instant::now() + retry);
-                continue;
+            let mut gc = gun_config_for(&ctx.cfg, id.as_deref());
+            // A synthesised macOS cursor makes the mouse clicks itself, so keep the gun's HID
+            // mouse from firing them (its stale position would snap the cursor to a corner).
+            #[cfg(target_os = "macos")]
+            if ctx.cfg.global.cursor == sindenrs::config::CursorDriver::Driver {
+                gc.buttons.mask_synthesised();
             }
+            let cal = match sindenrs::runtime::prepare_gun(&mut gun, &gc, ctx.cfg.recoil_gap()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("{port}: {e:#}; retrying in {}s", retry.as_secs());
+                    retry_after.insert(key, Instant::now() + retry);
+                    continue;
+                }
+            };
             info!(
                 "[{}] {port} + {} (id {})",
                 gc.name,
@@ -2314,8 +2532,8 @@ fn supervise_guns(
                 min_size: None,
                 flip: None,
                 orientation: None,
-                cal_x: None,
-                cal_y: None,
+                cal_x: cal.map(|c| c[0]),
+                cal_y: cal.map(|c| c[1]),
                 lens_k1: ctx.cfg.global.lens_k1,
                 jump_limit: ctx.display.jump_limit,
                 hover_smoothing: ctx.display.hover_smoothing,
@@ -2324,6 +2542,9 @@ fn supervise_guns(
                 record: None,
                 per_frame: false,
                 report_every: None,
+                aim_map,
+                cursor: ctx.cfg.global.cursor,
+                heartbeat: false,
             };
             let status = Arc::new(Mutex::new(Status {
                 name: gc.name.clone(),
@@ -2439,7 +2660,11 @@ fn supervise_guns(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn run_all(_ctx: &Ctx, _overlay: bool) -> Result<()> {
+fn run_all(
+    _ctx: &Ctx,
+    _overlay: bool,
+    _control: &std::sync::Arc<sindenrs::control::Control>,
+) -> Result<()> {
     bail!("the runtime needs the camera backend, which is not implemented on this platform yet")
 }
 
@@ -2952,6 +3177,14 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     let targets = grid_targets(a.grid);
     let port = select_port(ctx)?;
     let camera = camera_for_port(&port)?;
+    // The measurements compare aims to targets in border percent; the map only keeps the
+    // OS cursor under the gun while the letterboxed overlay is up (macOS).
+    #[cfg(target_os = "macos")]
+    let aim_map = sindenrs::overlay::aim_map(ctx.display.aspect)
+        .inspect_err(|e| warn!("overlay placement: {e:#}; sending positions unmapped"))
+        .unwrap_or_default();
+    #[cfg(not(target_os = "macos"))]
+    let aim_map = sindenrs::runtime::AimMap::default();
     let opts = TrackerOptions {
         display: ctx.display.clone(),
         threshold: None,
@@ -2968,6 +3201,9 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         record: a.record.clone(),
         per_frame: false,
         report_every: None,
+        aim_map,
+        cursor: ctx.cfg.global.cursor,
+        heartbeat: false,
     };
 
     let scene = Arc::new(Mutex::new(Scene {
@@ -2978,11 +3214,12 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         ..Default::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
-            .context("installing Ctrl-C handler")?;
-    }
+    on_ctrl_c(&stop)?;
+    // Launched from the menu there is no terminal, so ⌃⌥⌘Q is the way out.
+    #[cfg(target_os = "macos")]
+    let _quit_key = sindenrs::menubar::QuitKey::install(stop.clone())
+        .inspect_err(|e| warn!("quit hot key: {e:#}"))
+        .ok();
 
     println!("Aim at the ringed target and pull the trigger. Escape quits.");
     println!("The overlay shows everything: the ring is the target, the dot is where the driver");
@@ -3022,10 +3259,24 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 }
             };
             let id = gun.unique_id().ok();
-            let gc = gun_config_for(&cfg, id.as_deref());
-            if let Err(e) = sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
-                finish(&stop);
-                return Err(e);
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut gc = gun_config_for(&cfg, id.as_deref());
+            // As in `run`: a synthesised cursor makes the clicks, so the HID mouse must not.
+            #[cfg(target_os = "macos")]
+            if cfg.global.cursor == sindenrs::config::CursorDriver::Driver {
+                gc.buttons.mask_synthesised();
+            }
+            let mut opts = opts;
+            match sindenrs::runtime::prepare_gun(&mut gun, &gc, recoil_gap) {
+                Ok(cal) => {
+                    // Measure with the current bore correction applied, as play would.
+                    opts.cal_x = opts.cal_x.or(cal.map(|c| c[0]));
+                    opts.cal_y = opts.cal_y.or(cal.map(|c| c[1]));
+                }
+                Err(e) => {
+                    finish(&stop);
+                    return Err(e);
+                }
             }
             // The kick would disturb the aim being measured; `run` re-sends the config.
             if let Err(e) = gun.set_recoil_enabled(false) {
@@ -3208,7 +3459,7 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
         })?
     };
 
-    sindenrs::overlay::run(scene, stop)?;
+    sindenrs::overlay::run(scene, stop, ctx.display.aspect)?;
     let out = worker
         .join()
         .map_err(|_| anyhow!("the measuring thread panicked"))??;
@@ -3256,6 +3507,12 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
     ];
     println!("\n{} of {} targets measured", done.len(), targets.len());
     println!("error: mean {mean:.2}% of screen, max {max:.2}%");
+    // Launched from the menu there is no terminal, so the result goes to the log too.
+    info!(
+        "calibration: {} of {} targets measured, mean error {mean:.2}% of screen, max {max:.2}%",
+        done.len(),
+        targets.len()
+    );
     println!(
         "systematic bias: dx {:+.2}%, dy {:+.2}%  (cancel with display.offset_x / offset_y)",
         bias[0], bias[1]
@@ -3339,6 +3596,10 @@ fn calibrate(ctx: &Ctx, a: CalibrateArgs) -> Result<()> {
                 let mut gun = connect(&port, ctx.cfg.global.auto_recover)?;
                 gun.write_calibration(cal[0], cal[1])?;
                 println!("saved to the gun's EEPROM; run `calibrate` again to check the error drops to the spread above");
+                info!(
+                    "bore calibration x {:+.2}%, y {:+.2}% of frame saved to the gun's EEPROM",
+                    cal[0], cal[1]
+                );
                 if let Some(over) = gun_config_for(&ctx.cfg, out.gun_id.as_deref()).calibration {
                     println!(
                         "note: the config sets calibration = [{}, {}] for this gun, which overrides the saved value",

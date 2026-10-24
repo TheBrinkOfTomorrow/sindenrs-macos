@@ -8,13 +8,17 @@
 //! - [`camera`] — frame capture (V4L2 on Linux; stubbed elsewhere).
 //! - [`vision`] — image geometry and pixel helpers.
 //!
-//! The pointer itself is reported by the gun's own HID mouse, so nothing here touches
-//! the display server. Wayland, X11 and Windows only matter for the (future) border
-//! overlay, which will live behind its own module.
+//! The pointer is reported by the gun's own HID mouse on Linux and Windows, so nothing there
+//! touches the display server. macOS ignores an absolute HID pointer, so on that platform the
+//! driver moves the system cursor itself via [`cursor`]. Wayland, X11 and the macOS overlay
+//! draw the border the gun tracks.
 
 pub mod activity;
 pub mod camera;
 pub mod config;
+pub mod control;
+#[cfg(target_os = "macos")]
+pub mod cursor;
 pub mod discovery;
 pub mod firmware;
 pub mod gun;

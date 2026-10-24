@@ -8,8 +8,15 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 - The gun is two USB devices behind its own hub: the camera, and an ATmega32U4 (Arduino
   Leonardo bootloader) with a CDC serial port and its own HID mouse, keyboard and joystick.
 - Host software's job: read camera frames -> detect the white coded border -> compute aim ->
-  write the position to the gun over serial. The gun then reports the aim through its own
-  absolute USB mouse. **No kernel driver / DriverKit extension should be needed.**
+  drive the pointer. On Windows/Linux the gun reports the aim through its own absolute USB
+  mouse, so the driver just writes the position to the gun over serial. On 2026-10-15 that was
+  judged not to work on macOS (the cursor pegged in a corner) and the driver grew Core Graphics
+  cursor synthesis (`src/cursor.rs`); on 2026-10-16 a bench run with the full configuration and
+  positions actually reaching the gun moved the cursor through the gun's own HID pointer after
+  all — the corner was most likely the old 20 ms write timeout dropping the positions.
+  `[global] cursor = "driver" | "gun"` picks either; which becomes the default waits on the
+  hardware (`macos-notes.md`, 2026-10-16 overnight). **No kernel driver / DriverKit extension
+  is needed either way.**
 - Base to build on: https://github.com/schlarpc/sindenrs (MIT, Rust, clean-room).
   - Done: protocol (handshake, auth hashes, events), tracking at 60 fps, coded border,
     calibration, recoil/button TOML config, firmware backup/flash, hotplug, two guns.
@@ -27,6 +34,25 @@ Goal: make the Sinden Lightgun work on macOS 27 (Apple Silicon) with PCSX2, RPCS
 | 2 — Border overlay | **done** (per-emulator full-screen checks continue in Phase 3) |
 | 3 — Emulator setup | in progress: ARMSX2 and Flycast done; Mednafen, RPCS3 next |
 | 4 — Two players | optional, not started |
+
+Update 2026-10-15: on a 2026 gun the HID pointer does not move the macOS cursor; the driver now
+synthesises the cursor with Core Graphics (`src/cursor.rs`). Cursor tracking confirmed live on
+the browser arcade; the cursor releases to the trackpad when the border leaves view and the OS
+arrow hides while aiming. Permissions are permanent (`tools/macos/make-cert.sh`; macOS 27 lists
+the grant under Device Control and Data Access) and `event posting granted` confirmed. Still
+open before the trigger click lands: firmware 1.9 only reports buttons while position traffic
+flows, and in-process camera + serial writes wedge within a second (bisect cornered to the
+apply_config burst vs in-process AVFoundation — one experiment left); then pump's serial bit,
+a bounded serial close (a wedged gun hangs exit; the run lock now survives that),
+background-at-login, the Calibrate-from-menu hang, and a native config/calibration GUI. See
+`docs/macos-notes.md`, 2026-10-15 (evening).
+
+Update 2026-10-16 (overnight, not yet on hardware): `cursor = "gun"` (the HID-pointer model,
+no permissions beyond the camera) beside the Core Graphics `driver`; a bounded, non-draining
+serial close (a wedged gun no longer takes the tracker, `run`'s teardown or the Calibrate flow
+down with it); AppKit keeps turning during teardown (the frozen border); and
+`tools/macos/bench-wedge.sh` to bisect the write wedge hands-free. Next: the bench sequence at
+the end of that day's `macos-notes.md` entry.
 
 Measurements and decisions are in `docs/macos-notes.md`.
 

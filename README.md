@@ -9,8 +9,10 @@ games see a normal absolute mouse. Windows is planned; the serial and vision cod
 compiles for it, but the camera and window backends do not exist yet.
 
 **This fork also runs on macOS** (Apple silicon): discovery, camera, border overlay,
-calibration, and a `Sindenrs.app` with a menu bar item and shortcuts (⌃⌥B border, ⌃⌥C reticle,
-⌃⌥P camera view, ⌃⌥⌘Q quit).
+calibration, aiming (by default the driver moves the system cursor itself with Core Graphics;
+`cursor = "gun"` hands it to the gun's own HID pointer, as on Linux, which a 2026-10-16 bench run
+suggests works once positions reach the gun — see `docs/macos-notes.md`), and a `Sindenrs.app` with
+a menu bar item and shortcuts (⌃⌥B border, ⌃⌥C reticle, ⌃⌥P camera view, ⌃⌥⌘Q quit).
 See [docs/macos-emulators.md](docs/macos-emulators.md) to set it up and play, and
 [docs/macos-plan.md](docs/macos-plan.md) for the state of the port.
 
